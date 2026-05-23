@@ -5,17 +5,30 @@
  */
 
 import { createApp } from '@cyanheads/mcp-ts-core';
-import { echoTool } from './mcp-server/tools/definitions/echo.tool.js';
-import { echoAppTool } from './mcp-server/tools/definitions/echo-app.app-tool.js';
-import { echoResource } from './mcp-server/resources/definitions/echo.resource.js';
-import { echoAppUiResource } from './mcp-server/resources/definitions/echo-app-ui.app-resource.js';
-import { echoPrompt } from './mcp-server/prompts/definitions/echo.prompt.js';
+import { worldbankCountryResource } from './mcp-server/resources/definitions/worldbank-country.resource.js';
+import { worldbankIndicatorResource } from './mcp-server/resources/definitions/worldbank-indicator.resource.js';
+import { worldbankGetCountry } from './mcp-server/tools/definitions/worldbank-get-country.tool.js';
+import { worldbankGetData } from './mcp-server/tools/definitions/worldbank-get-data.tool.js';
+import { worldbankGetIndicator } from './mcp-server/tools/definitions/worldbank-get-indicator.tool.js';
+import { worldbankListCountries } from './mcp-server/tools/definitions/worldbank-list-countries.tool.js';
+import { worldbankListSources } from './mcp-server/tools/definitions/worldbank-list-sources.tool.js';
+import { worldbankListTopics } from './mcp-server/tools/definitions/worldbank-list-topics.tool.js';
+import { worldbankSearchIndicators } from './mcp-server/tools/definitions/worldbank-search-indicators.tool.js';
+import { initWorldBankApiService } from './services/worldbank/worldbank-service.js';
 
 await createApp({
-  tools: [echoTool, echoAppTool],
-  resources: [echoResource, echoAppUiResource],
-  prompts: [echoPrompt],
-  // instructions: 'Server-level orientation forwarded to the model on every initialize.\n' +
-  //   '- Use shortcut `X` for the most common case\n' +
-  //   '- Tools require auth via the `inventory:read` scope',
+  tools: [
+    worldbankListTopics,
+    worldbankListSources,
+    worldbankListCountries,
+    worldbankGetCountry,
+    worldbankSearchIndicators,
+    worldbankGetIndicator,
+    worldbankGetData,
+  ],
+  resources: [worldbankIndicatorResource, worldbankCountryResource],
+  prompts: [],
+  setup(core) {
+    initWorldBankApiService(core.config, core.storage);
+  },
 });
