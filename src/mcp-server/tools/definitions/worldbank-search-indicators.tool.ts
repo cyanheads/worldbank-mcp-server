@@ -17,7 +17,7 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
     'At least one of query, topic_id, or source_id must be provided. ' +
     'When topic_id or source_id is given with a query, filtering is applied client-side because the API ignores searchterm when a topic or source filter is active. ' +
     'Use worldbank_list_topics for topic IDs, worldbank_list_sources for source IDs.',
-  annotations: { readOnlyHint: true },
+  annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     query: z
       .string()
@@ -49,25 +49,29 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
   output: z.object({
     indicators: z
       .array(
-        z.object({
-          id: z
-            .string()
-            .describe(
-              'Indicator ID (e.g. NY.GDP.PCAP.CD). Use as indicator_id in worldbank_get_data.',
-            ),
-          name: z.string().describe('Indicator name.'),
-          sourceId: z.string().describe('Source dataset ID.'),
-          sourceName: z.string().describe('Source dataset name.'),
-          sourceNote: z.string().describe('Brief indicator description.'),
-          topics: z
-            .array(
-              z.object({
-                id: z.string().describe('Topic ID.'),
-                name: z.string().describe('Topic name.'),
-              }),
-            )
-            .describe('Thematic topics this indicator belongs to.'),
-        }),
+        z
+          .object({
+            id: z
+              .string()
+              .describe(
+                'Indicator ID (e.g. NY.GDP.PCAP.CD). Use as indicator_id in worldbank_get_data.',
+              ),
+            name: z.string().describe('Indicator name.'),
+            sourceId: z.string().describe('Source dataset ID.'),
+            sourceName: z.string().describe('Source dataset name.'),
+            sourceNote: z.string().describe('Brief indicator description.'),
+            topics: z
+              .array(
+                z
+                  .object({
+                    id: z.string().describe('Topic ID.'),
+                    name: z.string().describe('Topic name.'),
+                  })
+                  .describe('A thematic topic entry.'),
+              )
+              .describe('Thematic topics this indicator belongs to.'),
+          })
+          .describe('A matching indicator with metadata.'),
       )
       .describe('Matching indicators for this page.'),
     total: z.number().describe('Total matching indicators before pagination.'),

@@ -17,7 +17,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
     'Returns observations with null values when data is not available for a country×year cell (common for sparse series). ' +
     'Specify either date_range (historical analysis) or mrv (most recent N values), not both. ' +
     'For "all" countries, use pagination (per_page up to 1000) since the API returns ~266 entries per indicator.',
-  annotations: { readOnlyHint: true },
+  annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     indicator_id: z
       .string()
@@ -26,7 +26,10 @@ export const worldbankGetData = tool('worldbank_get_data', {
         'Indicator code to query (e.g. NY.GDP.PCAP.CD, SP.POP.TOTL). Use worldbank_search_indicators to find valid IDs.',
       ),
     countries: z
-      .union([z.string(), z.array(z.string())])
+      .union([
+        z.string().describe('A single country code or "all".'),
+        z.array(z.string().describe('A country code.')).describe('An array of country codes.'),
+      ])
       .describe(
         'Country codes. Accepts: ISO2 (US, CN), ISO3 (USA, CHN), regional aggregate codes (EAS, LCN, MEA, SAS, SSF, ECS, NAC), ' +
           'income group codes (HIC, UMC, LMC, LIC), world code (WLD), or "all" for all 266 entries (use pagination). ' +
@@ -61,28 +64,30 @@ export const worldbankGetData = tool('worldbank_get_data', {
   output: z.object({
     data: z
       .array(
-        z.object({
-          countryCode: z.string().describe('ISO2 country code (or aggregate code).'),
-          countryIso3: z.string().describe('ISO3 country code (empty for some aggregates).'),
-          countryName: z.string().describe('Country or aggregate name.'),
-          date: z.string().describe('Year of observation (YYYY format).'),
-          value: z
-            .number()
-            .nullable()
-            .describe(
-              'Indicator value. Null when data is not available for this country×year cell.',
-            ),
-          obsStatus: z
-            .string()
-            .describe(
-              'Observation status code (empty string when no special status; non-empty values signal data quality notes).',
-            ),
-          isAggregate: z
-            .boolean()
-            .describe(
-              'True when this row is a regional or income-group aggregate rather than an individual country.',
-            ),
-        }),
+        z
+          .object({
+            countryCode: z.string().describe('ISO2 country code (or aggregate code).'),
+            countryIso3: z.string().describe('ISO3 country code (empty for some aggregates).'),
+            countryName: z.string().describe('Country or aggregate name.'),
+            date: z.string().describe('Year of observation (YYYY format).'),
+            value: z
+              .number()
+              .nullable()
+              .describe(
+                'Indicator value. Null when data is not available for this country×year cell.',
+              ),
+            obsStatus: z
+              .string()
+              .describe(
+                'Observation status code (empty string when no special status; non-empty values signal data quality notes).',
+              ),
+            isAggregate: z
+              .boolean()
+              .describe(
+                'True when this row is a regional or income-group aggregate rather than an individual country.',
+              ),
+          })
+          .describe('A single country×year observation.'),
       )
       .describe('Indicator observations for this page. Null values are common for sparse series.'),
     indicator: z
@@ -102,6 +107,12 @@ export const worldbankGetData = tool('worldbank_get_data', {
   }),
 
   errors: [
+    {
+      reason: 'invalid_params',
+      code: JsonRpcErrorCode.InvalidParams,
+      when: 'Both date_range and mrv are provided simultaneously.',
+      recovery: 'Remove date_range to use mrv, or remove mrv to use date_range.',
+    },
     {
       reason: 'indicator_not_found',
       code: JsonRpcErrorCode.NotFound,
@@ -125,7 +136,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
 
   async handler(input, ctx) {
     if (input.date_range && input.mrv !== undefined) {
-      throw ctx.fail('no_data', 'Provide either date_range or mrv, not both.', {
+      throw ctx.fail('invalid_params', 'Provide either date_range or mrv, not both.', {
         recovery: { hint: 'Remove date_range to use mrv, or remove mrv to use date_range.' },
       });
     }

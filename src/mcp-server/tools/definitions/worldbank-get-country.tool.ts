@@ -12,7 +12,7 @@ export const worldbankGetCountry = tool('worldbank_get_country', {
   description:
     'Fetches full metadata for a specific country or aggregate entity: region, income level, capital, coordinates, and lending type. ' +
     'Accepts ISO2 codes (US, DE), ISO3 codes (USA, DEU), or World Bank aggregate codes (EAS, HIC, WLD).',
-  annotations: { readOnlyHint: true },
+  annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     country_code: z
       .string()
@@ -55,7 +55,7 @@ export const worldbankGetCountry = tool('worldbank_get_country', {
     },
   ],
 
-  async handler(input, ctx) {
+  handler(input, ctx) {
     ctx.log.info('Fetching country', { countryCode: input.country_code });
     return getWorldBankApiService().getCountry(input.country_code, ctx);
   },

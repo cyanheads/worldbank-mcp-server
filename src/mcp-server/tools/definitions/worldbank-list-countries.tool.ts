@@ -15,7 +15,7 @@ export const worldbankListCountries = tool('worldbank_list_countries', {
     'Filterable by region code (e.g. EAS, SSF, NAC) and income level (LIC, LMC, UMC, HIC). ' +
     'By default, excludes regional/income-group aggregate entries and returns individual countries only. ' +
     'Set include_aggregates=true to also see region, income group, and world aggregate entities.',
-  annotations: { readOnlyHint: true },
+  annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     region: z
       .string()
@@ -50,32 +50,34 @@ export const worldbankListCountries = tool('worldbank_list_countries', {
   output: z.object({
     countries: z
       .array(
-        z.object({
-          id: z.string().describe('Country or aggregate ID (ISO2 or WB aggregate code).'),
-          iso2: z.string().describe('ISO2 country code.'),
-          name: z.string().describe('Country or aggregate name.'),
-          region: z
-            .object({
-              id: z.string().describe('Region code.'),
-              name: z.string().describe('Region name.'),
-            })
-            .describe('World Bank region this country belongs to.'),
-          incomeLevel: z
-            .object({
-              id: z.string().describe('Income level code.'),
-              name: z.string().describe('Income level name.'),
-            })
-            .describe('World Bank income classification.'),
-          lendingType: z.string().describe('World Bank lending type classification.'),
-          capitalCity: z.string().describe('Capital city name (empty for aggregates).'),
-          longitude: z.string().describe('Capital longitude (empty for aggregates).'),
-          latitude: z.string().describe('Capital latitude (empty for aggregates).'),
-          isAggregate: z
-            .boolean()
-            .describe(
-              'True when this entry is a regional or income-group aggregate rather than an individual country.',
-            ),
-        }),
+        z
+          .object({
+            id: z.string().describe('Country or aggregate ID (ISO2 or WB aggregate code).'),
+            iso2: z.string().describe('ISO2 country code.'),
+            name: z.string().describe('Country or aggregate name.'),
+            region: z
+              .object({
+                id: z.string().describe('Region code.'),
+                name: z.string().describe('Region name.'),
+              })
+              .describe('World Bank region this country belongs to.'),
+            incomeLevel: z
+              .object({
+                id: z.string().describe('Income level code.'),
+                name: z.string().describe('Income level name.'),
+              })
+              .describe('World Bank income classification.'),
+            lendingType: z.string().describe('World Bank lending type classification.'),
+            capitalCity: z.string().describe('Capital city name (empty for aggregates).'),
+            longitude: z.string().describe('Capital longitude (empty for aggregates).'),
+            latitude: z.string().describe('Capital latitude (empty for aggregates).'),
+            isAggregate: z
+              .boolean()
+              .describe(
+                'True when this entry is a regional or income-group aggregate rather than an individual country.',
+              ),
+          })
+          .describe('A country or aggregate entry.'),
       )
       .describe('Countries (and optionally aggregates) matching the filters.'),
     total: z

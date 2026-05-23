@@ -100,7 +100,7 @@ describe('worldbankGetData', () => {
       mrv: 3,
     });
     await expect(worldbankGetData.handler(input, ctx)).rejects.toMatchObject({
-      data: { reason: 'no_data' },
+      data: { reason: 'invalid_params' },
     });
   });
 

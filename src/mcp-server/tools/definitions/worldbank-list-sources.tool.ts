@@ -13,7 +13,7 @@ export const worldbankListSources = tool('worldbank_list_sources', {
   description:
     'Lists the 70+ World Bank data sources (datasets) such as World Development Indicators, IDS, and Doing Business. ' +
     'Returns source IDs and names for use as source_id in worldbank_search_indicators. Supports pagination.',
-  annotations: { readOnlyHint: true },
+  annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     page: z.number().int().min(1).default(1).describe('Pagination page number (1-based).'),
     per_page: z
@@ -27,15 +27,17 @@ export const worldbankListSources = tool('worldbank_list_sources', {
   output: z.object({
     sources: z
       .array(
-        z.object({
-          id: z.string().describe('Source ID for use in worldbank_search_indicators.'),
-          name: z.string().describe('Dataset name.'),
-          code: z.string().describe('Short dataset code.'),
-          lastUpdated: z.string().describe('Date of last data update (YYYY-MM-DD or empty).'),
-          dataAvailability: z.string().describe('Data availability status.'),
-          metadataAvailability: z.string().describe('Metadata availability status.'),
-          concepts: z.string().describe('Number of concepts (variables) in this source.'),
-        }),
+        z
+          .object({
+            id: z.string().describe('Source ID for use in worldbank_search_indicators.'),
+            name: z.string().describe('Dataset name.'),
+            code: z.string().describe('Short dataset code.'),
+            lastUpdated: z.string().describe('Date of last data update (YYYY-MM-DD or empty).'),
+            dataAvailability: z.string().describe('Data availability status.'),
+            metadataAvailability: z.string().describe('Metadata availability status.'),
+            concepts: z.string().describe('Number of concepts (variables) in this source.'),
+          })
+          .describe('A World Bank data source entry.'),
       )
       .describe('World Bank data sources for this page.'),
     total: z.number().describe('Total number of sources.'),
@@ -43,11 +45,10 @@ export const worldbankListSources = tool('worldbank_list_sources', {
     pages: z.number().describe('Total number of pages.'),
   }),
 
-  async handler(input, ctx) {
+  handler(input, ctx) {
     const perPage = input.per_page ?? getServerConfig().defaultPerPage;
     ctx.log.info('Listing World Bank sources', { page: input.page, perPage });
-    const result = await getWorldBankApiService().listSources(input.page, perPage, ctx);
-    return result;
+    return getWorldBankApiService().listSources(input.page, perPage, ctx);
   },
 
   format: (result) => {

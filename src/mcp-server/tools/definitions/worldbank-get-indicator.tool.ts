@@ -13,7 +13,7 @@ export const worldbankGetIndicator = tool('worldbank_get_indicator', {
     'Fetches complete metadata for a single World Bank indicator by its ID: name, description, source dataset, ' +
     'source organization, unit, and thematic topics. ' +
     'Use worldbank_search_indicators to discover indicator IDs if you only know the concept.',
-  annotations: { readOnlyHint: true },
+  annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     indicator_id: z
       .string()
@@ -32,10 +32,12 @@ export const worldbankGetIndicator = tool('worldbank_get_indicator', {
     sourceOrganization: z.string().describe('Organization that collects or publishes this data.'),
     topics: z
       .array(
-        z.object({
-          id: z.string().describe('Topic ID.'),
-          name: z.string().describe('Topic name.'),
-        }),
+        z
+          .object({
+            id: z.string().describe('Topic ID.'),
+            name: z.string().describe('Topic name.'),
+          })
+          .describe('A thematic topic entry.'),
       )
       .describe('Thematic topics this indicator belongs to.'),
   }),

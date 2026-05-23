@@ -12,16 +12,18 @@ export const worldbankListTopics = tool('worldbank_list_topics', {
   description:
     'Lists all 21 World Bank thematic topics (Economy & Growth, Health, Education, etc.) with descriptions. ' +
     'Use to browse the indicator space or find a topic_id for worldbank_search_indicators.',
-  annotations: { readOnlyHint: true },
+  annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({}),
   output: z.object({
     topics: z
       .array(
-        z.object({
-          id: z.string().describe('Topic ID for use in worldbank_search_indicators.'),
-          name: z.string().describe('Topic name.'),
-          sourceNote: z.string().describe('Brief description of the topic.'),
-        }),
+        z
+          .object({
+            id: z.string().describe('Topic ID for use in worldbank_search_indicators.'),
+            name: z.string().describe('Topic name.'),
+            sourceNote: z.string().describe('Brief description of the topic.'),
+          })
+          .describe('A thematic topic entry.'),
       )
       .describe('All 21 World Bank thematic topics.'),
   }),

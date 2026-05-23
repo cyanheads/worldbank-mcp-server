@@ -28,10 +28,12 @@ export const worldbankIndicatorResource = resource('worldbank://indicator/{indic
     sourceOrganization: z.string().describe('Organization that publishes this data.'),
     topics: z
       .array(
-        z.object({
-          id: z.string().describe('Topic ID.'),
-          name: z.string().describe('Topic name.'),
-        }),
+        z
+          .object({
+            id: z.string().describe('Topic ID.'),
+            name: z.string().describe('Topic name.'),
+          })
+          .describe('A thematic topic entry.'),
       )
       .describe('Thematic topics.'),
   }),
