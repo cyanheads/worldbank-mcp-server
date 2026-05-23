@@ -1,7 +1,7 @@
 {
-  "name": "worldbank-mcp-server",
+  "name": "@cyanheads/worldbank-mcp-server",
   "version": "0.1.0",
-  "description": "",
+  "description": "MCP server for the World Bank Open Data API — 29,500+ development indicators for 200+ countries across 60+ years.",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -37,10 +37,20 @@
     "start:stdio": "MCP_TRANSPORT_TYPE=stdio node dist/index.js",
     "start:http": "MCP_TRANSPORT_TYPE=http node dist/index.js"
   },
-  "keywords": ["mcp", "mcp-server", "model-context-protocol"],
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "world-bank",
+    "open-data",
+    "development-indicators",
+    "economics",
+    "global-data",
+    "worldbank"
+  ],
   "repository": {
     "type": "git",
-    "url": ""
+    "url": "https://github.com/cyanheads/worldbank-mcp-server"
   },
   "license": "Apache-2.0",
   "engines": {

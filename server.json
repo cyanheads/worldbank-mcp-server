@@ -11,7 +11,7 @@
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
-      "identifier": "worldbank-mcp-server",
+      "identifier": "@cyanheads/worldbank-mcp-server",
       "runtimeHint": "node",
       "version": "0.1.0",
       "packageArguments": [
@@ -27,10 +27,24 @@
       "environmentVariables": [
         {
           "name": "MCP_LOG_LEVEL",
-          "description": "Sets the minimum log level for output (e.g., 'debug', 'info', 'warn').",
+          "description": "Minimum log level for output: 'debug', 'info', 'notice', 'warning', 'error'.",
           "format": "string",
           "isRequired": false,
           "default": "info"
+        },
+        {
+          "name": "WORLDBANK_API_BASE_URL",
+          "description": "World Bank API base URL override.",
+          "format": "string",
+          "isRequired": false,
+          "default": "https://api.worldbank.org/v2"
+        },
+        {
+          "name": "WORLDBANK_DEFAULT_PER_PAGE",
+          "description": "Default page size for list, search, and data operations.",
+          "format": "string",
+          "isRequired": false,
+          "default": "50"
         }
       ],
       "transport": {
@@ -40,7 +54,7 @@
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
-      "identifier": "worldbank-mcp-server",
+      "identifier": "@cyanheads/worldbank-mcp-server",
       "runtimeHint": "node",
       "version": "0.1.0",
       "packageArguments": [
@@ -77,17 +91,31 @@
         },
         {
           "name": "MCP_AUTH_MODE",
-          "description": "Authentication mode to use: 'none', 'jwt', or 'oauth'.",
+          "description": "Authentication mode: 'none', 'jwt', or 'oauth'.",
           "format": "string",
           "isRequired": false,
           "default": "none"
         },
         {
           "name": "MCP_LOG_LEVEL",
-          "description": "Sets the minimum log level for output (e.g., 'debug', 'info', 'warn').",
+          "description": "Minimum log level for output: 'debug', 'info', 'notice', 'warning', 'error'.",
           "format": "string",
           "isRequired": false,
           "default": "info"
+        },
+        {
+          "name": "WORLDBANK_API_BASE_URL",
+          "description": "World Bank API base URL override.",
+          "format": "string",
+          "isRequired": false,
+          "default": "https://api.worldbank.org/v2"
+        },
+        {
+          "name": "WORLDBANK_DEFAULT_PER_PAGE",
+          "description": "Default page size for list, search, and data operations.",
+          "format": "string",
+          "isRequired": false,
+          "default": "50"
         }
       ],
       "transport": {
