@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.7](changelog/0.1.x/0.1.7.md) — 2026-05-24
+
+Bug fixes: notFound() cause arg position in 2 resources; error code corrections; code simplification; mcp-ts-core ^0.9.7 → ^0.9.9; skills synced
+
 ## [0.1.6](changelog/0.1.x/0.1.6.md) — 2026-05-24
 
 Fix TypeError on invalid indicator/country, isAggregate lookup for aggregate codes, and inaccurate total/pages when filtering aggregates

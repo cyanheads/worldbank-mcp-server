@@ -50,7 +50,7 @@ describe('worldbankSearchIndicators', () => {
     expect(result.indicators[0].id).toBe('NY.GDP.PCAP.CD');
   });
 
-  it('throws no_match when all three filter fields are absent', async () => {
+  it('throws missing_filter when all three filter fields are absent', async () => {
     const { worldbankSearchIndicators } = await import(
       '@/mcp-server/tools/definitions/worldbank-search-indicators.tool.js'
     );
@@ -58,7 +58,7 @@ describe('worldbankSearchIndicators', () => {
     // Empty strings = form-client behaviour, treated as absent
     const input = worldbankSearchIndicators.input.parse({ query: '', topic_id: '', source_id: '' });
     await expect(worldbankSearchIndicators.handler(input, ctx)).rejects.toMatchObject({
-      data: { reason: 'no_match' },
+      data: { reason: 'missing_filter' },
     });
   });
 

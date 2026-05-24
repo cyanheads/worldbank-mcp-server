@@ -48,11 +48,12 @@ export const worldbankCountryResource = resource('worldbank://country/{countryCo
     ctx.log.debug('Reading country resource', { countryCode: params.countryCode });
     const country = await getWorldBankApiService()
       .getCountry(params.countryCode, ctx)
-      .catch((err) => {
-        throw notFound(`Country "${params.countryCode}" not found.`, {
-          countryCode: params.countryCode,
-          cause: err,
-        });
+      .catch((err: unknown) => {
+        throw notFound(
+          `Country "${params.countryCode}" not found.`,
+          { countryCode: params.countryCode },
+          { cause: err },
+        );
       });
     return country;
   },

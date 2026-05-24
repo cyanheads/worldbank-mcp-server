@@ -42,12 +42,13 @@ export const worldbankIndicatorResource = resource('worldbank://indicator/{indic
     ctx.log.debug('Reading indicator resource', { indicatorId: params.indicatorId });
     const indicator = await getWorldBankApiService()
       .getIndicator(params.indicatorId, ctx)
-      .catch((err) => {
+      .catch((err: unknown) => {
         // Rethrow as notFound for resource semantics
-        throw notFound(`Indicator "${params.indicatorId}" not found.`, {
-          indicatorId: params.indicatorId,
-          cause: err,
-        });
+        throw notFound(
+          `Indicator "${params.indicatorId}" not found.`,
+          { indicatorId: params.indicatorId },
+          { cause: err },
+        );
       });
     return indicator;
   },

@@ -85,6 +85,13 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
 
   errors: [
     {
+      reason: 'missing_filter',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'None of query, topic_id, or source_id were provided.',
+      recovery:
+        'Provide a keyword query, a topic_id from worldbank_list_topics, or a source_id from worldbank_list_sources.',
+    },
+    {
       reason: 'no_match',
       code: JsonRpcErrorCode.NotFound,
       when: 'No indicators matched the query.',
@@ -99,7 +106,7 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
 
     if (!query && !topicId && !sourceId) {
       throw ctx.fail(
-        'no_match',
+        'missing_filter',
         'At least one of query, topic_id, or source_id must be provided.',
         {
           recovery: {

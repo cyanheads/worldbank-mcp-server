@@ -11,10 +11,6 @@ import { notFound, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
-
-/** Minimal request-context shape that satisfies fetchWithTimeout and withRetry. */
-type ReqCtx = Context & Record<string, unknown>;
-
 import type {
   Country,
   DataPoint,
@@ -29,6 +25,9 @@ import type {
   Topic,
   WbEnvelope,
 } from './types.js';
+
+/** Minimal request-context shape that satisfies fetchWithTimeout and withRetry. */
+type ReqCtx = Context & Record<string, unknown>;
 
 // ─── Error detection ─────────────────────────────────────────────────────────
 
@@ -262,14 +261,10 @@ export class WorldBankApiService {
           ind.id.toLowerCase().includes(term) ||
           ind.sourceNote.toLowerCase().includes(term),
       );
-    }
-
-    // Apply pagination to client-filtered results
-    if (clientFilterTerm) {
+      // Paginate the client-filtered results
       const start = (page - 1) * perPage;
-      const pageItems = normalized.slice(start, start + perPage);
       return {
-        indicators: pageItems,
+        indicators: normalized.slice(start, start + perPage),
         total: normalized.length,
         page,
         pages: Math.ceil(normalized.length / perPage),
@@ -501,7 +496,7 @@ export class WorldBankApiService {
       'AFW',
     ]);
 
-    const dataPoints = (items ?? []).map((raw) => normalizeDataPoint(raw, knownAggregates));
+    const dataPoints = items.map((raw) => normalizeDataPoint(raw, knownAggregates));
     const nullCount = dataPoints.filter((d) => d.value === null).length;
 
     // Extract indicator metadata from the first item

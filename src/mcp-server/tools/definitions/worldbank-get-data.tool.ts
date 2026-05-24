@@ -109,7 +109,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
   errors: [
     {
       reason: 'invalid_params',
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       when: 'Both date_range and mrv are provided simultaneously.',
       recovery: 'Remove date_range to use mrv, or remove mrv to use date_range.',
     },
@@ -175,8 +175,12 @@ export const worldbankGetData = tool('worldbank_get_data', {
     const byCountry = new Map<string, typeof result.data>();
     for (const d of result.data) {
       const key = `${d.countryCode}|${d.countryName}`;
-      if (!byCountry.has(key)) byCountry.set(key, []);
-      byCountry.get(key)?.push(d);
+      let bucket = byCountry.get(key);
+      if (!bucket) {
+        bucket = [];
+        byCountry.set(key, bucket);
+      }
+      bucket.push(d);
     }
 
     for (const [key, rows] of byCountry) {
