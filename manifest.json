@@ -1,9 +1,17 @@
 {
   "manifest_version": "0.3",
   "name": "worldbank-mcp-server",
-  "version": "0.1.3",
-  "description": "Query 29,500+ World Bank development indicators for 200+ countries across 60+ years.",
-  "author": { "name": "cyanheads" },
+  "version": "0.1.4",
+  "description": "Query 29,500+ World Bank development indicators for 200+ countries across 60+ years via MCP. STDIO or Streamable HTTP.",
+  "author": {
+    "name": "cyanheads"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cyanheads/worldbank-mcp-server"
+  },
+  "homepage": "https://github.com/cyanheads/worldbank-mcp-server#readme",
+  "license": "Apache-2.0",
   "server": {
     "type": "node",
     "entry_point": "dist/index.js",
@@ -18,7 +26,9 @@
     }
   },
   "compatibility": {
-    "runtimes": { "node": ">=24.0.0" }
+    "runtimes": {
+      "node": ">=24.0.0"
+    }
   },
   "tools_generated": true,
   "prompts_generated": true,

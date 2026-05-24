@@ -6,14 +6,14 @@
     "url": "https://github.com/cyanheads/worldbank-mcp-server",
     "source": "github"
   },
-  "version": "0.1.3",
+  "version": "0.1.4",
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/worldbank-mcp-server",
-      "runtimeHint": "node",
-      "version": "0.1.3",
+      "runtimeHint": "bun",
+      "version": "0.1.4",
       "packageArguments": [
         {
           "type": "positional",
@@ -55,8 +55,8 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/worldbank-mcp-server",
-      "runtimeHint": "node",
-      "version": "0.1.3",
+      "runtimeHint": "bun",
+      "version": "0.1.4",
       "packageArguments": [
         {
           "type": "positional",
