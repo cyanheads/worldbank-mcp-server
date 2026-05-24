@@ -1,6 +1,6 @@
 {
   "name": "@cyanheads/worldbank-mcp-server",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "mcpName": "io.github.cyanheads/worldbank-mcp-server",
   "description": "MCP server for the World Bank Open Data API — 29,500+ development indicators for 200+ countries across 60+ years.",
   "type": "module",

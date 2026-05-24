@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.2](changelog/0.1.x/0.1.2.md) — 2026-05-24
+
+Bug fixes: array-wrapped error envelopes in list_countries, string pagination coercion in list_sources, internal implementation detail removed from search_indicators description; metadata polish
+
 ## [0.1.1](changelog/0.1.x/0.1.1.md) — 2026-05-23
 
 npm publish and GitHub Release for the initial public launch of worldbank-mcp-server — 7 tools, 2 resources, 29,500+ indicators, 200+ countries
