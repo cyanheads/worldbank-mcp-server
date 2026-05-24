@@ -33,6 +33,7 @@
     "bundle": "npm run build && npx -y @anthropic-ai/mcpb pack . dist/worldbank-mcp-server.mcpb",
     "changelog:build": "tsx scripts/build-changelog.ts",
     "changelog:check": "tsx scripts/build-changelog.ts --check",
+    "publish-mcp": "mcp-publisher login github -token \"$(security find-generic-password -a \"$USER\" -s mcp-publisher-github-pat -w)\" && mcp-publisher publish",
     "test": "vitest run",
     "start": "node dist/index.js",
     "start:stdio": "MCP_TRANSPORT_TYPE=stdio node dist/index.js",
