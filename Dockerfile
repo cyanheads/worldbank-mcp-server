@@ -17,8 +17,10 @@ RUN bun install --frozen-lockfile
 # Copy the rest of the source code
 COPY . .
 
-# Build the application
-RUN bun run build
+# Build the application — run tsc and tsc-alias directly to avoid bun intercepting
+# the node shim that tsx requires for its CJS compatibility layer
+RUN node_modules/.bin/tsc -p tsconfig.build.json && \
+    node_modules/.bin/tsc-alias -p tsconfig.build.json
 
 
 # ==============================================================================
