@@ -100,7 +100,9 @@ function normalizeDataPoint(raw: RawDataPoint, aggregateCodes: Set<string>): Dat
     date: raw.date ?? '',
     value: raw.value ?? null,
     obsStatus: raw.obs_status ?? '',
-    isAggregate: aggregateCodes.has(countryCode),
+    // Data endpoint returns country.id as ISO2 (e.g. "ZH" for AFE), but
+    // countryiso3code carries the aggregate code (e.g. "AFE"). Check both.
+    isAggregate: aggregateCodes.has(raw.countryiso3code ?? '') || aggregateCodes.has(countryCode),
   };
 }
 
@@ -320,7 +322,17 @@ export class WorldBankApiService {
   ): Promise<{ countries: Country[]; total: number; page: number; pages: number }> {
     const { region, incomeLevel, includeAggregates, page, perPage } = opts;
 
-    const params: Record<string, string | number | undefined> = { page, per_page: perPage };
+    // When filtering aggregates, the WB API has no server-side parameter for this.
+    // Fetch all entries in one shot (max 300, WB total is ~296) so we can filter
+    // and compute accurate total/pages. When including aggregates, use the requested
+    // page/perPage directly against the API — no over-fetch needed.
+    const fetchPage = includeAggregates ? page : 1;
+    const fetchPerPage = includeAggregates ? perPage : 300;
+
+    const params: Record<string, string | number | undefined> = {
+      page: fetchPage,
+      per_page: fetchPerPage,
+    };
     if (region) params.region = region;
     if (incomeLevel) params.incomeLevel = incomeLevel;
 
@@ -341,7 +353,17 @@ export class WorldBankApiService {
     let countries = (items ?? []).map(normalizeCountry);
 
     if (!includeAggregates) {
+      // Filter aggregates client-side and re-paginate so total/pages match.
       countries = countries.filter((c) => !c.isAggregate);
+      const filteredTotal = countries.length;
+      const filteredPages = Math.max(1, Math.ceil(filteredTotal / perPage));
+      const start = (page - 1) * perPage;
+      return {
+        countries: countries.slice(start, start + perPage),
+        total: filteredTotal,
+        page,
+        pages: filteredPages,
+      };
     }
 
     return {
@@ -411,8 +433,12 @@ export class WorldBankApiService {
     const data = await this.fetchWithRetry<WbEnvelope<RawDataPoint> | WbErrorEnvelope>(url, ctx);
 
     if (isWbErrorEnvelope(data)) {
-      // Could be invalid indicator or country — message is the same either way
-      const msg = data.message[0]?.value ?? 'Invalid value';
+      // Could be invalid indicator or country — message is the same either way.
+      // The /country/{code}/indicator/{id} endpoint wraps errors in an array:
+      // [{ message: [...] }], so data itself is an array and data.message would
+      // be undefined. Unwrap before accessing.
+      const envelope = (Array.isArray(data) ? data[0] : data) as WbErrorEnvelope;
+      const msg = envelope.message[0]?.value ?? 'Invalid value';
       // Try to classify by checking if the indicator ID looks like a WB code
       const isLikelyIndicator = /^[A-Z]{2}\.[A-Z.]+$/.test(indicatorId);
       if (isLikelyIndicator) {
