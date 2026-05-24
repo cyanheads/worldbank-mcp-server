@@ -36,12 +36,17 @@ import type {
 type WbErrorEnvelope = { message: Array<{ id: string; key: string; value: string }> };
 
 function isWbErrorEnvelope(data: unknown): data is WbErrorEnvelope {
-  return (
+  // Direct object: { message: [...] }
+  if (
     typeof data === 'object' &&
     data !== null &&
     'message' in data &&
     Array.isArray((data as WbErrorEnvelope).message)
-  );
+  )
+    return true;
+  // Array-wrapped: [{ message: [...] }] — returned by list endpoints like /country?region=INVALID
+  if (Array.isArray(data) && data.length > 0) return isWbErrorEnvelope(data[0]);
+  return false;
 }
 
 // ─── Normalization helpers ────────────────────────────────────────────────────
@@ -189,9 +194,10 @@ export class WorldBankApiService {
     const [paging, items] = data;
     return {
       sources: (items ?? []).map(normalizeSource),
-      total: paging.total,
-      page: paging.page,
-      pages: paging.pages,
+      // /source returns page/pages/total as strings — coerce to number
+      total: Number(paging.total),
+      page: Number(paging.page),
+      pages: Number(paging.pages),
     };
   }
 
@@ -321,8 +327,16 @@ export class WorldBankApiService {
     const url = this.buildUrl('/country', params);
     ctx.log.debug('Listing countries', { url });
 
-    const data = await this.fetchWithRetry<WbEnvelope<RawCountry>>(url, ctx);
-    const [paging, items] = data;
+    const data = await this.fetchWithRetry<WbEnvelope<RawCountry> | WbErrorEnvelope>(url, ctx);
+
+    if (isWbErrorEnvelope(data)) {
+      throw notFound(
+        'Invalid region or income_level code. Use worldbank_list_countries without filters to browse valid codes.',
+        { reason: 'invalid_filter', region: opts.region, incomeLevel: opts.incomeLevel },
+      );
+    }
+
+    const [paging, items] = data as WbEnvelope<RawCountry>;
 
     let countries = (items ?? []).map(normalizeCountry);
 
