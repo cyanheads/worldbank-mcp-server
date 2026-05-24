@@ -37,8 +37,9 @@ WORKDIR /usr/src/app
 ENV NODE_ENV=production
 
 # OCI image metadata (https://github.com/opencontainers/image-spec/blob/main/annotations.md)
-LABEL org.opencontainers.image.title="worldbank-mcp-server"
-LABEL org.opencontainers.image.description=""
+LABEL org.opencontainers.image.title="@cyanheads/worldbank-mcp-server"
+LABEL org.opencontainers.image.description="MCP server for the World Bank Open Data API — 29,500+ development indicators for 200+ countries across 60+ years."
+LABEL org.opencontainers.image.source="https://github.com/cyanheads/worldbank-mcp-server"
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 
 # Copy dependency manifests

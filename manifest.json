@@ -2,8 +2,8 @@
   "manifest_version": "0.3",
   "name": "worldbank-mcp-server",
   "version": "0.1.1",
-  "description": "",
-  "author": { "name": "" },
+  "description": "World Bank Open Data API — 29,500+ development indicators for 200+ countries across 60+ years.",
+  "author": { "name": "cyanheads" },
   "server": {
     "type": "node",
     "entry_point": "dist/index.js",

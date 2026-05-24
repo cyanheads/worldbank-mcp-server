@@ -1,6 +1,6 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "cyanheads/worldbank-mcp-server",
+  "name": "io.github.cyanheads/worldbank-mcp-server",
   "description": "World Bank Open Data API — 29,500+ development indicators for 200+ countries across 60+ years.",
   "repository": {
     "url": "https://github.com/cyanheads/worldbank-mcp-server",
