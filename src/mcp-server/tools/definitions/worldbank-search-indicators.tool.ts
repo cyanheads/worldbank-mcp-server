@@ -15,7 +15,7 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
     'Searches the 29,500+ World Bank indicator catalog by keyword, topic, or source. ' +
     'Returns indicator IDs and metadata for chaining into worldbank_get_data. ' +
     'At least one of query, topic_id, or source_id must be provided. ' +
-    'When topic_id or source_id is given with a query, filtering is applied client-side because the API ignores searchterm when a topic or source filter is active. ' +
+    'When combined with topic_id or source_id, keyword filtering applies across all results in that topic or source. ' +
     'Use worldbank_list_topics for topic IDs, worldbank_list_sources for source IDs.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
