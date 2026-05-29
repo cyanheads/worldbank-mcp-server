@@ -28,6 +28,7 @@ await createApp({
   ],
   resources: [worldbankIndicatorResource, worldbankCountryResource],
   prompts: [],
+  landing: { requireAuth: false },
   setup(core) {
     initWorldBankApiService(core.config, core.storage);
   },

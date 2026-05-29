@@ -1,0 +1,9 @@
+{
+  "@cyanheads/worldbank-mcp-server": {
+    "command": "npx",
+    "args": ["-y", "@cyanheads/worldbank-mcp-server"],
+    "env": {
+      "MCP_TRANSPORT_TYPE": "stdio"
+    }
+  }
+}
