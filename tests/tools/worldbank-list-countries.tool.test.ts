@@ -115,4 +115,80 @@ describe('worldbankListCountries', () => {
     // Aggregate tag
     expect(text).toContain('[Aggregate]');
   });
+
+  // ─── Zod input validation ─────────────────────────────────────────────────
+
+  it('rejects page below minimum (0)', async () => {
+    const { worldbankListCountries } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
+    );
+    expect(() => worldbankListCountries.input.parse({ page: 0 })).toThrow();
+  });
+
+  it('rejects per_page above maximum (301)', async () => {
+    const { worldbankListCountries } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
+    );
+    expect(() => worldbankListCountries.input.parse({ per_page: 301 })).toThrow();
+  });
+
+  it('accepts include_aggregates=true', async () => {
+    const { worldbankListCountries } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
+    );
+    expect(() => worldbankListCountries.input.parse({ include_aggregates: true })).not.toThrow();
+  });
+
+  // ─── Handler: include_aggregates flag ────────────────────────────────────
+
+  it('passes include_aggregates=true to service', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    const listCountriesMock = vi.fn().mockResolvedValue(mockCountriesResult);
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      listCountries: listCountriesMock,
+    } as never);
+
+    const { worldbankListCountries } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
+    );
+    const ctx = createMockContext();
+    const input = worldbankListCountries.input.parse({ include_aggregates: true });
+    await worldbankListCountries.handler(input, ctx);
+    const callArgs = listCountriesMock.mock.calls[0][0];
+    expect(callArgs.includeAggregates).toBe(true);
+  });
+
+  // ─── Format edge cases ────────────────────────────────────────────────────
+
+  it('format renders fallback message when countries list is empty', async () => {
+    const { worldbankListCountries } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
+    );
+    const blocks = worldbankListCountries.format!({ countries: [] });
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).toContain('No countries matched');
+  });
+
+  it('format omits capital line when capitalCity is empty', async () => {
+    const { worldbankListCountries } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
+    );
+    const noCapital = mockCountriesResult.countries.filter((c) => !c.capitalCity);
+    const blocks = worldbankListCountries.format!({ countries: noCapital });
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).not.toContain('Capital:');
+  });
+
+  // ─── Security ─────────────────────────────────────────────────────────────
+
+  it('format output never leaks env variable names or API keys', async () => {
+    const { worldbankListCountries } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
+    );
+    const blocks = worldbankListCountries.format!({ countries: mockCountriesResult.countries });
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).not.toMatch(/WORLDBANK_API/);
+    expect(text).not.toMatch(/process\.env/);
+    expect(text).not.toMatch(/Authorization/i);
+  });
 });

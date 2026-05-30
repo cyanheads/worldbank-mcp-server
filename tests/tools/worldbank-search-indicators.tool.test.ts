@@ -110,4 +110,142 @@ describe('worldbankSearchIndicators', () => {
     expect(text).toContain('Economy & Growth (3)');
     expect(text).toContain('GDP per capita description.');
   });
+
+  // ─── Zod input validation ─────────────────────────────────────────────────
+
+  it('rejects page below minimum (0)', async () => {
+    const { worldbankSearchIndicators } = await import(
+      '@/mcp-server/tools/definitions/worldbank-search-indicators.tool.js'
+    );
+    expect(() => worldbankSearchIndicators.input.parse({ query: 'GDP', page: 0 })).toThrow();
+  });
+
+  it('rejects per_page above maximum (101)', async () => {
+    const { worldbankSearchIndicators } = await import(
+      '@/mcp-server/tools/definitions/worldbank-search-indicators.tool.js'
+    );
+    expect(() => worldbankSearchIndicators.input.parse({ query: 'GDP', per_page: 101 })).toThrow();
+  });
+
+  it('defaults page to 1 when absent', async () => {
+    const { worldbankSearchIndicators } = await import(
+      '@/mcp-server/tools/definitions/worldbank-search-indicators.tool.js'
+    );
+    const parsed = worldbankSearchIndicators.input.parse({ query: 'GDP' });
+    expect(parsed.page).toBe(1);
+  });
+
+  // ─── Handler: filter logic ────────────────────────────────────────────────
+
+  it('succeeds with only topic_id (no query)', async () => {
+    const { worldbankSearchIndicators } = await import(
+      '@/mcp-server/tools/definitions/worldbank-search-indicators.tool.js'
+    );
+    const ctx = createMockContext({ errors: worldbankSearchIndicators.errors });
+    const input = worldbankSearchIndicators.input.parse({ topic_id: '3' });
+    const result = await worldbankSearchIndicators.handler(input, ctx);
+    expect(result.indicators).toHaveLength(1);
+  });
+
+  it('succeeds with only source_id (no query)', async () => {
+    const { worldbankSearchIndicators } = await import(
+      '@/mcp-server/tools/definitions/worldbank-search-indicators.tool.js'
+    );
+    const ctx = createMockContext({ errors: worldbankSearchIndicators.errors });
+    const input = worldbankSearchIndicators.input.parse({ source_id: '2' });
+    const result = await worldbankSearchIndicators.handler(input, ctx);
+    expect(result.indicators).toHaveLength(1);
+  });
+
+  it('trims whitespace from query before using it in enrichment echo', async () => {
+    const { worldbankSearchIndicators } = await import(
+      '@/mcp-server/tools/definitions/worldbank-search-indicators.tool.js'
+    );
+    const { getEnrichment } = await import('@cyanheads/mcp-ts-core/testing');
+    const ctx = createMockContext({ errors: worldbankSearchIndicators.errors });
+    const input = worldbankSearchIndicators.input.parse({ query: '  GDP per capita  ' });
+    await worldbankSearchIndicators.handler(input, ctx);
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.effectiveQuery).toContain('GDP per capita');
+    // Should not contain leading/trailing spaces
+    expect(enrichment.effectiveQuery).not.toContain('  GDP');
+  });
+
+  it('sets non-query empty-results notice when only topic filter used', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      searchIndicators: vi.fn().mockResolvedValue({ indicators: [], total: 0, page: 1, pages: 0 }),
+    } as never);
+
+    const { worldbankSearchIndicators } = await import(
+      '@/mcp-server/tools/definitions/worldbank-search-indicators.tool.js'
+    );
+    const { getEnrichment } = await import('@cyanheads/mcp-ts-core/testing');
+    const ctx = createMockContext({ errors: worldbankSearchIndicators.errors });
+    const input = worldbankSearchIndicators.input.parse({ topic_id: '99' });
+    await worldbankSearchIndicators.handler(input, ctx);
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.notice).toBeDefined();
+    expect(enrichment.notice).not.toContain('"'); // non-query branch doesn't echo a query string
+  });
+
+  // ─── Format edge cases ────────────────────────────────────────────────────
+
+  it('format omits topics line when indicator has no topics', async () => {
+    const { worldbankSearchIndicators } = await import(
+      '@/mcp-server/tools/definitions/worldbank-search-indicators.tool.js'
+    );
+    const noTopics = [{ ...mockSearchResult.indicators[0], topics: [] }];
+    const blocks = worldbankSearchIndicators.format!({ indicators: noTopics });
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).not.toContain('Topics:');
+  });
+
+  it('format omits sourceNote when empty', async () => {
+    const { worldbankSearchIndicators } = await import(
+      '@/mcp-server/tools/definitions/worldbank-search-indicators.tool.js'
+    );
+    const noNote = [{ ...mockSearchResult.indicators[0], sourceNote: '' }];
+    const blocks = worldbankSearchIndicators.format!({ indicators: noNote });
+    const text = (blocks[0] as { text: string }).text;
+    // Should still have the indicator name and ID, just no note
+    expect(text).toContain('NY.GDP.PCAP.CD');
+    expect(text).not.toContain('GDP per capita description.'); // the note text
+  });
+
+  // ─── Security ─────────────────────────────────────────────────────────────
+
+  it('format output never leaks env variable names or API keys', async () => {
+    const { worldbankSearchIndicators } = await import(
+      '@/mcp-server/tools/definitions/worldbank-search-indicators.tool.js'
+    );
+    const blocks = worldbankSearchIndicators.format!({ indicators: mockSearchResult.indicators });
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).not.toMatch(/WORLDBANK_API/);
+    expect(text).not.toMatch(/process\.env/);
+    expect(text).not.toMatch(/Authorization/i);
+  });
+
+  it('injection-attempt query does not cause handler to crash', async () => {
+    const { worldbankSearchIndicators } = await import(
+      '@/mcp-server/tools/definitions/worldbank-search-indicators.tool.js'
+    );
+    const ctx = createMockContext({ errors: worldbankSearchIndicators.errors });
+    const injectionQuery = '<script>alert(1)</script>';
+    const input = worldbankSearchIndicators.input.parse({ query: injectionQuery });
+    // Should succeed (service mock returns normal data); no crash from injection chars
+    const result = await worldbankSearchIndicators.handler(input, ctx);
+    expect(result.indicators).toBeDefined();
+  });
+
+  it('oversized query string (5000 chars) does not crash handler', async () => {
+    const { worldbankSearchIndicators } = await import(
+      '@/mcp-server/tools/definitions/worldbank-search-indicators.tool.js'
+    );
+    const ctx = createMockContext({ errors: worldbankSearchIndicators.errors });
+    const oversized = 'a'.repeat(5000);
+    const input = worldbankSearchIndicators.input.parse({ query: oversized });
+    const result = await worldbankSearchIndicators.handler(input, ctx);
+    expect(result.indicators).toBeDefined();
+  });
 });

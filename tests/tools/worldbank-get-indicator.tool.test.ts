@@ -85,4 +85,65 @@ describe('worldbankGetIndicator', () => {
     expect(text).toContain('Private Sector (19)');
     expect(text).toContain('GDP per capita is gross domestic product');
   });
+
+  // ─── Zod input validation ─────────────────────────────────────────────────
+
+  it('rejects empty indicator_id', async () => {
+    const { worldbankGetIndicator } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-indicator.tool.js'
+    );
+    expect(() => worldbankGetIndicator.input.parse({ indicator_id: '' })).toThrow();
+  });
+
+  it('rejects missing indicator_id', async () => {
+    const { worldbankGetIndicator } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-indicator.tool.js'
+    );
+    expect(() => worldbankGetIndicator.input.parse({})).toThrow();
+  });
+
+  // ─── Format edge cases ────────────────────────────────────────────────────
+
+  it('format omits Topics line when topics array is empty', async () => {
+    const { worldbankGetIndicator } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-indicator.tool.js'
+    );
+    const noTopics = { ...mockIndicator, topics: [] };
+    const blocks = worldbankGetIndicator.format!(noTopics);
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).not.toContain('Topics:');
+  });
+
+  it('format omits Unit line when unit is empty', async () => {
+    const { worldbankGetIndicator } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-indicator.tool.js'
+    );
+    const noUnit = { ...mockIndicator, unit: '' };
+    const blocks = worldbankGetIndicator.format!(noUnit);
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).not.toContain('Unit:');
+  });
+
+  it('format omits Organization line when sourceOrganization is empty', async () => {
+    const { worldbankGetIndicator } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-indicator.tool.js'
+    );
+    const noOrg = { ...mockIndicator, sourceOrganization: '' };
+    const blocks = worldbankGetIndicator.format!(noOrg);
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).not.toContain('Organization:');
+  });
+
+  // ─── Security ─────────────────────────────────────────────────────────────
+
+  it('format output never leaks env variable names or API keys', async () => {
+    const { worldbankGetIndicator } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-indicator.tool.js'
+    );
+    const blocks = worldbankGetIndicator.format!(mockIndicator);
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).not.toMatch(/WORLDBANK_API/);
+    expect(text).not.toMatch(/process\.env/);
+    expect(text).not.toMatch(/Authorization/i);
+  });
 });

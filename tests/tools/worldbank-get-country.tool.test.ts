@@ -107,4 +107,83 @@ describe('worldbankGetCountry', () => {
     expect(text).toContain('Yes'); // isAggregate: true
     expect(text).toContain('EAS');
   });
+
+  // ─── Zod input validation ─────────────────────────────────────────────────
+
+  it('rejects empty country_code', async () => {
+    const { worldbankGetCountry } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-country.tool.js'
+    );
+    expect(() => worldbankGetCountry.input.parse({ country_code: '' })).toThrow();
+  });
+
+  it('rejects missing country_code', async () => {
+    const { worldbankGetCountry } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-country.tool.js'
+    );
+    expect(() => worldbankGetCountry.input.parse({})).toThrow();
+  });
+
+  // ─── Security ─────────────────────────────────────────────────────────────
+
+  it('passes injection-attempt country code to service log unmodified', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    const getCountryMock = vi.fn().mockResolvedValue(mockCountry);
+    vi.mocked(getWorldBankApiService).mockReturnValue({ getCountry: getCountryMock } as never);
+
+    const { worldbankGetCountry } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-country.tool.js'
+    );
+    const ctx = createMockContext({ errors: worldbankGetCountry.errors });
+    // The tool should forward the raw input to the service without silently
+    // sanitizing or truncating it — the service enforces validity.
+    const injectionCode = "US'; DROP TABLE--";
+    const input = worldbankGetCountry.input.parse({ country_code: injectionCode });
+    await worldbankGetCountry.handler(input, ctx);
+    expect(getCountryMock).toHaveBeenCalledWith(injectionCode, expect.anything());
+  });
+
+  it('format output never leaks env variable names or API keys', async () => {
+    const { worldbankGetCountry } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-country.tool.js'
+    );
+    const blocks = worldbankGetCountry.format!(mockCountry);
+    const text = (blocks[0] as { text: string }).text;
+    // No env variable names or patterns that look like API keys/tokens
+    expect(text).not.toMatch(/WORLDBANK_API/);
+    expect(text).not.toMatch(/process\.env/);
+    expect(text).not.toMatch(/Authorization/i);
+  });
+
+  // ─── Format edge cases ────────────────────────────────────────────────────
+
+  it('format omits coordinates line when longitude/latitude are empty', async () => {
+    const { worldbankGetCountry } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-country.tool.js'
+    );
+    const sparseCountry = { ...mockCountry, longitude: '', latitude: '' };
+    const blocks = worldbankGetCountry.format!(sparseCountry);
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).not.toContain('Coordinates');
+  });
+
+  it('format omits capital line when capitalCity is empty', async () => {
+    const { worldbankGetCountry } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-country.tool.js'
+    );
+    const sparseCountry = { ...mockCountry, capitalCity: '' };
+    const blocks = worldbankGetCountry.format!(sparseCountry);
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).not.toContain('Capital:');
+  });
+
+  it('format renders N/A for empty lendingType', async () => {
+    const { worldbankGetCountry } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-country.tool.js'
+    );
+    const sparseCountry = { ...mockCountry, lendingType: '' };
+    const blocks = worldbankGetCountry.format!(sparseCountry);
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).toContain('N/A');
+  });
 });

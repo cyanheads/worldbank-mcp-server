@@ -120,4 +120,32 @@ describe('worldbankCountryResource', () => {
     expect(result.latitude).toBe('');
     expect(result.isAggregate).toBe(false);
   });
+
+  // ─── Zod params validation ─────────────────────────────────────────────────
+
+  it('rejects missing countryCode', async () => {
+    const { worldbankCountryResource } = await import(
+      '@/mcp-server/resources/definitions/worldbank-country.resource.js'
+    );
+    expect(() => worldbankCountryResource.params.parse({})).toThrow();
+  });
+
+  // ─── Security ─────────────────────────────────────────────────────────────
+
+  it('notFound error message does not leak env variable names or API keys', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      getCountry: vi.fn().mockRejectedValue(new Error('not found')),
+    } as never);
+
+    const { worldbankCountryResource } = await import(
+      '@/mcp-server/resources/definitions/worldbank-country.resource.js'
+    );
+    const ctx = createMockContext();
+    const params = worldbankCountryResource.params.parse({ countryCode: 'ZZ' });
+    const err = await worldbankCountryResource.handler(params, ctx).catch((e: unknown) => e);
+    const errStr = JSON.stringify(err);
+    expect(errStr).not.toMatch(/WORLDBANK_API/);
+    expect(errStr).not.toMatch(/Authorization/i);
+  });
 });

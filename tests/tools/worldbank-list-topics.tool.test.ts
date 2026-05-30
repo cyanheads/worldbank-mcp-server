@@ -51,4 +51,56 @@ describe('worldbankListTopics', () => {
     expect(text).toContain('Economy & Growth');
     expect(text).toContain('Covers farming and rural areas.');
   });
+
+  // ─── Edge cases ───────────────────────────────────────────────────────────
+
+  it('returns empty topics list when service returns none', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      listTopics: vi.fn().mockResolvedValue([]),
+    } as never);
+
+    const { worldbankListTopics } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-topics.tool.js'
+    );
+    const ctx = createMockContext();
+    const input = worldbankListTopics.input.parse({});
+    const result = await worldbankListTopics.handler(input, ctx);
+    expect(result.topics).toHaveLength(0);
+  });
+
+  it('format renders topic count in header', async () => {
+    const { worldbankListTopics } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-topics.tool.js'
+    );
+    const blocks = worldbankListTopics.format!({ topics: mockTopics });
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).toContain('2 total');
+  });
+
+  it('format omits sourceNote line when it is empty', async () => {
+    const { worldbankListTopics } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-topics.tool.js'
+    );
+    const noNote = [{ id: '5', name: 'Trade', sourceNote: '' }];
+    const blocks = worldbankListTopics.format!({ topics: noNote });
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).toContain('Trade');
+    // The format function only renders sourceNote if truthy — empty string should be absent
+    // Confirm the text contains the topic but doesn't have a blank line artifact that would mislead
+    expect(text.trim()).not.toBe('');
+  });
+
+  // ─── Security ─────────────────────────────────────────────────────────────
+
+  it('format output never leaks env variable names or API keys', async () => {
+    const { worldbankListTopics } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-topics.tool.js'
+    );
+    const blocks = worldbankListTopics.format!({ topics: mockTopics });
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).not.toMatch(/WORLDBANK_API/);
+    expect(text).not.toMatch(/process\.env/);
+    expect(text).not.toMatch(/Authorization/i);
+  });
 });

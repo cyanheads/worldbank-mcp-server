@@ -90,4 +90,32 @@ describe('worldbankIndicatorResource', () => {
     expect(result.unit).toBe('');
     expect(result.sourceOrganization).toBe('');
   });
+
+  // ─── Zod params validation ─────────────────────────────────────────────────
+
+  it('rejects missing indicatorId', async () => {
+    const { worldbankIndicatorResource } = await import(
+      '@/mcp-server/resources/definitions/worldbank-indicator.resource.js'
+    );
+    expect(() => worldbankIndicatorResource.params.parse({})).toThrow();
+  });
+
+  // ─── Security ─────────────────────────────────────────────────────────────
+
+  it('notFound error message does not leak env variable names or API keys', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      getIndicator: vi.fn().mockRejectedValue(new Error('not found')),
+    } as never);
+
+    const { worldbankIndicatorResource } = await import(
+      '@/mcp-server/resources/definitions/worldbank-indicator.resource.js'
+    );
+    const ctx = createMockContext();
+    const params = worldbankIndicatorResource.params.parse({ indicatorId: 'INVALID.XYZ' });
+    const err = await worldbankIndicatorResource.handler(params, ctx).catch((e: unknown) => e);
+    const errStr = JSON.stringify(err);
+    expect(errStr).not.toMatch(/WORLDBANK_API/);
+    expect(errStr).not.toMatch(/Authorization/i);
+  });
 });

@@ -88,4 +88,66 @@ describe('worldbankListSources', () => {
     expect(text).toContain('Concepts');
     expect(text).toContain('1400');
   });
+
+  // ─── Zod input validation ─────────────────────────────────────────────────
+
+  it('rejects page below minimum (0)', async () => {
+    const { worldbankListSources } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-sources.tool.js'
+    );
+    expect(() => worldbankListSources.input.parse({ page: 0 })).toThrow();
+  });
+
+  it('rejects per_page above maximum (101)', async () => {
+    const { worldbankListSources } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-sources.tool.js'
+    );
+    expect(() => worldbankListSources.input.parse({ per_page: 101 })).toThrow();
+  });
+
+  it('defaults page to 1 when absent', async () => {
+    const { worldbankListSources } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-sources.tool.js'
+    );
+    const parsed = worldbankListSources.input.parse({});
+    expect(parsed.page).toBe(1);
+  });
+
+  // ─── Format edge cases ────────────────────────────────────────────────────
+
+  it('format omits optional fields for sparse source entries', async () => {
+    const { worldbankListSources } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-sources.tool.js'
+    );
+    const sparseSource = [
+      {
+        id: '99',
+        name: 'Sparse Source',
+        code: '',
+        lastUpdated: '',
+        dataAvailability: '',
+        metadataAvailability: '',
+        concepts: '',
+      },
+    ];
+    const blocks = worldbankListSources.format!({ sources: sparseSource });
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).toContain('Sparse Source');
+    // Optional fields without values are omitted by the format function
+    expect(text).not.toContain('Last updated:');
+    expect(text).not.toContain('Data availability:');
+  });
+
+  // ─── Security ─────────────────────────────────────────────────────────────
+
+  it('format output never leaks env variable names or API keys', async () => {
+    const { worldbankListSources } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-sources.tool.js'
+    );
+    const blocks = worldbankListSources.format!({ sources: mockSourcesResult.sources });
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).not.toMatch(/WORLDBANK_API/);
+    expect(text).not.toMatch(/process\.env/);
+    expect(text).not.toMatch(/Authorization/i);
+  });
 });

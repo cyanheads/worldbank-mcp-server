@@ -226,4 +226,137 @@ describe('worldbankGetData', () => {
     expect(rendered).toBe('No data');
     expect(rendered).not.toContain('0'); // must not fabricate 0 for null
   });
+
+  // ─── Zod input validation ─────────────────────────────────────────────────
+
+  it('rejects empty indicator_id', async () => {
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    expect(() => worldbankGetData.input.parse({ indicator_id: '', countries: 'US' })).toThrow();
+  });
+
+  it('rejects mrv below minimum (0)', async () => {
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    expect(() =>
+      worldbankGetData.input.parse({ indicator_id: 'NY.GDP.PCAP.CD', countries: 'US', mrv: 0 }),
+    ).toThrow();
+  });
+
+  it('rejects mrv above maximum (11)', async () => {
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    expect(() =>
+      worldbankGetData.input.parse({ indicator_id: 'NY.GDP.PCAP.CD', countries: 'US', mrv: 11 }),
+    ).toThrow();
+  });
+
+  it('accepts mrv at boundary values 1 and 10', async () => {
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    expect(() =>
+      worldbankGetData.input.parse({ indicator_id: 'NY.GDP.PCAP.CD', countries: 'US', mrv: 1 }),
+    ).not.toThrow();
+    expect(() =>
+      worldbankGetData.input.parse({ indicator_id: 'NY.GDP.PCAP.CD', countries: 'US', mrv: 10 }),
+    ).not.toThrow();
+  });
+
+  it('rejects per_page above maximum (1001)', async () => {
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    expect(() =>
+      worldbankGetData.input.parse({
+        indicator_id: 'NY.GDP.PCAP.CD',
+        countries: 'US',
+        per_page: 1001,
+      }),
+    ).toThrow();
+  });
+
+  it('rejects page below minimum (0)', async () => {
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    expect(() =>
+      worldbankGetData.input.parse({ indicator_id: 'NY.GDP.PCAP.CD', countries: 'US', page: 0 }),
+    ).toThrow();
+  });
+
+  // ─── Handler edge cases ────────────────────────────────────────────────────
+
+  it('trims whitespace from date_range before using it', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    const getDataMock = vi.fn().mockResolvedValue(mockDataResult);
+    vi.mocked(getWorldBankApiService).mockReturnValue({ getData: getDataMock } as never);
+
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const ctx = createMockContext({ errors: worldbankGetData.errors });
+    const input = worldbankGetData.input.parse({
+      indicator_id: 'NY.GDP.PCAP.CD',
+      countries: 'US',
+      date_range: '  2020:2022  ',
+    });
+    await worldbankGetData.handler(input, ctx);
+    const callArgs = getDataMock.mock.calls[0][0];
+    expect(callArgs.dateRange).toBe('2020:2022');
+  });
+
+  it('treats whitespace-only date_range as absent', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    const getDataMock = vi.fn().mockResolvedValue(mockDataResult);
+    vi.mocked(getWorldBankApiService).mockReturnValue({ getData: getDataMock } as never);
+
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const ctx = createMockContext({ errors: worldbankGetData.errors });
+    const input = worldbankGetData.input.parse({
+      indicator_id: 'NY.GDP.PCAP.CD',
+      countries: 'US',
+      date_range: '   ',
+    });
+    await worldbankGetData.handler(input, ctx);
+    const callArgs = getDataMock.mock.calls[0][0];
+    expect(callArgs.dateRange).toBeUndefined();
+  });
+
+  // ─── Security ─────────────────────────────────────────────────────────────
+
+  it('format output never leaks env variable names or API keys', async () => {
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const domainResult = {
+      data: mockDataResult.data,
+      indicator: mockDataResult.indicator,
+      nullCount: mockDataResult.nullCount,
+    };
+    const blocks = worldbankGetData.format!(domainResult);
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).not.toMatch(/WORLDBANK_API/);
+    expect(text).not.toMatch(/process\.env/);
+    expect(text).not.toMatch(/Authorization/i);
+  });
+
+  it('format renders obsStatus when non-empty', async () => {
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const withStatus = {
+      data: [{ ...mockDataResult.data[0], obsStatus: 'E', value: 12345.67 }],
+      indicator: mockDataResult.indicator,
+      nullCount: 0,
+    };
+    const blocks = worldbankGetData.format!(withStatus);
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).toContain('obs_status: E');
+  });
 });
