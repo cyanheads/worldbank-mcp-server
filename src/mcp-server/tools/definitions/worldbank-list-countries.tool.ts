@@ -80,14 +80,19 @@ export const worldbankListCountries = tool('worldbank_list_countries', {
           .describe('A country or aggregate entry.'),
       )
       .describe('Countries (and optionally aggregates) matching the filters.'),
-    total: z
+  }),
+
+  // Agent-facing context: pagination totals. Kept out of the domain return so it
+  // reaches both structuredContent and content[] automatically.
+  enrichment: {
+    totalCount: z
       .number()
       .describe(
         'Total matching entries before pagination (includes aggregates if include_aggregates=true).',
       ),
-    page: z.number().describe('Current page number.'),
-    pages: z.number().describe('Total number of pages.'),
-  }),
+    currentPage: z.number().describe('Current page number.'),
+    totalPages: z.number().describe('Total number of pages.'),
+  },
 
   handler(input, ctx) {
     const perPage = input.per_page ?? getServerConfig().defaultPerPage;
@@ -99,7 +104,7 @@ export const worldbankListCountries = tool('worldbank_list_countries', {
     });
     const region = input.region?.trim() || undefined;
     const incomeLevel = input.income_level?.trim() || undefined;
-    return getWorldBankApiService().listCountries(
+    const resultPromise = getWorldBankApiService().listCountries(
       {
         ...(region !== undefined && { region }),
         ...(incomeLevel !== undefined && { incomeLevel }),
@@ -109,12 +114,14 @@ export const worldbankListCountries = tool('worldbank_list_countries', {
       },
       ctx,
     );
+    return resultPromise.then((result) => {
+      ctx.enrich({ totalCount: result.total, currentPage: result.page, totalPages: result.pages });
+      return { countries: result.countries };
+    });
   },
 
   format: (result) => {
-    const lines: string[] = [
-      `**Countries — Page ${result.page} of ${result.pages} (${result.total} total)**\n`,
-    ];
+    const lines: string[] = [];
     for (const c of result.countries) {
       const tag = c.isAggregate ? ' [Aggregate]' : '';
       lines.push(`### ${c.name} (${c.id}${tag})`);
@@ -125,9 +132,7 @@ export const worldbankListCountries = tool('worldbank_list_countries', {
       if (c.capitalCity) lines.push(`**Capital:** ${c.capitalCity}`);
       if (c.longitude && c.latitude) lines.push(`**Coordinates:** ${c.latitude}, ${c.longitude}`);
     }
-    if (result.page < result.pages) {
-      lines.push(`\n_Use page=${result.page + 1} for more results._`);
-    }
+    if (lines.length === 0) lines.push('No countries matched the specified filters.');
     return [{ type: 'text', text: lines.join('\n') }];
   },
 });

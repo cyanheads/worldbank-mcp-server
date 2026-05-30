@@ -96,15 +96,26 @@ export const worldbankGetData = tool('worldbank_get_data', {
         name: z.string().describe('Indicator name.'),
       })
       .describe('Indicator metadata echoed from the response.'),
-    total: z.number().describe('Total observations before pagination.'),
-    page: z.number().describe('Current page number.'),
-    pages: z.number().describe('Total number of pages.'),
     nullCount: z
       .number()
       .describe(
         'Count of null values on this page — indicates data sparsity for the requested filter.',
       ),
   }),
+
+  // Agent-facing context: pagination totals and query orientation. Kept out of the
+  // domain return so it reaches both structuredContent and content[] automatically.
+  enrichment: {
+    totalCount: z.number().describe('Total observations before pagination.'),
+    currentPage: z.number().describe('Current page number.'),
+    totalPages: z.number().describe('Total number of pages.'),
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'Recovery hint for sparse or empty result sets — suggests how to broaden the query.',
+      ),
+  },
 
   errors: [
     {
@@ -152,7 +163,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
       page: input.page,
     });
 
-    return getWorldBankApiService().getData(
+    const result = await getWorldBankApiService().getData(
       {
         indicatorId: input.indicator_id,
         countries: input.countries,
@@ -163,12 +174,27 @@ export const worldbankGetData = tool('worldbank_get_data', {
       },
       ctx,
     );
+
+    ctx.enrich({ totalCount: result.total, currentPage: result.page, totalPages: result.pages });
+
+    if (result.data.length === 0) {
+      ctx.enrich.notice(
+        'No observations returned for the requested filter. ' +
+          'Try broadening the date range, removing date filters, or using mrv=5 to fetch the most recent available values.',
+      );
+    }
+
+    return {
+      data: result.data,
+      indicator: result.indicator,
+      nullCount: result.nullCount,
+    };
   },
 
   format: (result) => {
     const lines: string[] = [
       `# ${result.indicator.name || result.indicator.id}`,
-      `**ID:** \`${result.indicator.id}\` | **Page ${result.page} of ${result.pages}** (${result.total} total observations, ${result.nullCount} null on this page)\n`,
+      `**ID:** \`${result.indicator.id}\` | **Null values this page:** ${result.nullCount}\n`,
     ];
 
     // Group by country for readability
@@ -194,10 +220,6 @@ export const worldbankGetData = tool('worldbank_get_data', {
         const statusStr = row.obsStatus ? ` [obs_status: ${row.obsStatus}]` : '';
         lines.push(`- **${row.date}:** ${valStr}${statusStr}`);
       }
-    }
-
-    if (result.page < result.pages) {
-      lines.push(`\n_Use page=${result.page + 1} for more results._`);
     }
 
     return [{ type: 'text', text: lines.join('\n') }];

@@ -40,21 +40,33 @@ export const worldbankListSources = tool('worldbank_list_sources', {
           .describe('A World Bank data source entry.'),
       )
       .describe('World Bank data sources for this page.'),
-    total: z.number().describe('Total number of sources.'),
-    page: z.number().describe('Current page number.'),
-    pages: z.number().describe('Total number of pages.'),
   }),
+
+  // Agent-facing context: pagination totals. Kept out of the domain return so it
+  // reaches both structuredContent and content[] automatically.
+  enrichment: {
+    totalCount: z.number().describe('Total number of sources.'),
+    currentPage: z.number().describe('Current page number.'),
+    totalPages: z.number().describe('Total number of pages.'),
+  },
 
   handler(input, ctx) {
     const perPage = input.per_page ?? getServerConfig().defaultPerPage;
     ctx.log.info('Listing World Bank sources', { page: input.page, perPage });
-    return getWorldBankApiService().listSources(input.page, perPage, ctx);
+    return getWorldBankApiService()
+      .listSources(input.page, perPage, ctx)
+      .then((result) => {
+        ctx.enrich({
+          totalCount: result.total,
+          currentPage: result.page,
+          totalPages: result.pages,
+        });
+        return { sources: result.sources };
+      });
   },
 
   format: (result) => {
-    const lines: string[] = [
-      `**Sources — Page ${result.page} of ${result.pages} (${result.total} total)**\n`,
-    ];
+    const lines: string[] = [];
     for (const s of result.sources) {
       lines.push(`### ${s.name} (ID: ${s.id}, Code: ${s.code || 'N/A'})`);
       if (s.lastUpdated) lines.push(`**Last updated:** ${s.lastUpdated}`);
@@ -62,9 +74,6 @@ export const worldbankListSources = tool('worldbank_list_sources', {
       if (s.metadataAvailability)
         lines.push(`**Metadata availability:** ${s.metadataAvailability}`);
       if (s.concepts) lines.push(`**Concepts:** ${s.concepts}`);
-    }
-    if (result.page < result.pages) {
-      lines.push(`\n_Use page=${result.page + 1} to see the next page._`);
     }
     return [{ type: 'text', text: lines.join('\n') }];
   },

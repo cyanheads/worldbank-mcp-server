@@ -3,7 +3,7 @@
  * @module tests/tools/worldbank-list-countries.tool.test
  */
 
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@/services/worldbank/worldbank-service.js', () => ({
@@ -66,6 +66,19 @@ describe('worldbankListCountries', () => {
     expect(result.countries[0].id).toBe('US');
   });
 
+  it('populates enrichment with totalCount and pagination', async () => {
+    const { worldbankListCountries } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
+    );
+    const ctx = createMockContext();
+    const input = worldbankListCountries.input.parse({});
+    await worldbankListCountries.handler(input, ctx);
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.totalCount).toBe(2);
+    expect(enrichment.currentPage).toBe(1);
+    expect(enrichment.totalPages).toBe(1);
+  });
+
   it('skips empty string region/income filters from form clients', async () => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
     const listCountriesMock = vi.fn().mockResolvedValue(mockCountriesResult);
@@ -89,7 +102,7 @@ describe('worldbankListCountries', () => {
     const { worldbankListCountries } = await import(
       '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
     );
-    const blocks = worldbankListCountries.format!(mockCountriesResult);
+    const blocks = worldbankListCountries.format!({ countries: mockCountriesResult.countries });
     expect(blocks[0].type).toBe('text');
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('United States');

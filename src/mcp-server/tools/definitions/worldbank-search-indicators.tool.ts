@@ -74,14 +74,24 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
           .describe('A matching indicator with metadata.'),
       )
       .describe('Matching indicators for this page.'),
-    total: z.number().describe('Total matching indicators before pagination.'),
-    page: z.number().describe('Current page number.'),
-    pages: z.number().describe('Total number of pages.'),
-    message: z
+  }),
+
+  // Agent-facing context: pagination totals, query echo, and empty-result guidance.
+  // Kept out of the domain return so it reaches both structuredContent and content[]
+  // without a format() entry or format-parity concern.
+  enrichment: {
+    effectiveQuery: z
+      .string()
+      .optional()
+      .describe('Active filters echoed: keyword, topic ID, and/or source ID that were applied.'),
+    totalCount: z.number().describe('Total matching indicators before pagination.'),
+    currentPage: z.number().describe('Current page number.'),
+    totalPages: z.number().describe('Total number of pages.'),
+    notice: z
       .string()
       .optional()
       .describe('Recovery hint when no indicators matched — suggests how to broaden the search.'),
-  }),
+  },
 
   errors: [
     {
@@ -131,29 +141,26 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
       ctx,
     );
 
+    // Build effective-query echo from active filters
+    const filterParts: string[] = [];
+    if (query) filterParts.push(`query="${query}"`);
+    if (topicId) filterParts.push(`topic_id=${topicId}`);
+    if (sourceId) filterParts.push(`source_id=${sourceId}`);
+    ctx.enrich({ effectiveQuery: filterParts.join(', ') });
+    ctx.enrich({ totalCount: result.total, currentPage: result.page, totalPages: result.pages });
+
     if (result.indicators.length === 0) {
       const hint = query
         ? `No indicators matched "${query}". Try a synonym or browse by topic using worldbank_list_topics.`
         : 'No indicators found for the specified filter. Try a different topic or source ID.';
-      return {
-        indicators: [],
-        total: 0,
-        page: result.page,
-        pages: result.pages,
-        message: hint,
-      };
+      ctx.enrich.notice(hint);
     }
 
-    return result;
+    return { indicators: result.indicators };
   },
 
   format: (result) => {
-    const lines: string[] = [
-      `**Indicators — Page ${result.page} of ${result.pages} (${result.total} total)**\n`,
-    ];
-    if (result.message) {
-      lines.push(`> ${result.message}\n`);
-    }
+    const lines: string[] = [];
     for (const ind of result.indicators) {
       lines.push(`### ${ind.name}`);
       lines.push(
@@ -163,9 +170,6 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
         lines.push(`**Topics:** ${ind.topics.map((t) => `${t.name} (${t.id})`).join(', ')}`);
       }
       if (ind.sourceNote) lines.push(ind.sourceNote);
-    }
-    if (result.page < result.pages) {
-      lines.push(`\n_Use page=${result.page + 1} for more results._`);
     }
     return [{ type: 'text', text: lines.join('\n') }];
   },

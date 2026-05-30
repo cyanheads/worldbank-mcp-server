@@ -3,7 +3,7 @@
  * @module tests/tools/worldbank-get-data.tool.test
  */
 
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@/services/worldbank/worldbank-service.js', () => ({
@@ -60,7 +60,7 @@ describe('worldbankGetData', () => {
     } as never);
   });
 
-  it('returns data with pagination and null count', async () => {
+  it('returns data with null count and indicator metadata', async () => {
     const { worldbankGetData } = await import(
       '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
     );
@@ -73,6 +73,48 @@ describe('worldbankGetData', () => {
     expect(result.data).toHaveLength(3);
     expect(result.nullCount).toBe(1);
     expect(result.indicator.id).toBe('NY.GDP.PCAP.CD');
+  });
+
+  it('populates enrichment with totalCount and pagination', async () => {
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const ctx = createMockContext({ errors: worldbankGetData.errors });
+    const input = worldbankGetData.input.parse({
+      indicator_id: 'NY.GDP.PCAP.CD',
+      countries: ['US', 'CN', 'ZW'],
+    });
+    await worldbankGetData.handler(input, ctx);
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.totalCount).toBe(3);
+    expect(enrichment.currentPage).toBe(1);
+    expect(enrichment.totalPages).toBe(1);
+  });
+
+  it('sets enrichment notice on empty data', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      getData: vi.fn().mockResolvedValue({
+        ...mockDataResult,
+        data: [],
+        total: 0,
+        nullCount: 0,
+      }),
+    } as never);
+
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const ctx = createMockContext({ errors: worldbankGetData.errors });
+    const input = worldbankGetData.input.parse({
+      indicator_id: 'NY.GDP.PCAP.CD',
+      countries: 'US',
+    });
+    const result = await worldbankGetData.handler(input, ctx);
+    expect(result.data).toHaveLength(0);
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.notice).toBeDefined();
+    expect(enrichment.notice).toContain('broaden');
   });
 
   it('accepts a single country string', async () => {
@@ -108,7 +150,12 @@ describe('worldbankGetData', () => {
     const { worldbankGetData } = await import(
       '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
     );
-    const blocks = worldbankGetData.format!(mockDataResult);
+    const domainResult = {
+      data: mockDataResult.data,
+      indicator: mockDataResult.indicator,
+      nullCount: mockDataResult.nullCount,
+    };
+    const blocks = worldbankGetData.format!(domainResult);
     expect(blocks[0].type).toBe('text');
     const text = (blocks[0] as { text: string }).text;
     // Indicator fields
@@ -122,17 +169,14 @@ describe('worldbankGetData', () => {
     // Null value rendered as "No data"
     expect(text).toContain('No data');
     // nullCount surfaced
-    expect(text).toContain('1 null');
-    // pagination
-    expect(text).toContain('Page 1 of 1');
+    expect(text).toContain('Null values this page:**');
   });
 
   it('renders aggregate tag for aggregate rows', async () => {
     const { worldbankGetData } = await import(
       '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
     );
-    const dataWithAggregate = {
-      ...mockDataResult,
+    const domainResult = {
       data: [
         {
           countryCode: 'EAS',
@@ -144,8 +188,10 @@ describe('worldbankGetData', () => {
           isAggregate: true,
         },
       ],
+      indicator: mockDataResult.indicator,
+      nullCount: 0,
     };
-    const blocks = worldbankGetData.format!(dataWithAggregate);
+    const blocks = worldbankGetData.format!(domainResult);
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('[Aggregate]');
     expect(text).toContain('EAS');
@@ -154,7 +200,6 @@ describe('worldbankGetData', () => {
   it('handles sparse upstream payload with missing value', () => {
     // Sparse test: verify format handles null values without fabricating data
     const sparseResult = {
-      ...mockDataResult,
       data: [
         {
           countryCode: 'AF',
@@ -166,9 +211,9 @@ describe('worldbankGetData', () => {
           isAggregate: false,
         },
       ],
+      indicator: mockDataResult.indicator,
       nullCount: 1,
     };
-    // Use the imported module for format
     const formatFn = (result: typeof sparseResult) => {
       const lines: string[] = [];
       for (const d of result.data) {

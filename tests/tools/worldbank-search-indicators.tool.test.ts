@@ -3,7 +3,7 @@
  * @module tests/tools/worldbank-search-indicators.tool.test
  */
 
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@/services/worldbank/worldbank-service.js', () => ({
@@ -50,6 +50,20 @@ describe('worldbankSearchIndicators', () => {
     expect(result.indicators[0].id).toBe('NY.GDP.PCAP.CD');
   });
 
+  it('populates enrichment with totalCount, pagination, and effectiveQuery', async () => {
+    const { worldbankSearchIndicators } = await import(
+      '@/mcp-server/tools/definitions/worldbank-search-indicators.tool.js'
+    );
+    const ctx = createMockContext({ errors: worldbankSearchIndicators.errors });
+    const input = worldbankSearchIndicators.input.parse({ query: 'GDP per capita' });
+    await worldbankSearchIndicators.handler(input, ctx);
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.totalCount).toBe(1);
+    expect(enrichment.currentPage).toBe(1);
+    expect(enrichment.totalPages).toBe(1);
+    expect(enrichment.effectiveQuery).toContain('GDP per capita');
+  });
+
   it('throws missing_filter when all three filter fields are absent', async () => {
     const { worldbankSearchIndicators } = await import(
       '@/mcp-server/tools/definitions/worldbank-search-indicators.tool.js'
@@ -62,7 +76,7 @@ describe('worldbankSearchIndicators', () => {
     });
   });
 
-  it('returns message on empty results', async () => {
+  it('sets enrichment notice on empty results', async () => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
     vi.mocked(getWorldBankApiService).mockReturnValue({
       searchIndicators: vi.fn().mockResolvedValue({ indicators: [], total: 0, page: 1, pages: 0 }),
@@ -75,15 +89,16 @@ describe('worldbankSearchIndicators', () => {
     const input = worldbankSearchIndicators.input.parse({ query: 'nonexistent xyz' });
     const result = await worldbankSearchIndicators.handler(input, ctx);
     expect(result.indicators).toHaveLength(0);
-    expect(result.message).toBeDefined();
-    expect(result.message).toContain('nonexistent xyz');
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.notice).toBeDefined();
+    expect(enrichment.notice).toContain('nonexistent xyz');
   });
 
   it('formats all fields including sourceId and topics with IDs', async () => {
     const { worldbankSearchIndicators } = await import(
       '@/mcp-server/tools/definitions/worldbank-search-indicators.tool.js'
     );
-    const blocks = worldbankSearchIndicators.format!(mockSearchResult);
+    const blocks = worldbankSearchIndicators.format!({ indicators: mockSearchResult.indicators });
     expect(blocks[0].type).toBe('text');
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('NY.GDP.PCAP.CD');
@@ -94,20 +109,5 @@ describe('worldbankSearchIndicators', () => {
     // topic ID rendered
     expect(text).toContain('Economy & Growth (3)');
     expect(text).toContain('GDP per capita description.');
-  });
-
-  it('renders message field in format when present', async () => {
-    const { worldbankSearchIndicators } = await import(
-      '@/mcp-server/tools/definitions/worldbank-search-indicators.tool.js'
-    );
-    const emptyResult = {
-      ...mockSearchResult,
-      indicators: [],
-      total: 0,
-      message: 'No indicators matched "xyz". Try a synonym.',
-    };
-    const blocks = worldbankSearchIndicators.format!(emptyResult);
-    const text = (blocks[0] as { text: string }).text;
-    expect(text).toContain('No indicators matched "xyz"');
   });
 });
