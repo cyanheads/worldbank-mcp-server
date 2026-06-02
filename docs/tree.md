@@ -1,6 +1,6 @@
 # worldbank-mcp-server - Directory Structure
 
-Generated on: 2026-05-29 05:48:22
+Generated on: 2026-06-02 15:10:23
 
 ```text
 worldbank-mcp-server/
@@ -29,12 +29,14 @@ worldbank-mcp-server/
 │   ├── build.ts
 │   ├── check-docs-sync.ts
 │   ├── check-framework-antipatterns.ts
+│   ├── check-skill-versions.ts
 │   ├── check-skills-sync.ts
 │   ├── clean.ts
 │   ├── devcheck.ts
 │   ├── lint-mcp.ts
 │   ├── lint-packaging.ts
 │   ├── list-skills.ts
+│   ├── release-github.ts
 │   ├── split-changelog.ts
 │   └── tree.ts
 ├── skills/
@@ -61,6 +63,8 @@ worldbank-mcp-server/
 │   ├── api-errors/
 │   │   └── SKILL.md
 │   ├── api-linter/
+│   │   └── SKILL.md
+│   ├── api-mirror/
 │   │   └── SKILL.md
 │   ├── api-services/
 │   │   ├── references/
@@ -89,6 +93,13 @@ worldbank-mcp-server/
 │   ├── git-wrapup/
 │   │   └── SKILL.md
 │   ├── maintenance/
+│   │   └── SKILL.md
+│   ├── orchestrations/
+│   │   ├── workflows/
+│   │   │   ├── field-test-fix.md
+│   │   │   ├── fix-wrapup-release.md
+│   │   │   ├── greenfield-build.md
+│   │   │   └── maintenance-release.md
 │   │   └── SKILL.md
 │   ├── polish-docs-meta/
 │   │   ├── references/
@@ -140,6 +151,7 @@ worldbank-mcp-server/
 │   │   └── worldbank-indicator.resource.test.ts
 │   ├── services/
 │   │   └── worldbank/
+│   │       └── worldbank-service.test.ts
 │   └── tools/
 │       ├── worldbank-get-country.tool.test.ts
 │       ├── worldbank-get-data.tool.test.ts
