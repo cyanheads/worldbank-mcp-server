@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.11](changelog/0.1.x/0.1.11.md) — 2026-06-04
+
+Typed error contracts: ctx.fail() re-throws for country_not_found, indicator_not_found, invalid_filter; empty getData returns structured result instead of throwing
+
 ## [0.1.10](changelog/0.1.x/0.1.10.md) — 2026-06-02
 
 @cyanheads/mcp-ts-core ^0.9.16 → ^0.9.21 — per-request log context fix, secret scrubbing from error messages, withRetry fail-fast
