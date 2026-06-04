@@ -5,7 +5,7 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { getServerConfig } from '@/config/server-config.js';
 import { getWorldBankApiService } from '@/services/worldbank/worldbank-service.js';
 
@@ -136,13 +136,6 @@ export const worldbankGetData = tool('worldbank_get_data', {
       when: 'One or more country codes are invalid.',
       recovery: 'Use worldbank_list_countries to browse valid ISO2, ISO3, and aggregate codes.',
     },
-    {
-      reason: 'no_data',
-      code: JsonRpcErrorCode.NotFound,
-      when: 'Indicator exists but returned zero observations for the requested filter.',
-      recovery:
-        'Broaden the date range, remove the date filter, or use mrv=5 to get the most recent available values.',
-    },
   ],
 
   async handler(input, ctx) {
@@ -163,17 +156,37 @@ export const worldbankGetData = tool('worldbank_get_data', {
       page: input.page,
     });
 
-    const result = await getWorldBankApiService().getData(
-      {
-        indicatorId: input.indicator_id,
-        countries: input.countries,
-        ...(dateRange !== undefined && { dateRange }),
-        ...(input.mrv !== undefined && { mrv: input.mrv }),
-        page: input.page,
-        perPage,
-      },
-      ctx,
-    );
+    let result: Awaited<ReturnType<ReturnType<typeof getWorldBankApiService>['getData']>>;
+    try {
+      result = await getWorldBankApiService().getData(
+        {
+          indicatorId: input.indicator_id,
+          countries: input.countries,
+          ...(dateRange !== undefined && { dateRange }),
+          ...(input.mrv !== undefined && { mrv: input.mrv }),
+          page: input.page,
+          perPage,
+        },
+        ctx,
+      );
+    } catch (err) {
+      if (err instanceof McpError) {
+        const reason = err.data?.reason as string | undefined;
+        if (reason === 'indicator_not_found') {
+          throw ctx.fail('indicator_not_found', err.message, {
+            ...ctx.recoveryFor('indicator_not_found'),
+            indicatorId: input.indicator_id,
+          });
+        }
+        if (reason === 'country_not_found') {
+          throw ctx.fail('country_not_found', err.message, {
+            ...ctx.recoveryFor('country_not_found'),
+            countries: input.countries,
+          });
+        }
+      }
+      throw err;
+    }
 
     ctx.enrich({ totalCount: result.total, currentPage: result.page, totalPages: result.pages });
 

@@ -3,7 +3,7 @@
  * @module tests/tools/worldbank-get-country.tool.test
  */
 
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -52,10 +52,12 @@ describe('worldbankGetCountry', () => {
   it('throws country_not_found for invalid code', async () => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
     vi.mocked(getWorldBankApiService).mockReturnValue({
-      getCountry: vi.fn().mockRejectedValue({
-        code: JsonRpcErrorCode.NotFound,
-        data: { reason: 'country_not_found' },
-      }),
+      getCountry: vi.fn().mockRejectedValue(
+        new McpError(JsonRpcErrorCode.NotFound, 'Country code "ZZ" not found.', {
+          reason: 'country_not_found',
+          countryCode: 'ZZ',
+        }),
+      ),
     } as never);
 
     const { worldbankGetCountry } = await import(
@@ -65,6 +67,31 @@ describe('worldbankGetCountry', () => {
     const input = worldbankGetCountry.input.parse({ country_code: 'ZZ' });
     await expect(worldbankGetCountry.handler(input, ctx)).rejects.toMatchObject({
       data: { reason: 'country_not_found' },
+    });
+  });
+
+  it('populates recovery.hint via ctx.fail for country_not_found', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      getCountry: vi.fn().mockRejectedValue(
+        new McpError(JsonRpcErrorCode.NotFound, 'Country code "ZZ" not found.', {
+          reason: 'country_not_found',
+          countryCode: 'ZZ',
+        }),
+      ),
+    } as never);
+
+    const { worldbankGetCountry } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-country.tool.js'
+    );
+    const ctx = createMockContext({ errors: worldbankGetCountry.errors });
+    const input = worldbankGetCountry.input.parse({ country_code: 'ZZ' });
+    const err = await worldbankGetCountry.handler(input, ctx).catch((e: unknown) => e);
+    expect(err).toMatchObject({
+      data: {
+        reason: 'country_not_found',
+        recovery: { hint: expect.stringContaining('worldbank_list_countries') },
+      },
     });
   });
 

@@ -3,6 +3,7 @@
  * @module tests/tools/worldbank-list-countries.tool.test
  */
 
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -114,6 +115,36 @@ describe('worldbankListCountries', () => {
     expect(text).toContain('Washington D.C.');
     // Aggregate tag
     expect(text).toContain('[Aggregate]');
+  });
+
+  // ─── Error handling ───────────────────────────────────────────────────────
+
+  it('throws invalid_filter with recovery.hint for bad region/income_level code', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      listCountries: vi
+        .fn()
+        .mockRejectedValue(
+          new McpError(
+            JsonRpcErrorCode.NotFound,
+            'Invalid region or income_level code. Use worldbank_list_countries without filters to browse valid codes.',
+            { reason: 'invalid_filter', region: 'BADCODE' },
+          ),
+        ),
+    } as never);
+
+    const { worldbankListCountries } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
+    );
+    const ctx = createMockContext({ errors: worldbankListCountries.errors });
+    const input = worldbankListCountries.input.parse({ region: 'BADCODE' });
+    const err = await worldbankListCountries.handler(input, ctx).catch((e: unknown) => e);
+    expect(err).toMatchObject({
+      data: {
+        reason: 'invalid_filter',
+        recovery: { hint: expect.stringContaining('worldbank_list_countries') },
+      },
+    });
   });
 
   // ─── Zod input validation ─────────────────────────────────────────────────

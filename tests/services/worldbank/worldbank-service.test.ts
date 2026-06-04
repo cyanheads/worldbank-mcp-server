@@ -752,19 +752,19 @@ describe('WorldBankApiService', () => {
     expect(result.data[0].isAggregate).toBe(true);
   });
 
-  it('getData: throws no_data when items array is empty', async () => {
+  it('getData: returns empty data (no throw) when items array is empty', async () => {
     fetchWithTimeoutMock.mockResolvedValueOnce({
       text: async () => JSON.stringify([pagingObj({ total: 0 }), null]),
     });
     const ctx = createMockContext();
-    await expect(
-      service.getData(
-        { indicatorId: 'NY.GDP.PCAP.CD', countries: 'US', page: 1, perPage: 50 },
-        ctx,
-      ),
-    ).rejects.toMatchObject({
-      data: { reason: 'no_data' },
-    });
+    const result = await service.getData(
+      { indicatorId: 'NY.GDP.PCAP.CD', countries: 'US', page: 1, perPage: 50 },
+      ctx,
+    );
+    expect(result.data).toHaveLength(0);
+    expect(result.nullCount).toBe(0);
+    expect(result.total).toBe(0);
+    expect(result.indicator.id).toBe('NY.GDP.PCAP.CD');
   });
 
   it('getData: throws indicator_not_found for WB-format indicator ID on WbErrorEnvelope', async () => {

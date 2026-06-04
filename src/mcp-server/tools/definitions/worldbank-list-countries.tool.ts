@@ -5,6 +5,7 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { getServerConfig } from '@/config/server-config.js';
 import { getWorldBankApiService } from '@/services/worldbank/worldbank-service.js';
 
@@ -94,7 +95,17 @@ export const worldbankListCountries = tool('worldbank_list_countries', {
     totalPages: z.number().describe('Total number of pages.'),
   },
 
-  handler(input, ctx) {
+  errors: [
+    {
+      reason: 'invalid_filter',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'An invalid region or income_level code was provided.',
+      recovery:
+        'Use worldbank_list_countries without filters to browse valid region and income-level codes.',
+    },
+  ],
+
+  async handler(input, ctx) {
     const perPage = input.per_page ?? getServerConfig().defaultPerPage;
     ctx.log.info('Listing countries', {
       region: input.region,
@@ -104,20 +115,30 @@ export const worldbankListCountries = tool('worldbank_list_countries', {
     });
     const region = input.region?.trim() || undefined;
     const incomeLevel = input.income_level?.trim() || undefined;
-    const resultPromise = getWorldBankApiService().listCountries(
-      {
-        ...(region !== undefined && { region }),
-        ...(incomeLevel !== undefined && { incomeLevel }),
-        includeAggregates: input.include_aggregates,
-        page: input.page,
-        perPage,
-      },
-      ctx,
-    );
-    return resultPromise.then((result) => {
-      ctx.enrich({ totalCount: result.total, currentPage: result.page, totalPages: result.pages });
-      return { countries: result.countries };
-    });
+    let result: Awaited<ReturnType<ReturnType<typeof getWorldBankApiService>['listCountries']>>;
+    try {
+      result = await getWorldBankApiService().listCountries(
+        {
+          ...(region !== undefined && { region }),
+          ...(incomeLevel !== undefined && { incomeLevel }),
+          includeAggregates: input.include_aggregates,
+          page: input.page,
+          perPage,
+        },
+        ctx,
+      );
+    } catch (err) {
+      if (err instanceof McpError && err.data?.reason === 'invalid_filter') {
+        throw ctx.fail('invalid_filter', err.message, {
+          ...ctx.recoveryFor('invalid_filter'),
+          region: input.region,
+          incomeLevel: input.income_level,
+        });
+      }
+      throw err;
+    }
+    ctx.enrich({ totalCount: result.total, currentPage: result.page, totalPages: result.pages });
+    return { countries: result.countries };
   },
 
   format: (result) => {

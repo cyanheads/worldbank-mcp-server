@@ -451,11 +451,16 @@ export class WorldBankApiService {
     const [paging, items] = data as WbEnvelope<RawDataPoint>;
 
     if (!items?.length) {
-      throw notFound(
-        `No data found for indicator "${indicatorId}" with the specified filters. ` +
-          `Try broadening the date range or using mrv=5 to get the most recent available values.`,
-        { reason: 'no_data', indicatorId, countryCodes },
-      );
+      // Return empty data — let the handler surface recovery guidance via
+      // enrichment notice so structured clients see it in ctx.enrich.notice.
+      return {
+        data: [],
+        indicator: { id: indicatorId, name: '' },
+        total: paging.total ?? 0,
+        page: paging.page ?? page,
+        pages: paging.pages ?? 1,
+        nullCount: 0,
+      };
     }
 
     // Determine aggregate codes from the data itself (region.id = "NA" detection isn't

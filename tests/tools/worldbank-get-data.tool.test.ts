@@ -3,6 +3,7 @@
  * @module tests/tools/worldbank-get-data.tool.test
  */
 
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -144,6 +145,91 @@ describe('worldbankGetData', () => {
     await expect(worldbankGetData.handler(input, ctx)).rejects.toMatchObject({
       data: { reason: 'invalid_params' },
     });
+  });
+
+  it('rethrows indicator_not_found via ctx.fail with recovery.hint', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      getData: vi.fn().mockRejectedValue(
+        new McpError(JsonRpcErrorCode.NotFound, 'Indicator "INVALID.ID" not found.', {
+          reason: 'indicator_not_found',
+          indicatorId: 'INVALID.ID',
+        }),
+      ),
+    } as never);
+
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const ctx = createMockContext({ errors: worldbankGetData.errors });
+    const input = worldbankGetData.input.parse({
+      indicator_id: 'INVALID.ID',
+      countries: 'US',
+    });
+    const err = await worldbankGetData.handler(input, ctx).catch((e: unknown) => e);
+    expect(err).toMatchObject({
+      data: {
+        reason: 'indicator_not_found',
+        recovery: { hint: expect.stringContaining('worldbank_search_indicators') },
+      },
+    });
+  });
+
+  it('rethrows country_not_found via ctx.fail with recovery.hint', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      getData: vi.fn().mockRejectedValue(
+        new McpError(JsonRpcErrorCode.NotFound, 'Invalid country code.', {
+          reason: 'country_not_found',
+          countryCodes: 'ZZ',
+        }),
+      ),
+    } as never);
+
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const ctx = createMockContext({ errors: worldbankGetData.errors });
+    const input = worldbankGetData.input.parse({
+      indicator_id: 'NY.GDP.PCAP.CD',
+      countries: 'ZZ',
+    });
+    const err = await worldbankGetData.handler(input, ctx).catch((e: unknown) => e);
+    expect(err).toMatchObject({
+      data: {
+        reason: 'country_not_found',
+        recovery: { hint: expect.stringContaining('worldbank_list_countries') },
+      },
+    });
+  });
+
+  it('returns empty data (no throw) when service returns no observations', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      getData: vi.fn().mockResolvedValue({
+        data: [],
+        indicator: { id: 'NY.GDP.PCAP.CD', name: '' },
+        total: 0,
+        page: 1,
+        pages: 1,
+        nullCount: 0,
+      }),
+    } as never);
+
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const ctx = createMockContext({ errors: worldbankGetData.errors });
+    const input = worldbankGetData.input.parse({
+      indicator_id: 'NY.GDP.PCAP.CD',
+      countries: 'US',
+      date_range: '1800:1801',
+    });
+    const result = await worldbankGetData.handler(input, ctx);
+    expect(result.data).toHaveLength(0);
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.notice).toBeDefined();
+    expect(enrichment.notice).toContain('broaden');
   });
 
   it('formats all output fields including null values and iso3', async () => {

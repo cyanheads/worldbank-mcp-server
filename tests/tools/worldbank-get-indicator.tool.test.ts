@@ -3,7 +3,7 @@
  * @module tests/tools/worldbank-get-indicator.tool.test
  */
 
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -52,10 +52,12 @@ describe('worldbankGetIndicator', () => {
   it('throws indicator_not_found for invalid ID', async () => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
     vi.mocked(getWorldBankApiService).mockReturnValue({
-      getIndicator: vi.fn().mockRejectedValue({
-        code: JsonRpcErrorCode.NotFound,
-        data: { reason: 'indicator_not_found' },
-      }),
+      getIndicator: vi.fn().mockRejectedValue(
+        new McpError(JsonRpcErrorCode.NotFound, 'Indicator "INVALID.ID" not found.', {
+          reason: 'indicator_not_found',
+          indicatorId: 'INVALID.ID',
+        }),
+      ),
     } as never);
 
     const { worldbankGetIndicator } = await import(
@@ -65,6 +67,31 @@ describe('worldbankGetIndicator', () => {
     const input = worldbankGetIndicator.input.parse({ indicator_id: 'INVALID.ID' });
     await expect(worldbankGetIndicator.handler(input, ctx)).rejects.toMatchObject({
       data: { reason: 'indicator_not_found' },
+    });
+  });
+
+  it('populates recovery.hint via ctx.fail for indicator_not_found', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      getIndicator: vi.fn().mockRejectedValue(
+        new McpError(JsonRpcErrorCode.NotFound, 'Indicator "INVALID.ID" not found.', {
+          reason: 'indicator_not_found',
+          indicatorId: 'INVALID.ID',
+        }),
+      ),
+    } as never);
+
+    const { worldbankGetIndicator } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-indicator.tool.js'
+    );
+    const ctx = createMockContext({ errors: worldbankGetIndicator.errors });
+    const input = worldbankGetIndicator.input.parse({ indicator_id: 'INVALID.ID' });
+    const err = await worldbankGetIndicator.handler(input, ctx).catch((e: unknown) => e);
+    expect(err).toMatchObject({
+      data: {
+        reason: 'indicator_not_found',
+        recovery: { hint: expect.stringContaining('worldbank_search_indicators') },
+      },
     });
   });
 

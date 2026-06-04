@@ -4,7 +4,7 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { getWorldBankApiService } from '@/services/worldbank/worldbank-service.js';
 
 export const worldbankGetIndicator = tool('worldbank_get_indicator', {
@@ -51,9 +51,19 @@ export const worldbankGetIndicator = tool('worldbank_get_indicator', {
     },
   ],
 
-  handler(input, ctx) {
+  async handler(input, ctx) {
     ctx.log.info('Fetching indicator', { indicatorId: input.indicator_id });
-    return getWorldBankApiService().getIndicator(input.indicator_id, ctx);
+    try {
+      return await getWorldBankApiService().getIndicator(input.indicator_id, ctx);
+    } catch (err) {
+      if (err instanceof McpError && err.data?.reason === 'indicator_not_found') {
+        throw ctx.fail('indicator_not_found', err.message, {
+          ...ctx.recoveryFor('indicator_not_found'),
+          indicatorId: input.indicator_id,
+        });
+      }
+      throw err;
+    }
   },
 
   format: (result) => {

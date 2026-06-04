@@ -4,7 +4,7 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { getWorldBankApiService } from '@/services/worldbank/worldbank-service.js';
 
 export const worldbankGetCountry = tool('worldbank_get_country', {
@@ -55,9 +55,19 @@ export const worldbankGetCountry = tool('worldbank_get_country', {
     },
   ],
 
-  handler(input, ctx) {
+  async handler(input, ctx) {
     ctx.log.info('Fetching country', { countryCode: input.country_code });
-    return getWorldBankApiService().getCountry(input.country_code, ctx);
+    try {
+      return await getWorldBankApiService().getCountry(input.country_code, ctx);
+    } catch (err) {
+      if (err instanceof McpError && err.data?.reason === 'country_not_found') {
+        throw ctx.fail('country_not_found', err.message, {
+          ...ctx.recoveryFor('country_not_found'),
+          countryCode: input.country_code,
+        });
+      }
+      throw err;
+    }
   },
 
   format: (result) => {
