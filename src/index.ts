@@ -17,6 +17,8 @@ import { worldbankSearchIndicators } from './mcp-server/tools/definitions/worldb
 import { initWorldBankApiService } from './services/worldbank/worldbank-service.js';
 
 await createApp({
+  name: 'worldbank-mcp-server',
+  title: 'worldbank-mcp-server',
   tools: [
     worldbankListTopics,
     worldbankListSources,
