@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.12](changelog/0.1.x/0.1.12.md) — 2026-06-12
+
+Adopt @cyanheads/mcp-ts-core ^0.10.6; explicit createApp name/title identity; Dockerfile healthcheck + version label; .mcpbignore anchoring and bundle-content lint guards
+
 ## [0.1.11](changelog/0.1.x/0.1.11.md) — 2026-06-04
 
 Typed error contracts: ctx.fail() re-throws for country_not_found, indicator_not_found, invalid_filter; empty getData returns structured result instead of throwing
