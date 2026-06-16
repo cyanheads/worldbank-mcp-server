@@ -1,6 +1,6 @@
 {
-  "name": "@cyanheads/worldbank-mcp-server",
-  "version": "0.1.12",
+  "name": "worldbank-mcp-server",
+  "version": "0.1.13",
   "description": "Query 29,500+ World Bank development indicators for 200+ countries across 60+ years via MCP. STDIO or Streamable HTTP.",
   "author": {
     "name": "cyanheads",
@@ -13,7 +13,7 @@
   "keywords": ["mcp", "mcp-server", "model-context-protocol", "world-bank", "open-data", "development-indicators", "economics"],
   "mcpServers": "./.codex-plugin/mcp.json",
   "interface": {
-    "displayName": "@cyanheads/worldbank-mcp-server",
+    "displayName": "worldbank-mcp-server",
     "shortDescription": "Query 29,500+ World Bank development indicators for 200+ countries across 60+ years.",
     "longDescription": "Provides access to World Bank API v2 data: indicators, countries, topics, sources, and time-series data across 60+ years. Supports STDIO and Streamable HTTP transports.",
     "developerName": "cyanheads",
