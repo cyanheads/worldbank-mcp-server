@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.13](changelog/0.1.x/0.1.13.md) — 2026-06-15
+
+Server-level instructions on createApp(); unscope agent-facing plugin identity fields to worldbank-mcp-server
+
 ## [0.1.12](changelog/0.1.x/0.1.12.md) — 2026-06-12
 
 Adopt @cyanheads/mcp-ts-core ^0.10.6; explicit createApp name/title identity; Dockerfile healthcheck + version label; .mcpbignore anchoring and bundle-content lint guards
