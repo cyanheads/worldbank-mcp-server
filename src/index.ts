@@ -19,6 +19,8 @@ import { initWorldBankApiService } from './services/worldbank/worldbank-service.
 await createApp({
   name: 'worldbank-mcp-server',
   title: 'worldbank-mcp-server',
+  instructions:
+    'Use the worldbank_* tools to query the World Bank Open Data API for development indicators. No API key required. Workflow: worldbank_search_indicators (browse topic/source IDs via worldbank_list_topics and worldbank_list_sources) to find an indicator_id, then worldbank_get_data to fetch values. Indicators use dotted codes like NY.GDP.PCAP.CD; countries use ISO2/ISO3, regional/income aggregate codes (EAS, HIC), WLD, or "all". On worldbank_get_data, date_range and mrv are mutually exclusive, sparse cells return null, and "all" requires pagination.',
   tools: [
     worldbankListTopics,
     worldbankListSources,
