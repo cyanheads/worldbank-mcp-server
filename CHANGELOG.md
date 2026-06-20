@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.14](changelog/0.1.x/0.1.14.md) — 2026-06-20
+
+Sync @cyanheads/mcp-ts-core ^0.10.9 maintenance scripts, skills, and devcheck guards
+
 ## [0.1.13](changelog/0.1.x/0.1.13.md) — 2026-06-15
 
 Server-level instructions on createApp(); unscope agent-facing plugin identity fields to worldbank-mcp-server
