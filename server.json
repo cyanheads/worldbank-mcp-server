@@ -12,14 +12,14 @@
       "url": "https://worldbank.caseyjhand.com/mcp"
     }
   ],
-  "version": "0.1.14",
+  "version": "0.1.15",
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/worldbank-mcp-server",
       "runtimeHint": "bun",
-      "version": "0.1.14",
+      "version": "0.1.15",
       "packageArguments": [
         {
           "type": "positional",
@@ -51,6 +51,13 @@
           "format": "string",
           "isRequired": false,
           "default": "50"
+        },
+        {
+          "name": "WORLDBANK_CATALOG_CACHE_TTL_MS",
+          "description": "Lifetime in ms of the in-process indicator-catalog cache used by keyword-only search. 0 disables caching.",
+          "format": "string",
+          "isRequired": false,
+          "default": "3600000"
         }
       ],
       "transport": {
@@ -62,7 +69,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/worldbank-mcp-server",
       "runtimeHint": "bun",
-      "version": "0.1.14",
+      "version": "0.1.15",
       "packageArguments": [
         {
           "type": "positional",
@@ -122,6 +129,13 @@
           "format": "string",
           "isRequired": false,
           "default": "50"
+        },
+        {
+          "name": "WORLDBANK_CATALOG_CACHE_TTL_MS",
+          "description": "Lifetime in ms of the in-process indicator-catalog cache used by keyword-only search. 0 disables caching.",
+          "format": "string",
+          "isRequired": false,
+          "default": "3600000"
         }
       ],
       "transport": {

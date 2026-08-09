@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.1.14-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/worldbank-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/worldbank-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.1.15-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.30.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/worldbank-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/worldbank-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -83,7 +83,8 @@ Fetch full metadata for a single country or aggregate entity.
 Search the 29,500+ World Bank indicator catalog.
 
 - Keyword search, topic filter, source filter — at least one required
-- When `topic_id` or `source_id` is combined with a keyword query, client-side filtering is applied (the upstream API ignores `searchterm` when a topic/source filter is active)
+- The upstream `searchterm` parameter does not filter, so keyword matching runs locally over the full catalog (or the full selected topic/source): every term must appear in the indicator ID, name, or description, in any word order, with punctuation ignored
+- Exact ID or name matches rank first, then whole-phrase matches, then other ID/name matches, then description-only matches — so pasting an indicator name (`GDP (current US$)`) or ID (`NY.GDP.MKTP.CD`) returns it as the top hit
 - Returns indicator IDs, names, source dataset, and thematic topics
 - Indicator IDs (e.g. `NY.GDP.PCAP.CD`, `SP.POP.TOTL`) feed directly into `worldbank_get_data`
 - Paginated with up to 100 results per page
@@ -232,6 +233,7 @@ All configuration is validated at startup via Zod schemas in `src/config/server-
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP exporter endpoint | none |
 | `WORLDBANK_API_BASE_URL` | World Bank API base URL override | `https://api.worldbank.org/v2` |
 | `WORLDBANK_DEFAULT_PER_PAGE` | Default page size for list/search/data operations | `50` |
+| `WORLDBANK_CATALOG_CACHE_TTL_MS` | Lifetime of the in-process indicator-catalog cache used by keyword-only search; `0` disables it | `3600000` |
 
 ## Running the server
 

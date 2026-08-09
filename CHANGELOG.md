@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.15](changelog/0.1.x/0.1.15.md) — 2026-08-09
+
+Fix indicator search truncation and invalid-filter handling, exhaustive country listing (#14, #15, #16, #21); sync mcp-ts-core to ^0.11.1
+
 ## [0.1.14](changelog/0.1.x/0.1.14.md) — 2026-06-20
 
 Sync @cyanheads/mcp-ts-core ^0.10.9 maintenance scripts, skills, and devcheck guards
