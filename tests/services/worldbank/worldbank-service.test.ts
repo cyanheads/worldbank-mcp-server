@@ -20,6 +20,7 @@ vi.mock('@/config/server-config.js', () => ({
   getServerConfig: vi.fn().mockReturnValue({
     apiBaseUrl: 'https://api.worldbank.org/v2',
     defaultPerPage: 50,
+    catalogCacheTtlMs: 60_000,
   }),
 }));
 
@@ -40,6 +41,35 @@ function pagingObj(overrides = {}) {
   return { page: 1, pages: 1, per_page: 50, total: 1, ...overrides };
 }
 
+/** Minimal raw indicator; `sourceNote` defaults to empty so matching stays predictable. */
+function rawIndicator(id: string, name: string, sourceNote = '') {
+  return { id, name, source: { id: '2', value: 'WDI' }, sourceNote, topics: [] };
+}
+
+/** Minimal raw country. Aggregates carry region.id = incomeLevel.id = "NA". */
+function rawCountry(id: string, name: string, aggregate = false) {
+  return {
+    id,
+    iso2Code: id.slice(0, 2),
+    name,
+    region: aggregate ? { id: 'NA', value: '' } : { id: 'ECS', value: 'Europe' },
+    incomeLevel: aggregate ? { id: 'NA', value: '' } : { id: 'HIC', value: 'High income' },
+    lendingType: {},
+    capitalCity: '',
+    longitude: '',
+    latitude: '',
+  };
+}
+
+/** The WB "invalid parameter value" body, returned with HTTP 200. */
+const WB_ERROR_BODY = [
+  {
+    message: [
+      { id: '120', key: 'Invalid value', value: 'The provided parameter value is not valid' },
+    ],
+  },
+];
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 describe('WorldBankApiService', () => {
@@ -48,9 +78,23 @@ describe('WorldBankApiService', () => {
     typeof import('@/services/worldbank/worldbank-service.js')['WorldBankApiService']
   >;
 
+  /** Queue one upstream JSON response on the fetch mock. */
+  function mockResponse(body: unknown) {
+    fetchWithTimeoutMock.mockResolvedValueOnce({ text: async () => JSON.stringify(body) });
+  }
+
   beforeEach(async () => {
     const { fetchWithTimeout } = await import('@cyanheads/mcp-ts-core/utils');
     fetchWithTimeoutMock = vi.mocked(fetchWithTimeout);
+
+    // Reset the config mock every test — individual tests override it (e.g. TTL 0)
+    // and vi.clearAllMocks() does not restore a mockReturnValue.
+    const { getServerConfig } = await import('@/config/server-config.js');
+    vi.mocked(getServerConfig).mockReturnValue({
+      apiBaseUrl: 'https://api.worldbank.org/v2',
+      defaultPerPage: 50,
+      catalogCacheTtlMs: 60_000,
+    } as never);
 
     const { WorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
     const storage = createInMemoryStorage();
@@ -507,126 +551,297 @@ describe('WorldBankApiService', () => {
     expect(result.pages).toBe(2);
   });
 
+  it('listCountries: reaches an entity on upstream page 2 when excluding aggregates', async () => {
+    mockResponse([
+      pagingObj({ pages: 2, total: 4 }),
+      [rawCountry('US', 'United States'), rawCountry('EAS', 'East Asia & Pacific', true)],
+    ]);
+    mockResponse([
+      pagingObj({ page: 2, pages: 2, total: 4 }),
+      [rawCountry('ZW', 'Zimbabwe'), rawCountry('WLD', 'World', true)],
+    ]);
+    const ctx = createMockContext();
+    const result = await service.listCountries(
+      { includeAggregates: false, page: 1, perPage: 50 },
+      ctx,
+    );
+    // The caller must actually receive the page-2 country, not merely trigger the fetch.
+    expect(result.countries.map((c) => c.id)).toEqual(['US', 'ZW']);
+    expect(result.total).toBe(2);
+    expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('listCountries: passes page/per_page straight through when including aggregates', async () => {
+    mockResponse([
+      pagingObj({ page: 3, pages: 4, total: 295, per_page: 100 }),
+      [rawCountry('US', 'United States')],
+    ]);
+    const ctx = createMockContext();
+    const result = await service.listCountries(
+      { includeAggregates: true, page: 3, perPage: 100 },
+      ctx,
+    );
+    const url = fetchWithTimeoutMock.mock.calls[0][0] as string;
+    expect(url).toContain('page=3');
+    expect(url).toContain('per_page=100');
+    expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(1);
+    expect(result.total).toBe(295);
+    expect(result.page).toBe(3);
+    expect(result.pages).toBe(4);
+  });
+
   // ─── searchIndicators ─────────────────────────────────────────────────────
 
-  it('searchIndicators: keyword-only path sends searchterm param', async () => {
-    fetchWithTimeoutMock.mockResolvedValueOnce({
-      text: async () =>
-        JSON.stringify([
-          pagingObj({ total: 1 }),
-          [
-            {
-              id: 'NY.GDP.PCAP.CD',
-              name: 'GDP per capita (current US$)',
-              source: { id: '2', value: 'World Development Indicators' },
-              sourceNote: 'GDP per capita description.',
-              topics: [{ id: '3', value: 'Economy & Growth' }],
-            },
-          ],
-        ]),
-    });
+  it('searchIndicators: keyword-only path filters the catalog instead of trusting searchterm', async () => {
+    mockResponse([
+      pagingObj({ total: 2 }),
+      [
+        rawIndicator('NY.GDP.PCAP.CD', 'GDP per capita (current US$)'),
+        rawIndicator('SP.POP.TOTL', 'Population, total'),
+      ],
+    ]);
     const ctx = createMockContext();
     const result = await service.searchIndicators({ query: 'GDP', page: 1, perPage: 50 }, ctx);
-    expect(result.indicators).toHaveLength(1);
-    expect(result.indicators[0].id).toBe('NY.GDP.PCAP.CD');
-    // Verify URL included searchterm
-    const url = fetchWithTimeoutMock.mock.calls[0][0] as string;
-    expect(url).toContain('searchterm=GDP');
+    expect(result.indicators.map((i) => i.id)).toEqual(['NY.GDP.PCAP.CD']);
+    expect(result.total).toBe(1);
+    // The upstream searchterm param doesn't filter, so it must not be relied on.
+    expect(fetchWithTimeoutMock.mock.calls[0][0] as string).not.toContain('searchterm');
   });
 
-  it('searchIndicators: topic+keyword path filters client-side', async () => {
-    // Returns 3 indicators for the topic, only 1 matches the keyword
-    fetchWithTimeoutMock.mockResolvedValueOnce({
-      text: async () =>
-        JSON.stringify([
-          pagingObj({ total: 3 }),
-          [
-            {
-              id: 'NY.GDP.PCAP.CD',
-              name: 'GDP per capita',
-              source: { id: '2', value: 'WDI' },
-              sourceNote: 'GDP desc.',
-              topics: [{ id: '3', value: 'Economy' }],
-            },
-            {
-              id: 'SP.POP.TOTL',
-              name: 'Population, total',
-              source: { id: '2', value: 'WDI' },
-              sourceNote: 'Population.',
-              topics: [{ id: '3', value: 'Economy' }],
-            },
-            {
-              id: 'NY.ADJ.NNTY.PC.CD',
-              name: 'Adjusted net national income per capita',
-              source: { id: '2', value: 'WDI' },
-              sourceNote: 'Adj net.',
-              topics: [{ id: '3', value: 'Economy' }],
-            },
-          ],
-        ]),
-    });
+  it('searchIndicators: keyword-only path returns empty for a nonsense query', async () => {
+    mockResponse([
+      pagingObj({ total: 2 }),
+      [
+        rawIndicator('NY.GDP.PCAP.CD', 'GDP per capita'),
+        rawIndicator('SP.POP.TOTL', 'Population, total'),
+      ],
+    ]);
     const ctx = createMockContext();
     const result = await service.searchIndicators(
-      { query: 'population', topicId: '3', page: 1, perPage: 50 },
+      { query: 'zzzz-no-such-indicator-xyz', page: 1, perPage: 50 },
       ctx,
     );
-    expect(result.indicators).toHaveLength(1);
-    expect(result.indicators[0].id).toBe('SP.POP.TOTL');
-    expect(result.total).toBe(1);
+    expect(result.indicators).toHaveLength(0);
+    expect(result.total).toBe(0);
   });
 
-  it('searchIndicators: source-only path uses source filter param', async () => {
-    fetchWithTimeoutMock.mockResolvedValueOnce({
-      text: async () =>
-        JSON.stringify([
-          pagingObj({ total: 1 }),
-          [
-            {
-              id: 'NY.GDP.PCAP.CD',
-              name: 'GDP per capita',
-              source: { id: '2', value: 'WDI' },
-              sourceNote: '',
-              topics: [],
-            },
-          ],
-        ]),
-    });
+  it('searchIndicators: keyword-only path reaches a match on upstream page 2', async () => {
+    mockResponse([pagingObj({ pages: 2, total: 2 }), [rawIndicator('SP.POP.TOTL', 'Population')]]);
+    mockResponse([
+      pagingObj({ page: 2, pages: 2, total: 2 }),
+      [rawIndicator('VC.IHR.PSRC.P5', 'Intentional homicides (per 100,000 people)')],
+    ]);
     const ctx = createMockContext();
-    await service.searchIndicators({ sourceId: '2', page: 1, perPage: 50 }, ctx);
+    const result = await service.searchIndicators(
+      { query: 'VC.IHR.PSRC.P5', page: 1, perPage: 50 },
+      ctx,
+    );
+    expect(result.indicators.map((i) => i.id)).toEqual(['VC.IHR.PSRC.P5']);
+    expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(2);
+    // The catalog is ~15 MB; the single-page timeout is far too short for it.
+    expect(fetchWithTimeoutMock.mock.calls.map((c) => c[1])).toEqual([60_000, 60_000]);
+  });
+
+  it('searchIndicators: keyword matching ignores word order', async () => {
+    mockResponse([
+      pagingObj({ total: 1 }),
+      [rawIndicator('NY.GDP.PCAP.CD', 'GDP per capita (current US$)')],
+    ]);
+    const ctx = createMockContext();
+    const result = await service.searchIndicators(
+      { query: 'per capita gdp', page: 1, perPage: 50 },
+      ctx,
+    );
+    expect(result.indicators.map((i) => i.id)).toEqual(['NY.GDP.PCAP.CD']);
+  });
+
+  it('searchIndicators: ranks id/name matches ahead of sourceNote-only matches', async () => {
+    mockResponse([
+      pagingObj({ total: 2 }),
+      [
+        rawIndicator('AG.LND.FRST.ZS', 'Forest area', 'Share of land area relative to GDP trends.'),
+        rawIndicator('NY.GDP.PCAP.CD', 'GDP per capita'),
+      ],
+    ]);
+    const ctx = createMockContext();
+    const result = await service.searchIndicators({ query: 'gdp', page: 1, perPage: 50 }, ctx);
+    expect(result.indicators.map((i) => i.id)).toEqual(['NY.GDP.PCAP.CD', 'AG.LND.FRST.ZS']);
+  });
+
+  it('searchIndicators: matches a pasted indicator name despite its punctuation', async () => {
+    // Split on whitespace, this query yields the token "(%)" — which appears in
+    // no indicator name — and the search returns nothing.
+    mockResponse([
+      pagingObj({ total: 2 }),
+      [
+        rawIndicator('SL.UEM.TOTL.FE.ZS', 'Unemployment, female (% of female labor force)'),
+        rawIndicator('SP.POP.TOTL', 'Population, total'),
+      ],
+    ]);
+    const ctx = createMockContext();
+    const result = await service.searchIndicators(
+      { query: 'Unemployment, female (%)', page: 1, perPage: 50 },
+      ctx,
+    );
+    expect(result.indicators.map((i) => i.id)).toEqual(['SL.UEM.TOTL.FE.ZS']);
+  });
+
+  it('searchIndicators: ranks an exact ID or name match first', async () => {
+    mockResponse([
+      pagingObj({ total: 3 }),
+      [
+        rawIndicator('NV.SRV.DISC.CD', 'Discrepancy in expenditure estimate of GDP (current US$)'),
+        rawIndicator('NY.GDP.MKTP.CD.XD', 'GDP (current US$) deflator index'),
+        rawIndicator('NY.GDP.MKTP.CD', 'GDP (current US$)'),
+      ],
+    ]);
+    const ctx = createMockContext();
+    const byName = await service.searchIndicators(
+      { query: 'GDP (current US$)', page: 1, perPage: 50 },
+      ctx,
+    );
+    // Exact name first, then the whole-phrase hits in catalog order.
+    expect(byName.indicators.map((i) => i.id)).toEqual([
+      'NY.GDP.MKTP.CD',
+      'NV.SRV.DISC.CD',
+      'NY.GDP.MKTP.CD.XD',
+    ]);
+  });
+
+  it('searchIndicators: topic+keyword path reaches a match on upstream page 2', async () => {
+    mockResponse([
+      pagingObj({ pages: 2, total: 2 }),
+      [rawIndicator('NY.GDP.PCAP.CD', 'GDP per capita')],
+    ]);
+    mockResponse([
+      pagingObj({ page: 2, pages: 2, total: 2 }),
+      [rawIndicator('VC.IHR.PSRC.P5', 'Intentional homicides')],
+    ]);
+    const ctx = createMockContext();
+    const result = await service.searchIndicators(
+      { query: 'VC.IHR.PSRC.P5', topicId: '4', page: 1, perPage: 50 },
+      ctx,
+    );
+    expect(result.indicators.map((i) => i.id)).toEqual(['VC.IHR.PSRC.P5']);
+    expect(result.total).toBe(1);
+    expect(fetchWithTimeoutMock.mock.calls[0][0] as string).toContain('/topic/4/indicator');
+  });
+
+  it('searchIndicators: source+keyword path reaches a match on upstream page 2', async () => {
+    mockResponse([
+      pagingObj({ pages: 2, total: 2 }),
+      [rawIndicator('NY.GDP.PCAP.CD', 'GDP per capita')],
+    ]);
+    mockResponse([
+      pagingObj({ page: 2, pages: 2, total: 2 }),
+      [rawIndicator('VC.IHR.PSRC.P5', 'Intentional homicides')],
+    ]);
+    const ctx = createMockContext();
+    const result = await service.searchIndicators(
+      { query: 'homicides', sourceId: '2', page: 1, perPage: 50 },
+      ctx,
+    );
+    expect(result.indicators.map((i) => i.id)).toEqual(['VC.IHR.PSRC.P5']);
+    expect(fetchWithTimeoutMock.mock.calls[0][0] as string).toContain('source=2');
+  });
+
+  it('searchIndicators: paginates matches beyond the first result page', async () => {
+    mockResponse([
+      pagingObj({ total: 3 }),
+      [
+        rawIndicator('NY.GDP.PCAP.CD', 'GDP per capita'),
+        rawIndicator('NY.GDP.MKTP.CD', 'GDP (current US$)'),
+        rawIndicator('NY.GDP.MKTP.KD.ZG', 'GDP growth'),
+      ],
+    ]);
+    const ctx = createMockContext();
+    const result = await service.searchIndicators({ query: 'gdp', page: 2, perPage: 2 }, ctx);
+    expect(result.indicators.map((i) => i.id)).toEqual(['NY.GDP.MKTP.KD.ZG']);
+    expect(result.total).toBe(3);
+    expect(result.pages).toBe(2);
+    expect(result.page).toBe(2);
+  });
+
+  it('searchIndicators: source-only path uses source filter param and upstream pagination', async () => {
+    mockResponse([
+      pagingObj({ page: 2, pages: 4, total: 190 }),
+      [rawIndicator('NY.GDP.PCAP.CD', 'GDP per capita')],
+    ]);
+    const ctx = createMockContext();
+    const result = await service.searchIndicators({ sourceId: '2', page: 2, perPage: 50 }, ctx);
     const url = fetchWithTimeoutMock.mock.calls[0][0] as string;
     expect(url).toContain('source=2');
+    expect(url).toContain('per_page=50');
+    expect(url).toContain('page=2');
+    // Upstream pagination is passed through verbatim on this branch.
+    expect(result.indicators.map((i) => i.id)).toEqual(['NY.GDP.PCAP.CD']);
+    expect(result).toMatchObject({ total: 190, page: 2, pages: 4 });
   });
 
-  it('searchIndicators: source+keyword path filters client-side', async () => {
-    fetchWithTimeoutMock.mockResolvedValueOnce({
-      text: async () =>
-        JSON.stringify([
-          pagingObj({ total: 2 }),
-          [
-            {
-              id: 'NY.GDP.PCAP.CD',
-              name: 'GDP per capita',
-              source: { id: '2', value: 'WDI' },
-              sourceNote: 'GDP description.',
-              topics: [],
-            },
-            {
-              id: 'SP.POP.TOTL',
-              name: 'Population, total',
-              source: { id: '2', value: 'WDI' },
-              sourceNote: 'Population total.',
-              topics: [],
-            },
-          ],
-        ]),
-    });
+  it('searchIndicators: throws invalid_filter for an unknown topic id (no query)', async () => {
+    mockResponse(WB_ERROR_BODY);
     const ctx = createMockContext();
-    const result = await service.searchIndicators(
-      { query: 'gdp', sourceId: '2', page: 1, perPage: 50 },
+    await expect(
+      service.searchIndicators({ topicId: '999', page: 1, perPage: 50 }, ctx),
+    ).rejects.toMatchObject({ data: { reason: 'invalid_filter' } });
+  });
+
+  it('searchIndicators: throws invalid_filter for an unknown source id with a keyword', async () => {
+    mockResponse(WB_ERROR_BODY);
+    const ctx = createMockContext();
+    await expect(
+      service.searchIndicators({ query: 'gdp', sourceId: '999', page: 1, perPage: 50 }, ctx),
+    ).rejects.toMatchObject({ data: { reason: 'invalid_filter' } });
+  });
+
+  it('searchIndicators: caches the catalog across keyword-only searches', async () => {
+    mockResponse([
+      pagingObj({ total: 2 }),
+      [
+        rawIndicator('NY.GDP.PCAP.CD', 'GDP per capita'),
+        rawIndicator('SP.POP.TOTL', 'Population, total'),
+      ],
+    ]);
+    const ctx = createMockContext();
+    const first = await service.searchIndicators({ query: 'gdp', page: 1, perPage: 50 }, ctx);
+    const second = await service.searchIndicators(
+      { query: 'population', page: 1, perPage: 50 },
       ctx,
     );
-    expect(result.indicators).toHaveLength(1);
-    expect(result.indicators[0].id).toBe('NY.GDP.PCAP.CD');
+    expect(first.indicators.map((i) => i.id)).toEqual(['NY.GDP.PCAP.CD']);
+    expect(second.indicators.map((i) => i.id)).toEqual(['SP.POP.TOTL']);
+    expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('searchIndicators: concurrent keyword searches share one catalog fetch', async () => {
+    mockResponse([pagingObj({ total: 1 }), [rawIndicator('NY.GDP.PCAP.CD', 'GDP per capita')]]);
+    const ctx = createMockContext();
+    const [a, b] = await Promise.all([
+      service.searchIndicators({ query: 'gdp', page: 1, perPage: 50 }, ctx),
+      service.searchIndicators({ query: 'capita', page: 1, perPage: 50 }, ctx),
+    ]);
+    expect(a.indicators).toHaveLength(1);
+    expect(b.indicators).toHaveLength(1);
+    expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('searchIndicators: refetches the catalog when the cache TTL is 0', async () => {
+    const { getServerConfig } = await import('@/config/server-config.js');
+    vi.mocked(getServerConfig).mockReturnValue({
+      apiBaseUrl: 'https://api.worldbank.org/v2',
+      defaultPerPage: 50,
+      catalogCacheTtlMs: 0,
+    } as never);
+    const { WorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    const uncached = new WorldBankApiService(makeConfig() as never, createInMemoryStorage());
+
+    const body = [pagingObj({ total: 1 }), [rawIndicator('NY.GDP.PCAP.CD', 'GDP per capita')]];
+    mockResponse(body);
+    mockResponse(body);
+    const ctx = createMockContext();
+    await uncached.searchIndicators({ query: 'gdp', page: 1, perPage: 50 }, ctx);
+    await uncached.searchIndicators({ query: 'gdp', page: 1, perPage: 50 }, ctx);
+    expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(2);
   });
 
   it('searchIndicators: filters out topics with empty id during normalization', async () => {

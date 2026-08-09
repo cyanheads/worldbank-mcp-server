@@ -5,7 +5,7 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { getServerConfig } from '@/config/server-config.js';
 import { getWorldBankApiService } from '@/services/worldbank/worldbank-service.js';
 
@@ -15,7 +15,9 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
     'Searches the 29,500+ World Bank indicator catalog by keyword, topic, or source. ' +
     'Returns indicator IDs and metadata for chaining into worldbank_get_data. ' +
     'At least one of query, topic_id, or source_id must be provided. ' +
-    'When combined with topic_id or source_id, keyword filtering applies across all results in that topic or source. ' +
+    'A keyword query matches every term against indicator ID, name, and description, in any word order, ' +
+    'across the whole catalog or the whole selected topic or source; punctuation in the query is ignored. ' +
+    'Exact ID or name matches rank first, then whole-phrase matches, then ID/name matches, then description-only matches. ' +
     'Use worldbank_list_topics for topic IDs, worldbank_list_sources for source IDs.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
@@ -23,7 +25,7 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
       .string()
       .optional()
       .describe(
-        'Keyword search terms. At least one of query, topic_id, or source_id must be provided.',
+        'Keyword search terms — an indicator name, ID, or any words from either (e.g. "GDP per capita", "NY.GDP.MKTP.CD", "CO2 emissions"). Every term must match; punctuation is ignored. At least one of query, topic_id, or source_id must be provided.',
       ),
     topic_id: z
       .string()
@@ -102,10 +104,11 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
         'Provide a keyword query, a topic_id from worldbank_list_topics, or a source_id from worldbank_list_sources.',
     },
     {
-      reason: 'no_match',
+      reason: 'invalid_filter',
       code: JsonRpcErrorCode.NotFound,
-      when: 'No indicators matched the query.',
-      recovery: 'Broaden the query, try a synonym, or browse by topic using worldbank_list_topics.',
+      when: 'The topic_id or source_id does not exist upstream.',
+      recovery:
+        'Browse valid IDs with worldbank_list_topics or worldbank_list_sources, then retry with one of those.',
     },
   ],
 
@@ -130,16 +133,28 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
 
     ctx.log.info('Searching indicators', { query, topicId, sourceId, page: input.page, perPage });
 
-    const result = await getWorldBankApiService().searchIndicators(
-      {
-        ...(query !== undefined && { query }),
-        ...(topicId !== undefined && { topicId }),
-        ...(sourceId !== undefined && { sourceId }),
-        page: input.page,
-        perPage,
-      },
-      ctx,
-    );
+    let result: Awaited<ReturnType<ReturnType<typeof getWorldBankApiService>['searchIndicators']>>;
+    try {
+      result = await getWorldBankApiService().searchIndicators(
+        {
+          ...(query !== undefined && { query }),
+          ...(topicId !== undefined && { topicId }),
+          ...(sourceId !== undefined && { sourceId }),
+          page: input.page,
+          perPage,
+        },
+        ctx,
+      );
+    } catch (err) {
+      if (err instanceof McpError && err.data?.reason === 'invalid_filter') {
+        throw ctx.fail('invalid_filter', err.message, {
+          ...ctx.recoveryFor('invalid_filter'),
+          topicId: input.topic_id,
+          sourceId: input.source_id,
+        });
+      }
+      throw err;
+    }
 
     // Build effective-query echo from active filters
     const filterParts: string[] = [];
@@ -149,10 +164,18 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
     ctx.enrich({ effectiveQuery: filterParts.join(', ') });
     ctx.enrich({ totalCount: result.total, currentPage: result.page, totalPages: result.pages });
 
+    // A search that matched nothing is a valid answer, not a failure: return an
+    // empty list with a recovery notice rather than throwing. An empty page of a
+    // non-empty result set is a different problem and gets its own hint.
     if (result.indicators.length === 0) {
-      const hint = query
-        ? `No indicators matched "${query}". Try a synonym or browse by topic using worldbank_list_topics.`
-        : 'No indicators found for the specified filter. Try a different topic or source ID.';
+      let hint: string;
+      if (result.total > 0) {
+        hint = `Page ${result.page} is past the last page of ${result.pages}. Request a page between 1 and ${result.pages}.`;
+      } else if (query) {
+        hint = `No indicators matched "${query}". Try a synonym or browse by topic using worldbank_list_topics.`;
+      } else {
+        hint = 'No indicators found for the specified filter. Try a different topic or source ID.';
+      }
       ctx.enrich.notice(hint);
     }
 

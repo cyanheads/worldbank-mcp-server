@@ -3,6 +3,7 @@
  * @module tests/tools/worldbank-search-indicators.tool.test
  */
 
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -92,6 +93,102 @@ describe('worldbankSearchIndicators', () => {
     const enrichment = getEnrichment(ctx);
     expect(enrichment.notice).toBeDefined();
     expect(enrichment.notice).toContain('nonexistent xyz');
+  });
+
+  it('distinguishes an out-of-range page from a query that matched nothing', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      searchIndicators: vi
+        .fn()
+        .mockResolvedValue({ indicators: [], total: 679, page: 99, pages: 7 }),
+    } as never);
+
+    const { worldbankSearchIndicators } = await import(
+      '@/mcp-server/tools/definitions/worldbank-search-indicators.tool.js'
+    );
+    const ctx = createMockContext({ errors: worldbankSearchIndicators.errors });
+    const input = worldbankSearchIndicators.input.parse({ query: 'gdp', page: 99 });
+    await worldbankSearchIndicators.handler(input, ctx);
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.notice).toBe(
+      'Page 99 is past the last page of 7. Request a page between 1 and 7.',
+    );
+    expect(enrichment.notice).not.toContain('No indicators matched');
+  });
+
+  it('maps an invalid topic/source filter to the invalid_filter contract error', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      searchIndicators: vi
+        .fn()
+        .mockRejectedValue(
+          new McpError(
+            JsonRpcErrorCode.NotFound,
+            'Invalid topic_id or source_id. Use worldbank_list_topics or worldbank_list_sources to browse valid IDs.',
+            { reason: 'invalid_filter', topicId: '999' },
+          ),
+        ),
+    } as never);
+
+    const { worldbankSearchIndicators } = await import(
+      '@/mcp-server/tools/definitions/worldbank-search-indicators.tool.js'
+    );
+    const ctx = createMockContext({ errors: worldbankSearchIndicators.errors });
+    const input = worldbankSearchIndicators.input.parse({ topic_id: '999' });
+    const err = await worldbankSearchIndicators.handler(input, ctx).catch((e: unknown) => e);
+    expect(err).toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: {
+        reason: 'invalid_filter',
+        recovery: { hint: expect.stringContaining('worldbank_list_topics') },
+      },
+    });
+    // The caller must never see internal output-schema field names.
+    expect((err as McpError).message).not.toMatch(/totalCount|currentPage|totalPages/);
+  });
+
+  it('declares no error contract entry that the handler cannot reach', async () => {
+    const { worldbankSearchIndicators } = await import(
+      '@/mcp-server/tools/definitions/worldbank-search-indicators.tool.js'
+    );
+    // Empty results are structured success with a notice, so no_match can never fire.
+    expect(worldbankSearchIndicators.errors?.map((e) => e.reason)).toEqual([
+      'missing_filter',
+      'invalid_filter',
+    ]);
+  });
+
+  it('surfaces matches from a deep result page', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    const deepMatch = {
+      id: 'VC.IHR.PSRC.P5',
+      name: 'Intentional homicides (per 100,000 people)',
+      sourceId: '2',
+      sourceName: 'World Development Indicators',
+      sourceNote: 'Intentional homicides are estimates of unlawful homicides.',
+      topics: [],
+    };
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      searchIndicators: vi
+        .fn()
+        .mockResolvedValue({ indicators: [deepMatch], total: 1201, page: 25, pages: 25 }),
+    } as never);
+
+    const { worldbankSearchIndicators } = await import(
+      '@/mcp-server/tools/definitions/worldbank-search-indicators.tool.js'
+    );
+    const ctx = createMockContext({ errors: worldbankSearchIndicators.errors });
+    const input = worldbankSearchIndicators.input.parse({
+      query: 'VC.IHR.PSRC.P5',
+      source_id: '2',
+      page: 25,
+    });
+    const result = await worldbankSearchIndicators.handler(input, ctx);
+    expect(result.indicators.map((i) => i.id)).toEqual(['VC.IHR.PSRC.P5']);
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.totalCount).toBe(1201);
+    expect(enrichment.currentPage).toBe(25);
+    expect(enrichment.notice).toBeUndefined();
   });
 
   it('formats all fields including sourceId and topics with IDs', async () => {

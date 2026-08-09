@@ -1,7 +1,9 @@
 /**
  * @fileoverview World Bank Indicators API v2 service. Wraps all endpoint categories
  * (indicators, countries, data, topics, sources) with typed fetch methods,
- * retry/timeout, and sparse-payload normalization.
+ * retry/timeout, and sparse-payload normalization. Keyword indicator search and
+ * aggregate-free country listing are computed locally over an exhaustively
+ * fetched candidate set, since the API offers neither server-side.
  * @module services/worldbank/worldbank-service
  */
 
@@ -33,6 +35,23 @@ type ReqCtx = Context & Record<string, unknown>;
 
 /** Shape returned by the WB API for invalid IDs (HTTP 200, not 404). */
 type WbErrorEnvelope = { message: Array<{ id: string; key: string; value: string }> };
+
+/**
+ * Per-request page size for exhaustive fetches. Not a result ceiling — the
+ * fetch loop reads `pages` from the first response and keeps going, so this
+ * only trades request count against response size.
+ */
+const BULK_PAGE_SIZE = 10_000;
+
+/** Timeout for ordinary single-page requests. */
+const REQUEST_TIMEOUT_MS = 15_000;
+
+/**
+ * Timeout for exhaustive fetches. The full indicator catalog is ~15 MB and
+ * takes seconds to transfer even on a good day, so it gets far more headroom
+ * than the small requests {@link REQUEST_TIMEOUT_MS} was sized for.
+ */
+const BULK_TIMEOUT_MS = 60_000;
 
 function isWbErrorEnvelope(data: unknown): data is WbErrorEnvelope {
   // Direct object: { message: [...] }
@@ -125,13 +144,93 @@ function normalizeSource(raw: RawSource): Source {
   };
 }
 
+// ─── Keyword matching ────────────────────────────────────────────────────────
+
+/**
+ * Lowercase and collapse every run of non-alphanumeric characters to a single
+ * space. Indicator names are dense with punctuation — `GDP (current US$)`,
+ * `Unemployment, female (% of female labor force)` — and splitting a query on
+ * whitespace alone yields tokens like `us$)` or `(%)` that appear nowhere,
+ * zeroing out queries a caller would reasonably expect to work.
+ */
+function normalizeForMatch(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .trim();
+}
+
+/**
+ * Rank the ID/name hits so a caller who typed something specific gets it first:
+ * an exact ID or name, then the query as a contiguous phrase, then the rest in
+ * catalog order. Without this, `Population, total` buries `SP.POP.TOTL` behind
+ * whichever loosely-related indicators happen to sort earlier upstream.
+ */
+function rankIdOrNameHits(hits: readonly Indicator[], phrase: string): Indicator[] {
+  const exact: Indicator[] = [];
+  const contiguous: Indicator[] = [];
+  const rest: Indicator[] = [];
+  for (const indicator of hits) {
+    const id = normalizeForMatch(indicator.id);
+    const name = normalizeForMatch(indicator.name);
+    if (phrase === id || phrase === name) exact.push(indicator);
+    else if (`${id} ${name}`.includes(phrase)) contiguous.push(indicator);
+    else rest.push(indicator);
+  }
+  return [...exact, ...contiguous, ...rest];
+}
+
+/**
+ * Filter indicators by keyword. Every token of the normalized query must appear
+ * (case-insensitive substring) in the indicator's ID, name, or source note, so
+ * word order doesn't matter — "per capita GDP" and "gdp per capita" return the
+ * same set. Tokens are alphanumeric-only, which lets them be matched against the
+ * raw haystack directly: an alphanumeric run in the normalized text is present
+ * verbatim in the original, so normalizing 29.5k source notes per query buys
+ * nothing. Results matching on ID or name are ranked ahead of those that only
+ * matched the prose in `sourceNote`, which keeps the useful hits on page one.
+ */
+function matchIndicators(indicators: readonly Indicator[], query: string): Indicator[] {
+  const phrase = normalizeForMatch(query);
+  if (!phrase) return [...indicators];
+  const tokens = phrase.split(' ');
+
+  const byIdOrName: Indicator[] = [];
+  const byNote: Indicator[] = [];
+  for (const indicator of indicators) {
+    const idAndName = `${indicator.id} ${indicator.name}`.toLowerCase();
+    if (tokens.every((token) => idAndName.includes(token))) {
+      byIdOrName.push(indicator);
+      continue;
+    }
+    const note = indicator.sourceNote.toLowerCase();
+    if (tokens.every((token) => idAndName.includes(token) || note.includes(token))) {
+      byNote.push(indicator);
+    }
+  }
+  return [...rankIdOrNameHits(byIdOrName, phrase), ...byNote];
+}
+
 // ─── Service ─────────────────────────────────────────────────────────────────
 
 export class WorldBankApiService {
   private readonly baseUrl: string;
+  private readonly catalogCacheTtlMs: number;
+
+  /**
+   * Cached projection of the full indicator catalog, used by keyword-only
+   * search. Held on the instance rather than in module scope so tests (and
+   * multiple service instances) can't leak state into each other.
+   */
+  private catalogCache: { indicators: Indicator[]; expiresAt: number } | undefined;
+
+  /** In-flight catalog fetch, shared so concurrent searches trigger one request. */
+  private catalogInFlight: Promise<Indicator[]> | undefined;
 
   constructor(_config: AppConfig, _storage: StorageService) {
-    this.baseUrl = getServerConfig().apiBaseUrl.replace(/\/$/, '');
+    const serverConfig = getServerConfig();
+    this.baseUrl = serverConfig.apiBaseUrl.replace(/\/$/, '');
+    this.catalogCacheTtlMs = serverConfig.catalogCacheTtlMs;
   }
 
   /** Build a fully-qualified URL with format=json always appended. */
@@ -145,9 +244,9 @@ export class WorldBankApiService {
   }
 
   /** Fetch a URL, detect HTML error pages, and return the parsed JSON. */
-  private async fetchJson<T>(url: string, ctx: Context): Promise<T> {
+  private async fetchJson<T>(url: string, ctx: Context, timeoutMs: number): Promise<T> {
     const reqCtx = ctx as ReqCtx;
-    const response = await fetchWithTimeout(url, 15_000, reqCtx, { signal: ctx.signal });
+    const response = await fetchWithTimeout(url, timeoutMs, reqCtx, { signal: ctx.signal });
     const text = await response.text();
 
     // Detect HTML error pages (upstream returns HTML on some gateway errors)
@@ -161,13 +260,55 @@ export class WorldBankApiService {
   }
 
   /** Fetch JSON with retry wrapping the full pipeline. */
-  private fetchWithRetry<T>(url: string, ctx: Context): Promise<T> {
-    return withRetry(() => this.fetchJson<T>(url, ctx), {
+  private fetchWithRetry<T>(
+    url: string,
+    ctx: Context,
+    timeoutMs: number = REQUEST_TIMEOUT_MS,
+  ): Promise<T> {
+    return withRetry(() => this.fetchJson<T>(url, ctx, timeoutMs), {
       operation: 'WorldBankApiService.fetch',
       context: ctx as ReqCtx,
       baseDelayMs: 1000,
       signal: ctx.signal,
     });
+  }
+
+  /**
+   * Fetch every upstream page for a scope and return the concatenated raw items.
+   *
+   * `pages` from the first response is the loop bound; the accumulated item
+   * count — not `paging.total` — is what callers paginate against, since only
+   * the rows actually in hand can be served and local filtering changes the
+   * count anyway.
+   *
+   * @param onErrorEnvelope - Throws the caller's domain error when the World
+   *   Bank returns its HTTP-200 error envelope for an invalid filter value.
+   */
+  private async fetchAllPages<T>(
+    path: string,
+    params: Record<string, string | number | undefined>,
+    ctx: Context,
+    onErrorEnvelope: () => never,
+  ): Promise<T[]> {
+    const requestPage = async (page: number) => {
+      const url = this.buildUrl(path, { ...params, page, per_page: BULK_PAGE_SIZE });
+      ctx.log.debug('Fetching upstream page', { url });
+      const data = await this.fetchWithRetry<WbEnvelope<T> | WbErrorEnvelope>(
+        url,
+        ctx,
+        BULK_TIMEOUT_MS,
+      );
+      if (isWbErrorEnvelope(data)) onErrorEnvelope();
+      const [paging, items] = data as WbEnvelope<T>;
+      return { paging, items: items ?? [] };
+    };
+
+    const first = await requestPage(1);
+    const pages = Number(first.paging.pages);
+    if (pages <= 1) return first.items;
+
+    const rest = await Promise.all(Array.from({ length: pages - 1 }, (_, i) => requestPage(i + 2)));
+    return [first.items, ...rest.map((r) => r.items)].flat();
   }
 
   // ─── Topics ──────────────────────────────────────────────────────────────
@@ -204,6 +345,36 @@ export class WorldBankApiService {
 
   // ─── Indicators ──────────────────────────────────────────────────────────
 
+  /**
+   * Load and cache the full indicator catalog. Keyword-only search has no
+   * server-side counterpart — the upstream `searchterm` parameter returns the
+   * unfiltered catalog — so matching happens locally over the whole set.
+   * Concurrent callers share one in-flight fetch instead of each pulling ~15 MB.
+   */
+  private loadIndicatorCatalog(ctx: Context): Promise<Indicator[]> {
+    const cached = this.catalogCache;
+    if (cached && cached.expiresAt > Date.now()) return Promise.resolve(cached.indicators);
+
+    this.catalogInFlight ??= this.fetchAllPages<RawIndicator>('/indicator', {}, ctx, () => {
+      throw serviceUnavailable(
+        'World Bank returned an error response for the indicator catalog listing.',
+      );
+    })
+      .then((raw) => {
+        const indicators = raw.map(normalizeIndicator);
+        if (this.catalogCacheTtlMs > 0) {
+          this.catalogCache = { indicators, expiresAt: Date.now() + this.catalogCacheTtlMs };
+        }
+        ctx.log.debug('Indicator catalog loaded', { count: indicators.length });
+        return indicators;
+      })
+      .finally(() => {
+        this.catalogInFlight = undefined;
+      });
+
+    return this.catalogInFlight;
+  }
+
   async searchIndicators(
     opts: {
       query?: string;
@@ -216,66 +387,51 @@ export class WorldBankApiService {
   ): Promise<{ indicators: Indicator[]; total: number; page: number; pages: number }> {
     const { query, topicId, sourceId, page, perPage } = opts;
 
-    let url: string;
-    let clientFilterTerm: string | undefined;
+    // Topic wins when both are given — /topic/{id}/indicator takes no source param.
+    const path = topicId ? `/topic/${encodeURIComponent(topicId)}/indicator` : '/indicator';
+    const scopeParams: Record<string, string | number | undefined> =
+      !topicId && sourceId ? { source: sourceId } : {};
 
-    if (topicId && !query) {
-      // Topic-only: use dedicated endpoint
-      url = this.buildUrl(`/topic/${encodeURIComponent(topicId)}/indicator`, {
-        page,
-        per_page: perPage,
-      });
-    } else if (topicId && query) {
-      // Topic + keyword: fetch by topic, filter client-side
-      url = this.buildUrl(`/topic/${encodeURIComponent(topicId)}/indicator`, {
-        page: 1,
-        per_page: 1000,
-      });
-      clientFilterTerm = query.toLowerCase();
-    } else if (sourceId && !query) {
-      // Source-only: use source filter
-      url = this.buildUrl('/indicator', { source: sourceId, page, per_page: perPage });
-    } else if (sourceId && query) {
-      // Source + keyword: fetch by source, filter client-side
-      url = this.buildUrl('/indicator', { source: sourceId, page: 1, per_page: 1000 });
-      clientFilterTerm = query.toLowerCase();
-    } else if (query) {
-      // Keyword-only: use searchterm
-      url = this.buildUrl('/indicator', { searchterm: query, page, per_page: perPage });
-    } else {
-      // No filter: list all
-      url = this.buildUrl('/indicator', { page, per_page: perPage });
-    }
-
-    ctx.log.debug('Searching indicators', { url });
-    const data = await this.fetchWithRetry<WbEnvelope<RawIndicator>>(url, ctx);
-    const [paging, items] = data;
-
-    let normalized = (items ?? []).map(normalizeIndicator);
-
-    if (clientFilterTerm) {
-      const term = clientFilterTerm;
-      normalized = normalized.filter(
-        (ind) =>
-          ind.name.toLowerCase().includes(term) ||
-          ind.id.toLowerCase().includes(term) ||
-          ind.sourceNote.toLowerCase().includes(term),
+    const invalidScope: () => never = () => {
+      throw notFound(
+        'Invalid topic_id or source_id. Use worldbank_list_topics or worldbank_list_sources to browse valid IDs.',
+        { reason: 'invalid_filter', topicId, sourceId },
       );
-      // Paginate the client-filtered results
-      const start = (page - 1) * perPage;
+    };
+
+    if (!query) {
+      // No keyword: upstream pagination is authoritative, one request per page.
+      const url = this.buildUrl(path, { ...scopeParams, page, per_page: perPage });
+      ctx.log.debug('Listing indicators', { url });
+      const data = await this.fetchWithRetry<WbEnvelope<RawIndicator> | WbErrorEnvelope>(url, ctx);
+      if (isWbErrorEnvelope(data)) invalidScope();
+
+      const [paging, items] = data as WbEnvelope<RawIndicator>;
       return {
-        indicators: normalized.slice(start, start + perPage),
-        total: normalized.length,
-        page,
-        pages: Math.ceil(normalized.length / perPage),
+        indicators: (items ?? []).map(normalizeIndicator),
+        total: paging.total,
+        page: paging.page,
+        pages: paging.pages,
       };
     }
 
+    // Keyword matching is entirely client-side, so every candidate in scope has
+    // to be in hand before filtering — otherwise matches past the first upstream
+    // page are unreachable through any tool input.
+    const pool =
+      topicId || sourceId
+        ? (await this.fetchAllPages<RawIndicator>(path, scopeParams, ctx, invalidScope)).map(
+            normalizeIndicator,
+          )
+        : await this.loadIndicatorCatalog(ctx);
+
+    const matches = matchIndicators(pool, query);
+    const start = (page - 1) * perPage;
     return {
-      indicators: normalized,
-      total: paging.total,
-      page: paging.page,
-      pages: paging.pages,
+      indicators: matches.slice(start, start + perPage),
+      total: matches.length,
+      page,
+      pages: Math.ceil(matches.length / perPage),
     };
   }
 
@@ -317,52 +473,47 @@ export class WorldBankApiService {
   ): Promise<{ countries: Country[]; total: number; page: number; pages: number }> {
     const { region, incomeLevel, includeAggregates, page, perPage } = opts;
 
-    // When filtering aggregates, the WB API has no server-side parameter for this.
-    // Fetch all entries in one shot (max 300, WB total is ~296) so we can filter
-    // and compute accurate total/pages. When including aggregates, use the requested
-    // page/perPage directly against the API — no over-fetch needed.
-    const fetchPage = includeAggregates ? page : 1;
-    const fetchPerPage = includeAggregates ? perPage : 300;
+    const filterParams: Record<string, string | number | undefined> = {};
+    if (region) filterParams.region = region;
+    if (incomeLevel) filterParams.incomeLevel = incomeLevel;
 
-    const params: Record<string, string | number | undefined> = {
-      page: fetchPage,
-      per_page: fetchPerPage,
-    };
-    if (region) params.region = region;
-    if (incomeLevel) params.incomeLevel = incomeLevel;
-
-    const url = this.buildUrl('/country', params);
-    ctx.log.debug('Listing countries', { url });
-
-    const data = await this.fetchWithRetry<WbEnvelope<RawCountry> | WbErrorEnvelope>(url, ctx);
-
-    if (isWbErrorEnvelope(data)) {
+    const invalidFilter: () => never = () => {
       throw notFound(
         'Invalid region or income_level code. Use worldbank_list_countries without filters to browse valid codes.',
-        { reason: 'invalid_filter', region: opts.region, incomeLevel: opts.incomeLevel },
+        { reason: 'invalid_filter', region, incomeLevel },
       );
-    }
-
-    const [paging, items] = data as WbEnvelope<RawCountry>;
-
-    let countries = (items ?? []).map(normalizeCountry);
+    };
 
     if (!includeAggregates) {
-      // Filter aggregates client-side and re-paginate so total/pages match.
-      countries = countries.filter((c) => !c.isAggregate);
-      const filteredTotal = countries.length;
-      const filteredPages = Math.max(1, Math.ceil(filteredTotal / perPage));
+      // The WB API has no server-side aggregate filter, so every entity in scope
+      // has to be fetched before aggregates can be dropped and the remainder
+      // re-paginated — otherwise entities past the first upstream page are
+      // unreachable and total/pages under-report.
+      const raw = await this.fetchAllPages<RawCountry>(
+        '/country',
+        filterParams,
+        ctx,
+        invalidFilter,
+      );
+      const countries = raw.map(normalizeCountry).filter((c) => !c.isAggregate);
       const start = (page - 1) * perPage;
       return {
         countries: countries.slice(start, start + perPage),
-        total: filteredTotal,
+        total: countries.length,
         page,
-        pages: filteredPages,
+        pages: Math.max(1, Math.ceil(countries.length / perPage)),
       };
     }
 
+    const url = this.buildUrl('/country', { ...filterParams, page, per_page: perPage });
+    ctx.log.debug('Listing countries', { url });
+
+    const data = await this.fetchWithRetry<WbEnvelope<RawCountry> | WbErrorEnvelope>(url, ctx);
+    if (isWbErrorEnvelope(data)) invalidFilter();
+
+    const [paging, items] = data as WbEnvelope<RawCountry>;
     return {
-      countries,
+      countries: (items ?? []).map(normalizeCountry),
       total: paging.total,
       page: paging.page,
       pages: paging.pages,

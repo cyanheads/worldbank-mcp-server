@@ -189,6 +189,58 @@ describe('worldbankListCountries', () => {
     expect(callArgs.includeAggregates).toBe(true);
   });
 
+  it('passes include_aggregates=false with the requested page to the service', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    const listCountriesMock = vi.fn().mockResolvedValue(mockCountriesResult);
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      listCountries: listCountriesMock,
+    } as never);
+
+    const { worldbankListCountries } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
+    );
+    const ctx = createMockContext();
+    const input = worldbankListCountries.input.parse({ page: 4, per_page: 100 });
+    await worldbankListCountries.handler(input, ctx);
+    expect(listCountriesMock.mock.calls[0][0]).toMatchObject({
+      includeAggregates: false,
+      page: 4,
+      perPage: 100,
+    });
+  });
+
+  it('surfaces an entity past the 300th with a matching totalCount', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    const deepCountry = {
+      id: 'ZWE',
+      iso2: 'ZW',
+      name: 'Zimbabwe',
+      region: { id: 'SSF', name: 'Sub-Saharan Africa' },
+      incomeLevel: { id: 'LMC', name: 'Lower middle income' },
+      lendingType: 'IDA',
+      capitalCity: 'Harare',
+      longitude: '31.0672',
+      latitude: '-17.8312',
+      isAggregate: false,
+    };
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      listCountries: vi
+        .fn()
+        .mockResolvedValue({ countries: [deepCountry], total: 320, page: 7, pages: 7 }),
+    } as never);
+
+    const { worldbankListCountries } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
+    );
+    const ctx = createMockContext();
+    const input = worldbankListCountries.input.parse({ page: 7, per_page: 50 });
+    const result = await worldbankListCountries.handler(input, ctx);
+    expect(result.countries.map((c) => c.id)).toEqual(['ZWE']);
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.totalCount).toBe(320);
+    expect(enrichment.totalPages).toBe(7);
+  });
+
   // ─── Format edge cases ────────────────────────────────────────────────────
 
   it('format renders fallback message when countries list is empty', async () => {

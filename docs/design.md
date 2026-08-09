@@ -58,6 +58,7 @@ One service wrapping the entire API. All endpoints share the same base URL and r
 |:--------|:---------|:------------|
 | `WORLDBANK_API_BASE_URL` | No | Override base URL (default: `https://api.worldbank.org/v2`). Useful for testing against local mirrors. |
 | `WORLDBANK_DEFAULT_PER_PAGE` | No | Default page size for list/search operations (default: `50`). |
+| `WORLDBANK_CATALOG_CACHE_TTL_MS` | No | Lifetime of the in-process indicator-catalog cache backing keyword-only search (default: `3600000`). `0` disables caching and refetches on every keyword-only search. |
 
 No API key. The World Bank API is fully public.
 
@@ -81,7 +82,7 @@ The API has four endpoint families. All return the same envelope: `[{ page, page
 
 | Noun | Endpoint | Operations |
 |:-----|:---------|:-----------|
-| Indicator | `GET /v2/indicator` | list (paginated), search (`?searchterm=`), filter by topic (`?topic=`), filter by source (`?source=`) |
+| Indicator | `GET /v2/indicator` | list (paginated), filter by source (`?source=`). `?searchterm=` exists but does not filter — see the note under `worldbank_search_indicators`. |
 | Indicator | `GET /v2/indicator/{id}` | get by ID |
 | Indicator | `GET /v2/topic/{id}/indicator` | list indicators for a topic |
 | Country | `GET /v2/country` | list (paginated); includes aggregates intermixed |
@@ -144,13 +145,13 @@ The API returns country aggregates (regions, income groups, World) mixed with in
 Searches the 29,500+ indicator catalog. The critical discovery entry point — without this, an agent must already know an indicator's cryptic ID (e.g., `NY.GDP.PCAP.CD`).
 
 **Input:**
-- `query: string` — keyword search passed to `?searchterm=`. Required unless `topic_id` or `source_id` is provided.
+- `query: string` — keyword terms, matched locally. Required unless `topic_id` or `source_id` is provided.
 - `topic_id: string | undefined` — numeric topic ID (1–21) to filter by thematic area. Use `worldbank_list_topics` to browse.
 - `source_id: string | undefined` — numeric source ID to filter by dataset origin (e.g., `"2"` for World Development Indicators). Use `worldbank_list_sources` to browse.
 - `page: number` (default: 1) — pagination page
 - `per_page: number` (default: 50, max: 100) — results per page
 
-**Note:** The API's `searchterm` is silently ignored when `topic_id` or `source_id` is present — the topic or source filter takes over and returns all indicators for that topic/source regardless of the keyword. When `topic_id` is given without `query`, use `GET /v2/topic/{id}/indicator`. When `source_id` is given without `query`, use `GET /v2/indicator?source={id}`. When either filter is given *with* `query`, the service must fetch by the topic/source endpoint and filter client-side by the keyword term. This is a WB API quirk that the service layer must handle for both `topic_id` and `source_id`.
+**Note:** The API's `searchterm` parameter does not filter anything — a nonsense term returns the entire catalog, with or without a topic/source filter present. Keyword matching therefore happens entirely in the service, over the full candidate set for the requested scope: the whole catalog for a keyword-only search, `GET /v2/topic/{id}/indicator` for topic scope, `GET /v2/indicator?source={id}` for source scope. Each scope is fetched exhaustively (loop over the envelope's `pages`) before matching, so a hit on upstream page 2 is reachable. Matching is token-AND over an alphanumeric tokenization: the query is lowercased and split on every run of non-alphanumeric characters, and each resulting term must appear as a substring of the indicator's ID, name, or `sourceNote`. Results are ordered exact ID or name match, then whole-phrase ID/name match, then remaining ID/name matches, then `sourceNote`-only matches.
 
 **Output:**
 - `indicators: Array<{ id, name, sourceId, sourceName, topics[], sourceNote }>` — matching indicators
@@ -158,7 +159,10 @@ Searches the 29,500+ indicator catalog. The critical discovery entry point — w
 - `page: number`, `pages: number` — pagination state
 
 **Errors:**
-- `no_match` (`NotFound`) — no indicators matched the query. Recovery: broaden the query or browse by topic.
+- `missing_filter` (`ValidationError`) — none of `query`, `topic_id`, `source_id` given. Recovery: supply one.
+- `invalid_filter` (`NotFound`) — `topic_id` or `source_id` doesn't exist upstream (HTTP 200 with the error envelope). Recovery: browse valid IDs with `worldbank_list_topics` / `worldbank_list_sources`.
+
+A search that matches nothing is not an error — it returns an empty `indicators` array with an `enrichment.notice` carrying the recovery hint.
 
 ### `worldbank_get_indicator`
 
@@ -260,19 +264,24 @@ Lists the ~71 WB data sources (datasets). Supports pagination since the list can
 | Single `worldbank_get_data` for all data queries | The API returns data in the same shape regardless of whether you query one country, many, a region, or `all`. Splitting by use case would be a 1:1 API-mirror mistake — the tool is already self-sufficient with flexible `countries` input. |
 | `countries` accepts both single string and array | Agents most often query 2–6 countries for comparison; array input reads naturally for that case. The service layer joins the array with `;` before calling the API. |
 | `include_aggregates` defaults to `false` in `worldbank_list_countries` | Aggregate entries (regions, income groups) look like real countries in the raw API response and confuse country-browsing workflows. A researcher asking "list Sub-Saharan countries" doesn't want `AFR`, `AFE`, `SSA` in the results. Aggregates are fully accessible by setting the flag or querying with aggregate codes directly. |
+| Aggregate-free country listing fetches every upstream page | The API has no server-side aggregate filter, so `include_aggregates=false` must filter locally — and can only do that correctly over the complete entity set. A fixed first-page fetch made anything past that page unreachable and made `total`/`pages` under-report silently. `include_aggregates=true` still pages straight through to upstream. |
 | `isAggregate` field on data rows | The WDI mixes individual country data with regional aggregates in `all` queries. The agent needs to split or label them correctly for analysis. Region entries have `incomeLevel.id = "NA"` in the raw API, so this is a cheap derived boolean. |
 | `mrv` vs `date_range` as mutually exclusive | The API supports both `mrv` and `date` independently. They serve different workflows (explore recent trends vs. historical analysis) and combining them yields confusing results. Making them mutually exclusive in the schema forces clarity. |
-| Topic/source indicator search routes to dedicated endpoints; combined keyword+filter queries use client-side filtering | The `searchterm` param is silently ignored when `topic` or `source` is also present — the API returns all indicators for the topic/source regardless of the keyword. The only correct path: topic-only → `/topic/{id}/indicator`; source-only → `/indicator?source={id}`; topic/source + keyword → fetch from the dedicated endpoint and filter client-side by the keyword term. |
+| All keyword matching is client-side over an exhaustively fetched scope | `?searchterm=` never filters, so there is no server-side search to lean on for any query shape. Every keyword path fetches its whole scope (catalog, topic, or source) by looping the envelope's `pages`, then matches and paginates locally. A single-shot fetch with a fixed page size would silently drop matches past that page. |
+| Full-catalog fetch is cached in-process with single-flight | The catalog is ~15 MB / 29.5k rows and paying that on every keyword-only search is untenable. A TTL'd cache on the service instance (`WORLDBANK_CATALOG_CACHE_TTL_MS`, default 1 h) with a shared in-flight promise keeps concurrent searches to one fetch. State lives on the instance, not module scope, so tests and multiple instances stay isolated. |
+| Token-AND matching on alphanumeric terms, ranked by specificity | Whole-string substring matching is word-order sensitive: "per capita GDP" returned 8 hits where "gdp per capita" returned 38, for the same intent. Requiring each term independently makes both return the same 108. Splitting on punctuation rather than whitespace is what keeps a copied indicator name working — `Unemployment, female (%)` tokenized on whitespace yields `(%)`, which appears in no name, and the query returns nothing. The looser tokens widen recall, so the exact/phrase ranking tiers do the work of putting the obvious answer first. |
+| Empty results are structured success, not `no_match` | A search with zero hits is a valid answer. It returns an empty array plus an `enrichment.notice` carrying the recovery hint, matching `worldbank_get_data`'s empty-result handling. The declared `no_match` error was unreachable and was removed rather than wired up. |
 | No `worldbank_compare_countries` workflow tool | A first-class comparison tool is tempting but adds no real value over `worldbank_get_data` with multiple countries — the agent can do the comparison logic. Keeping the surface tight avoids duplicating the data query with a thin wrapper. |
 | DataCanvas not used | Data result sets are moderate-sized (200 countries × N years). The 1000-row `per_page` ceiling and typical query sizes (10–50 rows for focused country comparisons) don't warrant the DuckDB overhead. An agent doing deep tabular analysis can call multiple times. This can be revisited if large `all`-country time-series queries prove problematic in practice. |
 | Resources for country and indicator | Stable, addressable by ID, read-only, useful as injectable context for agents that support resources. Both entities satisfy the resource criteria without redundancy — their tool path (`worldbank_get_country`, `worldbank_get_indicator`) also covers tool-only clients. |
 
 ## Known Limitations
 
-- **Search is keyword-only.** The WB `searchterm` API is a simple keyword match — no semantic search, no fuzzy matching. An agent searching for "income inequality" won't find the Gini coefficient unless it also tries "Gini". Compound searches and synonyms require multiple calls.
+- **Search is literal substring matching.** No semantic search, no stemming, no fuzzy matching. An agent searching for "income inequality" won't find the Gini coefficient unless it also tries "Gini". Synonyms require multiple calls. Short terms match inside longer words (`us` hits `housing`), which the ranking tiers mitigate but do not eliminate.
 - **Data sparsity is inherent.** Many indicators lack data for specific countries or years — the API returns `null` for those cells without warning. `nullCount` in the response quantifies this; the agent must interpret null values in context.
-- **`searchterm` is ignored when topic or source filter is present.** Passing both a keyword and a topic/source filter causes the API to silently ignore the keyword and return all indicators for the topic/source. The service layer handles this with client-side filtering for combined queries.
-- **`searchterm` returns all 29,500+ records when no match found.** The API falls back to returning everything when a search term hits zero exact matches. The tool caps `per_page` at 100 to prevent overwhelming responses.
+- **The upstream `searchterm` parameter does not filter.** It is accepted and ignored — a nonsense term still returns the full 29,500-record catalog with the same `total`. There is no server-side full-text search to fall back on, so the service does all keyword matching itself.
+- **A keyword-only search costs a full-catalog fetch on a cold cache.** ~15 MB and a few seconds, once per `WORLDBANK_CATALOG_CACHE_TTL_MS` window per process. Topic- and source-scoped searches are far smaller (the largest source is ~1,500 rows).
+- **The catalog contains duplicate indicator IDs.** 54 IDs appear twice in `/indicator`, most of them the same indicator published under two `source` values. They are passed through as-is, so a search can return the same ID more than once and `total` counts both rows.
 - **Indicator IDs are opaque and hierarchical.** IDs like `NY.GDP.PCAP.CD` encode source, topic, and unit, but the encoding isn't documented for programmatic parsing. The agent should treat them as opaque strings.
 - **Update frequency varies widely.** Some indicators are annual, some quarterly, some have multi-year gaps. The API provides no update schedule — agents querying "most recent data" may get values from several years ago.
 
@@ -321,7 +330,12 @@ Lists the ~71 WB data sources (datasets). Supports pagination since the list can
 | 2026-05-23 | `include_aggregates` defaults to false on `worldbank_list_countries` | Raw API mixes ~90 aggregates (regions, sub-regions, income groups, IDA/IBRD classifications) into the country listing. A researcher browsing "countries in South Asia" doesn't want those. Opt-in via flag. |
 | 2026-05-23 | No `worldbank_compare_countries` tool | It would be a thin wrapper over `worldbank_get_data`. The comparison logic belongs to the agent. Adding it would grow the surface without adding capability. |
 | 2026-05-23 | `mrv` and `date_range` are mutually exclusive inputs | When both are passed, the API silently lets `mrv` win and ignores `date`. Forcing the caller to choose one in the schema prevents silent surprise and reflects actual workflow intent. |
-| 2026-05-23 | Topic/source-filter search routes to dedicated endpoints; combined keyword+filter uses client-side filtering | The WB `searchterm` param is silently ignored when `topic` or `source` is also present — both filters exhibit the same behavior. Routing to `/topic/{id}/indicator` or `/indicator?source={id}` and optionally filtering client-side by keyword is the only correct path. |
+| 2026-05-23 | Topic/source-filter search routes to dedicated endpoints; combined keyword+filter uses client-side filtering *(superseded 2026-08-09)* | The WB `searchterm` param appeared to be ignored only when `topic` or `source` was present. Routing to `/topic/{id}/indicator` or `/indicator?source={id}` and filtering client-side by keyword was taken as the correct path for combined queries. |
+| 2026-08-09 | Every keyword search matches client-side over an exhaustively fetched scope | Measured against the live API: `?searchterm=zzzz-no-such-indicator-xyz` returns the full catalog with `total: 29544`, so the parameter never filters — the earlier "only when topic/source is present" reading was too narrow. Keyword-only search now matches over the full catalog, and topic/source scopes are fetched across all upstream pages (topic 4 alone holds 1,014 rows, source 2 holds 1,498) instead of a single 1,000-row page. |
+| 2026-08-09 | Full catalog cached in-process, 1 h TTL, single-flight | The catalog is 14.9 MB / 29,544 rows, ~39 MB retained as a normalized projection, and a measured RSS step of roughly 140 MB on the first cold search. Fetching it per search is untenable; caching it on the service instance with a shared in-flight promise makes a warm keyword-only search a local scan in tens of milliseconds. TTL is configurable via `WORLDBANK_CATALOG_CACHE_TTL_MS`; `0` trades the memory back for a refetch per search. |
+| 2026-08-09 | Token-AND keyword matching on alphanumeric terms, ranked by specificity | Word-order sensitivity was producing wrong-looking results ("per capita GDP" → 8 hits, "gdp per capita" → 38). Requiring each term independently makes both return 108. Terms are split on punctuation, not whitespace, so a pasted indicator name survives: `Unemployment, female (%)` split on whitespace yields the term `(%)`, which appears in no indicator name, and the search returns nothing. Punctuation-insensitive terms match more loosely, so exact-ID/name and whole-phrase hits are promoted ahead of the rest — `Population, total` puts `SP.POP.TOTL` first, `GDP (current US$)` puts `NY.GDP.MKTP.CD` first. |
+| 2026-08-09 | `no_match` removed from `worldbank_search_indicators`; empty results stay structured | The declared error could never fire — empty searches already returned success with an `enrichment.notice`. A zero-hit search is a valid answer, and `worldbank_get_data` handles its empty case the same way, so the unreachable contract entry was dropped rather than wired up. `invalid_filter` was added in its place for genuinely bad topic/source IDs. |
+| 2026-08-09 | `worldbank_list_countries` fetches all upstream pages when excluding aggregates | The fixed `page=1&per_page=300` fetch left five rows of headroom over upstream's 295 entities; crossing 300 would have dropped countries from every page with `totalCount` under-reporting and no notice. Reading `pages` from the first response removes the ceiling and costs one request today. |
 | 2026-05-23 | DataCanvas deferred | Typical query sizes don't exceed context budget. DuckDB adds startup overhead and worker-mode incompatibility. Revisit if `all`-country queries with long date ranges prove costly in practice. |
 | 2026-05-23 | `nullCount` field on data response | The WDI has significant data gaps — sparse series are the rule, not the exception. Surfacing `nullCount` gives the agent a quantitative sparsity signal without requiring it to count nulls manually. |
 | 2026-05-23 | Seven tools total | Covers all discovery and data workflows without overlap. `worldbank_list_topics` and `worldbank_list_sources` are small reference tools that pay for themselves by enabling natural discovery flows and reducing indicator search failures. |
