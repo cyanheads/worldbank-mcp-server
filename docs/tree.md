@@ -1,6 +1,6 @@
 # worldbank-mcp-server - Directory Structure
 
-Generated on: 2026-08-10 02:13:31
+Generated on: 2026-08-10 03:23:34
 
 ```text
 worldbank-mcp-server/
@@ -23,6 +23,7 @@ worldbank-mcp-server/
 ├── changelog/
 │   ├── 0.1.x/
 │   ├── 0.2.x/
+│   ├── 0.3.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md
@@ -148,10 +149,14 @@ worldbank-mcp-server/
 │   │           ├── worldbank-list-countries.tool.ts
 │   │           ├── worldbank-list-sources.tool.ts
 │   │           ├── worldbank-list-topics.tool.ts
-│   │           └── worldbank-search-indicators.tool.ts
+│   │           ├── worldbank-search-indicators.tool.ts
+│   │           └── worldbank-search-projects.tool.ts
 │   ├── services/
 │   │   ├── pip/
 │   │   │   ├── pip-service.ts
+│   │   │   └── types.ts
+│   │   ├── projects/
+│   │   │   ├── projects-service.ts
 │   │   │   └── types.ts
 │   │   └── worldbank/
 │   │       ├── types.ts
@@ -165,6 +170,8 @@ worldbank-mcp-server/
 │   ├── services/
 │   │   ├── pip/
 │   │   │   └── pip-service.test.ts
+│   │   ├── projects/
+│   │   │   └── projects-service.test.ts
 │   │   └── worldbank/
 │   │       └── worldbank-service.test.ts
 │   └── tools/
@@ -175,7 +182,8 @@ worldbank-mcp-server/
 │       ├── worldbank-list-countries.tool.test.ts
 │       ├── worldbank-list-sources.tool.test.ts
 │       ├── worldbank-list-topics.tool.test.ts
-│       └── worldbank-search-indicators.tool.test.ts
+│       ├── worldbank-search-indicators.tool.test.ts
+│       └── worldbank-search-projects.tool.test.ts
 ├── .dockerignore
 ├── .env.example
 ├── .gitattributes

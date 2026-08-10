@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.0](changelog/0.3.x/0.3.0.md) — 2026-08-09
+
+Add worldbank_search_projects — search the World Bank lending portfolio by text, country, region, status, and board approval date (#8)
+
 ## [0.2.0](changelog/0.2.x/0.2.0.md) — 2026-08-09
 
 Add worldbank_get_poverty — poverty and inequality estimates from the Poverty and Inequality Platform (#8)
