@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.0](changelog/0.2.x/0.2.0.md) — 2026-08-09
+
+Add worldbank_get_poverty — poverty and inequality estimates from the Poverty and Inequality Platform (#8)
+
 ## [0.1.17](changelog/0.1.x/0.1.17.md) — 2026-08-09
 
 Add appliedFilters echo to worldbank_search_indicators/worldbank_get_data; fix resource not-found misclassification and duplicate indicator IDs (#12, #19, #23)

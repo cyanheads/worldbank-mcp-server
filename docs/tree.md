@@ -1,6 +1,6 @@
 # worldbank-mcp-server - Directory Structure
 
-Generated on: 2026-08-09 22:02:51
+Generated on: 2026-08-10 02:13:31
 
 ```text
 worldbank-mcp-server/
@@ -22,6 +22,7 @@ worldbank-mcp-server/
 │   └── settings.json
 ├── changelog/
 │   ├── 0.1.x/
+│   ├── 0.2.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md
@@ -143,11 +144,15 @@ worldbank-mcp-server/
 │   │           ├── worldbank-get-country.tool.ts
 │   │           ├── worldbank-get-data.tool.ts
 │   │           ├── worldbank-get-indicator.tool.ts
+│   │           ├── worldbank-get-poverty.tool.ts
 │   │           ├── worldbank-list-countries.tool.ts
 │   │           ├── worldbank-list-sources.tool.ts
 │   │           ├── worldbank-list-topics.tool.ts
 │   │           └── worldbank-search-indicators.tool.ts
 │   ├── services/
+│   │   ├── pip/
+│   │   │   ├── pip-service.ts
+│   │   │   └── types.ts
 │   │   └── worldbank/
 │   │       ├── types.ts
 │   │       └── worldbank-service.ts
@@ -158,12 +163,15 @@ worldbank-mcp-server/
 │   │   ├── worldbank-country.resource.test.ts
 │   │   └── worldbank-indicator.resource.test.ts
 │   ├── services/
+│   │   ├── pip/
+│   │   │   └── pip-service.test.ts
 │   │   └── worldbank/
 │   │       └── worldbank-service.test.ts
 │   └── tools/
 │       ├── worldbank-get-country.tool.test.ts
 │       ├── worldbank-get-data.tool.test.ts
 │       ├── worldbank-get-indicator.tool.test.ts
+│       ├── worldbank-get-poverty.tool.test.ts
 │       ├── worldbank-list-countries.tool.test.ts
 │       ├── worldbank-list-sources.tool.test.ts
 │       ├── worldbank-list-topics.tool.test.ts
