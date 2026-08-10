@@ -12,14 +12,14 @@
       "url": "https://worldbank.caseyjhand.com/mcp"
     }
   ],
-  "version": "0.2.0",
+  "version": "0.3.0",
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/worldbank-mcp-server",
       "runtimeHint": "bun",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "packageArguments": [
         {
           "type": "positional",
@@ -53,6 +53,13 @@
           "default": "https://api.worldbank.org/pip/v1"
         },
         {
+          "name": "WORLDBANK_PROJECTS_BASE_URL",
+          "description": "World Bank Projects API base URL override.",
+          "format": "string",
+          "isRequired": false,
+          "default": "https://search.worldbank.org/api/v3"
+        },
+        {
           "name": "WORLDBANK_DEFAULT_PER_PAGE",
           "description": "Default page size for list, search, and data operations.",
           "format": "string",
@@ -76,7 +83,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/worldbank-mcp-server",
       "runtimeHint": "bun",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "packageArguments": [
         {
           "type": "positional",
@@ -136,6 +143,13 @@
           "format": "string",
           "isRequired": false,
           "default": "https://api.worldbank.org/pip/v1"
+        },
+        {
+          "name": "WORLDBANK_PROJECTS_BASE_URL",
+          "description": "World Bank Projects API base URL override.",
+          "format": "string",
+          "isRequired": false,
+          "default": "https://search.worldbank.org/api/v3"
         },
         {
           "name": "WORLDBANK_DEFAULT_PER_PAGE",

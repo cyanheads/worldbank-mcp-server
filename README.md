@@ -1,13 +1,13 @@
 <div align="center">
   <h1>@cyanheads/worldbank-mcp-server</h1>
   <p><b>Query 29,500+ World Bank development indicators for 200+ countries across 60+ years via MCP. STDIO or Streamable HTTP.</b>
-  <div>8 Tools • 2 Resources</div>
+  <div>9 Tools • 2 Resources</div>
   </p>
 </div>
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.2.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.30.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/worldbank-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/worldbank-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.3.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.30.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/worldbank-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/worldbank-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -25,7 +25,7 @@
 
 ## Tools
 
-8 tools for browsing and querying the World Bank Open Data API:
+9 tools for browsing and querying the World Bank Open Data API:
 
 | Tool | Description |
 |:---|:---|
@@ -37,6 +37,7 @@
 | `worldbank_get_indicator` | Fetch complete metadata for a single indicator: name, description, source, unit, and topics |
 | `worldbank_get_data` | Query indicator values for one or more countries across a time range or most-recent N values |
 | `worldbank_get_poverty` | Poverty headcount, gap, and severity at any poverty line, plus the Gini coefficient and decile shares, from the Poverty and Inequality Platform |
+| `worldbank_search_projects` | Search the World Bank lending portfolio by text, country, region, status, and board approval date |
 
 ### `worldbank_list_topics`
 
@@ -131,6 +132,20 @@ Poverty and inequality estimates from the World Bank [Poverty and Inequality Pla
 - `year` accepts a four-digit year, `"all"` for the full history, or `"MRV"` for the most recent available. Coverage starts in 1963
 - Individual economies only, by ISO3 code — PIP does not serve regional, income-group, or world aggregate codes through this endpoint, and a structured error says so
 - Paginated locally with up to 1000 entries per page, since PIP itself has no pagination
+
+---
+
+### `worldbank_search_projects`
+
+The World Bank [lending portfolio](https://projects.worldbank.org/) — the individual loans, credits, and grants the Bank finances — rather than the statistics the other tools read. A third upstream API, on its own host, with its own envelope and conventions.
+
+- Free-text `query` across project names, abstracts, and objectives, combined with exact filters on `countries`, `region`, `status`, and a board-approval date window. Every filter is an AND, and every multi-value filter is an OR within itself
+- Returns the project ID, name, borrowing country and region, status, board approval and closing dates, total commitment in USD, financing windows (IBRD, IDA, Grants), major sectors, and a link to the project page
+- **Countries are ISO2 here** (`BR`, `IN`, `ZA`) — the one place this server departs from the ISO3 codes its other tools take, because the Projects API keys on ISO2. Multi-country operations carry a World Bank regional code instead (`3A`, `4E`), two characters like the rest. An ISO3 code is rejected at the schema with a message naming the difference, rather than being passed upstream where it would come back as a silent zero-hit. `worldbank_get_country` reports a country's `iso2` field for either form
+- `status` is a closed set (`Active`, `Closed`, `Dropped`, `Pipeline`) and `region` is the nine World Bank operational regions, both enforced by the schema — a typo in either can't reach upstream and read back as "no results"
+- An empty result says which filter emptied it. When a country filter was in force, the search re-runs it on its own: either no project carries those codes at all, or they match as a set and the remaining filters are what narrowed the result to nothing, and the notice names them
+- `include_abstract` is off by default. Abstracts run to a median of roughly 1,200 characters and are published for about half the portfolio, so a full page of them roughly doubles the response — turn it on once the result set is small enough to read
+- Offset-paginated with up to 1000 entries per page, which is also the most the API returns for one request
 
 ## Resources
 
@@ -256,6 +271,7 @@ All configuration is validated at startup via Zod schemas in `src/config/server-
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP exporter endpoint | none |
 | `WORLDBANK_API_BASE_URL` | World Bank Indicators API base URL override | `https://api.worldbank.org/v2` |
 | `WORLDBANK_PIP_BASE_URL` | Poverty and Inequality Platform API base URL override | `https://api.worldbank.org/pip/v1` |
+| `WORLDBANK_PROJECTS_BASE_URL` | Projects API base URL override | `https://search.worldbank.org/api/v3` |
 | `WORLDBANK_DEFAULT_PER_PAGE` | Default page size for list/search/data operations | `50` |
 | `WORLDBANK_CATALOG_CACHE_TTL_MS` | Lifetime of the in-process reference caches — the indicator catalog behind keyword-only search and the aggregate-code set behind `isAggregate`; `0` disables both | `3600000` |
 
@@ -285,10 +301,11 @@ All configuration is validated at startup via Zod schemas in `src/config/server-
 
 | Directory | Purpose |
 |:---|:---|
-| `src/mcp-server/tools` | Tool definitions (`*.tool.ts`). Eight tools covering topics, sources, countries, indicators, data, and poverty. |
+| `src/mcp-server/tools` | Tool definitions (`*.tool.ts`). Nine tools covering topics, sources, countries, indicators, data, poverty, and projects. |
 | `src/mcp-server/resources` | Resource definitions. Indicator and country metadata resources. |
 | `src/services/worldbank` | World Bank Indicators API service layer — API client and domain types. |
 | `src/services/pip` | Poverty and Inequality Platform API service layer — separate client and domain types. |
+| `src/services/projects` | Projects API service layer — separate client and domain types. |
 | `src/config` | Server-specific environment variable parsing and validation with Zod. |
 | `tests/` | Unit and integration tests, mirroring the `src/` structure. |
 

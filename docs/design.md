@@ -14,6 +14,7 @@
 | `worldbank_list_topics` | List all 21 thematic topics (Economy & Growth, Health, Education, etc.) with descriptions. Use to browse the indicator space or find a `topic_id` for `worldbank_search_indicators`. | — | `readOnlyHint: true` |
 | `worldbank_list_sources` | List the 70+ data sources (World Development Indicators, IDS, Doing Business, etc.) with codes. Use to find a `source_id` for filtering indicator search. | `page`, `per_page` | `readOnlyHint: true` |
 | `worldbank_get_poverty` | Poverty headcount, gap, and severity at any poverty line, plus the Gini coefficient, mean log deviation, polarization, and decile shares, from the Poverty and Inequality Platform. Individual economies only. | `countries`, `year`, `poverty_line`, `welfare_type`, `reporting_level`, `fill_gaps`, `page`, `per_page` | `readOnlyHint: true` |
+| `worldbank_search_projects` | Search the World Bank lending portfolio — the loans, credits, and grants the Bank finances — by free text, country, region, status, and board approval date. Countries are ISO2 here, not ISO3. | `query`, `countries`, `status`, `region`, `approved_from`, `approved_to`, `include_abstract`, `page`, `per_page` | `readOnlyHint: true` |
 
 ### Resources
 
@@ -45,15 +46,17 @@ Designed as the global complement to BLS (US detail) and EIA (US energy) — pro
 - Response data can be sparse: individual country×year cells may be `null` when the WDI doesn't have a value
 - Aggregates (regions, income groups, World) are returned alongside individual countries in `all` queries; the server must communicate what type each entry is
 - Poverty at a caller-chosen threshold, and the inequality distribution behind it, come from the Poverty and Inequality Platform rather than the WDI series — a second upstream API, with its own envelope, error convention, and survey coverage, and no aggregate support
+- The Bank's own lending operations are a third upstream API, on a different host again, keyed on ISO2 rather than ISO3 and answering an unmatched exact filter with a plain zero-hit rather than an error; the server must not let a bad filter value read as "no results"
 
 ## Services
 
 | Service | Wraps | Used By |
 |:--------|:------|:--------|
-| `WorldBankApiService` | World Bank Indicators API v2 (`https://api.worldbank.org/v2/`) | All tools and resources except `worldbank_get_poverty` |
+| `WorldBankApiService` | World Bank Indicators API v2 (`https://api.worldbank.org/v2/`) | All tools and resources except `worldbank_get_poverty` and `worldbank_search_projects` |
 | `PipService` | World Bank Poverty and Inequality Platform (`https://api.worldbank.org/pip/v1/`) | `worldbank_get_poverty` |
+| `ProjectsService` | World Bank Projects API (`https://search.worldbank.org/api/v3/`) | `worldbank_search_projects` |
 
-One service per upstream API. Every Indicators v2 endpoint shares a base URL and the `[paging, items]` envelope, so a single service covers that whole surface. PIP shares none of it — flat JSON array, no pagination, real HTTP status codes — so it gets its own client rather than an extension of `WorldBankApiService`, whose `buildUrl`, `fetchAllPages`, and `isWbErrorEnvelope` are all specific to Indicators v2. What the two share is the framework layer beneath them: `fetchWithTimeout`, `withRetry`, the init/accessor pattern, and HTML-error-page detection against the common Cloudflare front.
+One service per upstream API. Every Indicators v2 endpoint shares a base URL and the `[paging, items]` envelope, so a single service covers that whole surface. PIP shares none of it — flat JSON array, no pagination, real HTTP status codes. Projects shares none of it either, and none of PIP's: a different host, results keyed by project ID in an object rather than listed, offset paging on `os`/`rows`, and a zero-hit where the others would error. Each gets its own client rather than an extension of `WorldBankApiService`, whose `buildUrl`, `fetchAllPages`, and `isWbErrorEnvelope` are all specific to Indicators v2. What the three share is the framework layer beneath them: `fetchWithTimeout`, `withRetry`, the init/accessor pattern, and HTML-error-page detection — every one of the three hosts serves an HTML error page on some failure.
 
 ## Config
 
@@ -61,6 +64,7 @@ One service per upstream API. Every Indicators v2 endpoint shares a base URL and
 |:--------|:---------|:------------|
 | `WORLDBANK_API_BASE_URL` | No | Override the Indicators v2 base URL (default: `https://api.worldbank.org/v2`). Useful for testing against local mirrors. |
 | `WORLDBANK_PIP_BASE_URL` | No | Override the PIP base URL (default: `https://api.worldbank.org/pip/v1`). |
+| `WORLDBANK_PROJECTS_BASE_URL` | No | Override the Projects API base URL (default: `https://search.worldbank.org/api/v3`). The service appends `/projects`, matching how the other two services append their endpoint path to a configured base. |
 | `WORLDBANK_DEFAULT_PER_PAGE` | No | Default page size for list/search operations (default: `50`). |
 | `WORLDBANK_CATALOG_CACHE_TTL_MS` | No | Lifetime of the in-process reference caches — the indicator catalog behind keyword-only search and the aggregate-code set behind `isAggregate` (default: `3600000`). `0` disables caching and refetches on every use. |
 
@@ -76,6 +80,7 @@ No API key. The World Bank API is fully public.
 6. `worldbank_get_data` — primary data tool; most complex due to multi-country and aggregate handling
 7. Resources — `worldbank://indicator/{id}` and `worldbank://country/{code}`
 8. `PipService` + `worldbank_get_poverty` — a second upstream API with its own envelope, error convention, and survey-vs-gap-filled merge
+9. `ProjectsService` + `worldbank_search_projects` — a third upstream API on its own host, with an ID-keyed result object, offset paging, and a zero-hit where the others error
 
 Each step is independently testable against the live API.
 
@@ -142,6 +147,14 @@ The API returns country aggregates (regions, income groups, World) mixed with in
 |:--|:-----|:-----|
 | 1 | Query indicator with regional aggregate codes | `worldbank_get_data` (countries = `EAS;LCN;MEA;SAS;SSF;ECS`) |
 | 2 | Follow up with income-group breakdown | `worldbank_get_data` (countries = `LIC;LMC;UMC;HIC`) |
+
+**Lending portfolio for a country:**
+
+| # | Call | Tool |
+|:--|:-----|:-----|
+| 1 | Resolve the country's ISO2 code, if only a name or ISO3 is in hand | `worldbank_get_country` → `iso2` |
+| 2 | Search the portfolio, narrowed by status and board-approval window | `worldbank_search_projects` |
+| 3 | Re-run the narrowed search with `include_abstract` once the result set is small | `worldbank_search_projects` |
 
 ## Tool Specifications
 
@@ -292,6 +305,32 @@ Enrichment carries `appliedFilters` (including the applied `fillGaps`), `totalCo
 
 PIP answers a rejected parameter with a real HTTP 404 whose body names the parameter and enumerates every accepted value. The framework truncates a captured error body at 500 bytes, which lands mid-array for `country` and `year`, so the parameter names are read out of the body with a regex over the `"<name>": {"msg"` prefixes rather than parsed; those prefixes sit at the head of each `details` entry and `msg` appears nowhere else, so a truncated body can drop a later parameter from the list but can never substitute a wrong name. `country` is always the first `details` entry, so the country-not-found branch survives every truncation. A `valid` list is quoted only when the body arrived intact and holds twelve entries or fewer. Zero rows is a successful empty result with a notice, not an error — PIP returns `[]` for a well-formed query that matches nothing.
 
+### `worldbank_search_projects`
+
+The World Bank lending portfolio — 28,074 operations as of 2026-08-09. The only tool backed by `ProjectsService`.
+
+**Input:**
+- `query: string | undefined` — free text over project names, abstracts, and objectives. Terms combine as AND, so extra words narrow. Blank is read as absent.
+- `countries: string | string[] | undefined` — two-character codes, single, array, or one comma/semicolon-separated string. A schema `refine` rejects anything that isn't two alphanumeric characters after the split, naming ISO2 explicitly: this API keys on ISO2 while every other tool here takes ISO3, and an ISO3 code passed through would come back as a plain zero-hit. Digits are accepted because 34 of the 218 codes the portfolio uses are World Bank regional codes (`3A`, `4E`, `1W`) rather than ISO2.
+- `status: Array<'Active' | 'Closed' | 'Dropped' | 'Pipeline'> | undefined` — the complete set the portfolio publishes, read off the endpoint's own facet.
+- `region: string[] | undefined` — the nine World Bank operational regions, likewise read off the facet. These are lending regions, not the WDI aggregate codes `worldbank_get_data` accepts.
+- `approved_from` / `approved_to: string | undefined` — inclusive board-approval window as `YYYY-MM-DD`, enforced by a schema `pattern`. Blank is read as absent.
+- `include_abstract: boolean` (default: `false`)
+- `page: number` (default: 1), `per_page: number` (default: 50, max: 1000) — translated to the API's `os` (skip) and `rows`.
+
+**Output:**
+- `projects: Array<{ id, name, status, countryCodes, countryName, regionName, boardApprovalDate, closingDate, totalCommitment, financialTypes, majorSectors, abstract, url }>` — newest board approval first, which is the API's default order and the order pagination walks.
+
+Coverage is uneven across a portfolio reaching back to 1947. Across all 28,074 records only `id`, `project_name`, `status`, `countryname`, `countrycode`, and `regionname` are present on every row; `boardapprovaldate` is absent on 2%, `major_sectors` on 17%, `projectfinancialtype` on 36%, `closingdate` on 44%, `project_abstract` on 48%, and `totalamt` on 52%, so those are nullable and a missing amount is `null` rather than `0`. Dropped operations account for most of the gaps — 2% of them publish a closing date and 23% an amount, against 89% and 83% of active ones. `countrycode` is a list upstream but holds exactly one code on every record, regional operations included. `boardApprovalDate` is narrowed from the upstream timestamp to the calendar day the tool's own date filters use. `financialTypes` and `majorSectors` are deduplicated — upstream repeats a financing window once per instrument and a major sector once per sector rolling up to it. `url` is derived from the ID; the API publishes no link field.
+
+Enrichment carries `appliedFilters` (including `includeAbstract`), `totalCount`, `currentPage`, `totalPages`, and a `notice` for an empty result or a page past the end.
+
+**Errors:**
+- `page_out_of_range` (`ValidationError`) — the requested page starts past the 100,000-result offset the API serves. Thrown before any request.
+- `upstream_unavailable` (`ServiceUnavailable`) — any non-success status or an HTML error page. A 4xx is marked non-retryable, since the schema validated every filter before the request and a rejection is therefore the API's own state rather than something a retry changes.
+
+Every filter is an exact match upstream and an unmatched value is HTTP 200 with `total: 0` — the same response a genuine no-match produces. The schema closes that hole everywhere it can: `status` and `region` are enums, the dates are pattern-checked, `per_page` is capped, and multi-value filters are joined with `^` by the service rather than the comma a caller would reach for, which upstream reads as part of a single value. Country codes are the one filter a schema cannot settle — two characters is well-formed, and only the index knows whether the portfolio has ever used them — so an empty result with a country filter in force costs one extra `rows=0` request asking the country filter alone. Zero there means no project carries any of the codes; a positive count means they match as a set and the notice names the other filters as the cause, adding that with more than one code in force the count does not clear each of them individually. A probe that fails is swallowed: the search itself succeeded, so the empty result is returned with the generic notice rather than turned into an error.
+
 ---
 
 ## Design Decisions
@@ -319,6 +358,13 @@ PIP answers a rejected parameter with a real HTTP 404 whose body names the param
 | `PipService` is a separate service, not an extension of `WorldBankApiService` | Nothing transfers: `buildUrl()` forces `format=json` plus `page`/`per_page`, which PIP takes neither of; `fetchAllPages()` assumes the `[paging, items]` tuple, where PIP returns a flat array; `isWbErrorEnvelope()` detects an HTTP-200 sentinel, where PIP uses real status codes. The reuse is one level down — `fetchWithTimeout`, `withRetry`, the init/accessor pattern, and HTML-error detection against the shared Cloudflare front. |
 | PIP's 5xx retry budget is one retry, not the framework default of three | All 28 aggregate codes PIP advertises among its valid `country` values fail this endpoint with HTTP 500 (`/pip-grp` serves those, and is out of scope), on every attempt. Three retries only delay a settled answer. The one retry is kept for the timeout case instead: PIP computes a query on first sight and caches it, so the attempt that timed out warms the query and the retry usually returns at once. The 500 body carries nothing but `Internal Server Error`, so the message states the status and offers the outage and the aggregate cause side by side rather than asserting one. |
 | Resources for country and indicator | Stable, addressable by ID, read-only, useful as injectable context for agents that support resources. Both entities satisfy the resource criteria without redundancy — their tool path (`worldbank_get_country`, `worldbank_get_indicator`) also covers tool-only clients. |
+| `worldbank_search_projects` filters are enum-backed wherever the value set is closed | Every filter on this endpoint is an exact match, and an unmatched value returns HTTP 200 with `total: 0` — indistinguishable from a real no-match. `status` has four values and `region` nine, both enumerable from the endpoint's own `fct` facets, so a Zod enum makes a typo unreachable rather than something the agent has to diagnose from an empty result. The same reasoning caps `per_page` at the 1,000 rows upstream actually returns and pattern-checks the dates. |
+| Multi-value filters are joined with `^`, and the tool splits commas itself | The API's list separator is a caret. A comma reads as part of one value — `countrycode_exact=BR,IN` returns `total: 0`, the silent-zero shape again — and region names contain commas of their own, so a comma-joined list could not express them at all. The tool accepts the comma- and semicolon-separated input its sibling tools take and the service converts, so the separator never becomes the caller's problem. |
+| An empty result probes the country filter in isolation | Client-side validation closes every filter with a knowable value set, which leaves country codes: two characters is well-formed and only the index knows whether the portfolio uses them. One extra `rows=0` request asking `countrycode_exact` alone separates "no project carries this code" from "the codes are fine and the other filters emptied the result", and the notice says which. The probe asks the codes as one OR-set, so a positive count settles the set and not each member; the notice says so when more than one code is in force, rather than paying one request per code. Its failure is swallowed — the primary search already succeeded, and a broken diagnostic must not turn a valid empty result into an error. Facets cannot do this job — they are scoped to the query, so a zero-hit response carries an empty `facets` object. |
+| Countries are two characters here, and an ISO3 code is rejected at the schema | The Projects API keys on ISO2 (`BR`), where the rest of this server takes ISO3 (`BRA`); `countrycode_exact=BRA` returns `total: 0`. Since every other tool trains the agent on ISO3, this is the mistake most likely to be made, and the one that reads most convincingly as "no projects in Brazil". The schema rejects a three-letter code with a message naming the difference and pointing at `worldbank_get_country`, which reports the `iso2` field. It checks length rather than letters: 34 of the 218 codes in use are World Bank regional codes carrying a digit (`3A`, `4E`, `1W`), and a letters-only rule would make 1,073 multi-country operations unreachable. |
+| `include_abstract` defaults to false | Abstracts are the single largest component of the payload — a median of roughly 1,200 characters, a p90 of 2,300, a max of 8,000, and a measured 111 KB for a default 50-row page against 53 KB without them. They arrive whatever `fl` asks for, so the choice is only whether to emit them, and a search tool is usually being used to narrow rather than to read. The flag is echoed in `appliedFilters` so a `null` abstract is never ambiguous between "not requested" and "none published". |
+| The page size is clamped in the service, not just the schema | Upstream accepts `rows=5000`, echoes `"rows": 5000` back in the envelope, and returns 1,000 records. Nothing but counting the body reveals the truncation, so the ceiling is enforced before the request and `pages` is computed against the clamped size. |
+| Upstream error bodies are never quoted into a message | A 4xx body carries the hostname and index name of the search cluster behind the API; a 5xx body carries a Node stack trace with absolute paths from the upstream host. Neither helps an agent, and both are the API's internals. The message states the status and nothing else, with the original kept as the error's `cause`. |
 
 ## Known Limitations
 
@@ -333,6 +379,11 @@ PIP answers a rejected parameter with a real HTTP 404 whose body names the param
 - **PIP and WDI poverty figures will not match exactly.** `SI.POV.DDAY` and friends are WDI series with their own vintage and revision cycle; `worldbank_get_poverty` reads PIP directly. Comparable questions, different numbers.
 - **A cold PIP query is slow.** PIP computes a query the first time it sees it and serves repeats from cache, so the same request can take 15–60 seconds once and under a second thereafter; 90 seconds has been observed. The request timeout is 60s with a single retry, which recovers the common case because the timed-out attempt leaves the query warm. A full-history request with `fill_gaps` on pays this twice, once per pass.
 - **Update frequency varies widely.** Some indicators are annual, some quarterly, some have multi-year gaps. The API provides no update schedule — agents querying "most recent data" may get values from several years ago.
+- **The Projects API ignores a parameter it does not recognize.** A misspelled filter name is dropped and the search runs unfiltered, returning the full 28,074-project total as though the filter had been satisfied. The tool sends only the parameters it knows, so this is unreachable through it, but it rules out ever passing caller-supplied parameter names through.
+- **Several documented-looking Projects filters do nothing.** `borrower_exact`, `impagency_exact`, and `teamleadname_exact` appear in the field list the endpoint advertises via `fl=*`, and `lendinginstr_exact`, `fiscalyear_exact`, and `majorsector_exact` are the obvious names for filters the data supports — all six are accepted and ignored, leaving the total unchanged. Only the filters the tool exposes were confirmed to narrow a result.
+- **Projects coverage thins going back in time.** 44% of the portfolio publishes no closing date, 52% no commitment amount, and 48% no abstract; the oldest operations carry little beyond an ID, a name, a country, and a board date, and 2% carry no board date either. A `null` amount is missing data, not a commitment of zero.
+- **Projects sector data is not on one vintage.** Older operations carry sector and theme names prefixed `FY17 - `, newer ones carry unprefixed names for the same concepts. `majorSectors` reports what the record holds; matching sectors across eras needs the agent to account for the prefix.
+- **The Projects portfolio is mostly history.** 18,293 of 28,074 operations are closed and 6,901 were dropped, against 2,581 active and 299 in the pipeline. A search with no `status` filter is dominated by finished lending.
 
 ## API Reference
 
@@ -388,6 +439,34 @@ PIP answers a rejected parameter with a real HTTP 404 whose body names the param
 
 **Not exposed:** `/pip-grp` (regional and income-group aggregates), `/aux` (reference tables), `/versions` (data vintages).
 
+### Projects
+
+**Base URL:** `https://search.worldbank.org/api/v3/` — a different host from the other two, not `api.worldbank.org/v2/projects`.
+
+**Endpoint used:** `/projects?format=json&fl=&rows=&os=&qterm=&<field>_exact=&strdate=&enddate=`. No key.
+
+**Response envelope:** `{rows, os, page, total, projects: {<project_id>: {...}}, facets}`. `projects` is an object keyed by project ID, not an array, so the values have to be collected before anything can treat them as rows. `total`, `os`, and `page` are strings; `rows` is a number.
+
+**Pagination:** offset-based on `os` (skip) and `rows` (page size), not `page`/`per_page`. Default `rows` is 10. `rows` is capped at 1,000 — a larger value is accepted and echoed back in the envelope while 1,000 records are returned. `os` accepts 0–100,000; outside that the request fails with HTTP 400.
+
+**Error convention:** three shapes, none of them the sentinel envelope Indicators v2 uses. A bad parameter *value* on an `_exact` filter is HTTP 200 with `total: 0` and no error at all. A bad parameter *type* is HTTP 400 with a JSON body naming the Azure Search cluster and index behind the API. A value the query builder cannot parse — a malformed `strdate` — is HTTP 500 with a `text/txt` body holding a Node stack trace and absolute paths from the upstream host. An unrecognized path is HTTP 404 with a Tomcat HTML error page. None of these bodies are quoted into a message.
+
+**Unknown parameters are ignored,** so a misspelled filter name silently widens the search to the full portfolio rather than erroring.
+
+**Field projection:** `fl` is a comma-separated field list and is required to reach `status`, `countrycode`, `countryname`, and `project_abstract`, none of which are in the default projection. It does not narrow the response to exactly what was asked for: `proj_id` and `project_abstract` come back regardless. `fl=*` returns the full field inventory (45 fields), including the `_exact` variants.
+
+**Filters confirmed to narrow a result:** `qterm` (free text over name, abstract, and objective; terms combine as AND), `countrycode_exact` (ISO2 — `BRA` matches nothing, `BR` matches 831), `status_exact`, `regionname_exact`, `countryshortname_exact`, `sector_exact`, `sectorcode_exact`, `theme_exact`, `mjsector_exact`, `prodline_exact`, `projectfinancialtype_exact`, `esrc_ovrl_risk_rate_exact`, `cons_serv_reqd_ind_exact`, plus `strdate`/`enddate` (an inclusive board-approval window) and `fiscalyear`. **Accepted and ignored:** `borrower_exact`, `impagency_exact`, `teamleadname_exact`, `lendinginstr_exact`, `fiscalyear_exact`, `majorsector_exact`.
+
+**Multi-value syntax:** `^`. A comma is read as part of a single value and matches nothing; a repeated parameter keeps only the first occurrence. Values within one filter combine as OR, and separate filters combine as AND.
+
+**Facets:** `fct=<field>_exact` returns value counts as an object keyed by ordinal, capped at 100 entries. They are scoped to the current query, so a zero-hit search returns an empty `facets` object and they cannot serve as a recovery path from one. `countrycode_exact`, `prodline_exact`, `mjsector_exact`, and `sectorcode_exact` are filterable but not facetable.
+
+**Default ordering:** board approval date, descending — nulls last. Pagination over it is stable and repeatable; `srt`/`order` can override it and are not exposed.
+
+**Measured 2026-08-09:** 28,074 projects total — 18,293 Closed, 6,901 Dropped, 2,581 Active, 299 Pipeline, across nine operational regions and 218 distinct country codes, 34 of which are World Bank regional codes carrying a digit. Board approval dates span 1947-05-09 to 2027-10-26. Abstracts are published for 52% of the portfolio, with a median length of ~1,200 characters (p90 ~2,300, max 8,000); a 50-row page is ~111 KB with them and ~53 KB without. No rate-limit headers observed.
+
+**Not exposed:** facet retrieval, sort overrides, and the sector/theme/product-line/risk-rating filters, whose value vocabularies are large, partly facet-invisible, and split across `FY17 - ` and unprefixed vintages.
+
 ---
 
 ## Decisions Log
@@ -415,6 +494,13 @@ PIP answers a rejected parameter with a real HTTP 404 whose body names the param
 | 2026-08-09 | Token-AND keyword matching on alphanumeric terms, ranked by specificity | Word-order sensitivity was producing wrong-looking results ("per capita GDP" → 8 hits, "gdp per capita" → 38). Requiring each term independently makes both return 108. Terms are split on punctuation, not whitespace, so a pasted indicator name survives: `Unemployment, female (%)` split on whitespace yields the term `(%)`, which appears in no indicator name, and the search returns nothing. Punctuation-insensitive terms match more loosely, so exact-ID/name and whole-phrase hits are promoted ahead of the rest — `Population, total` puts `SP.POP.TOTL` first, `GDP (current US$)` puts `NY.GDP.MKTP.CD` first. |
 | 2026-08-09 | `no_match` removed from `worldbank_search_indicators`; empty results stay structured | The declared error could never fire — empty searches already returned success with an `enrichment.notice`. A zero-hit search is a valid answer, and `worldbank_get_data` handles its empty case the same way, so the unreachable contract entry was dropped rather than wired up. `invalid_filter` was added in its place for genuinely bad topic/source IDs. |
 | 2026-08-09 | `worldbank_list_countries` fetches all upstream pages when excluding aggregates | The fixed `page=1&per_page=300` fetch left five rows of headroom over upstream's 295 entities; crossing 300 would have dropped countries from every page with `totalCount` under-reporting and no notice. Reading `pages` from the first response removes the ceiling and costs one request today. |
+| 2026-08-09 | Projects gets a third service, `ProjectsService` | It shares nothing with either existing client. Different host (`search.worldbank.org`), results as an object keyed by project ID instead of a list, offset paging on `os`/`rows` instead of `page`/`per_page` or none, and an unmatched filter answered with HTTP 200 and `total: 0` instead of PIP's 404 or the Indicators sentinel envelope. The reuse is the framework layer all three sit on. |
+| 2026-08-09 | `countries` on `worldbank_search_projects` is two characters, rejected at the schema when it is not | Measured: `countrycode_exact=BRA` returns `total: 0`, `BR` returns 831. Every other tool on this server takes ISO3, so ISO3 is the mistake an agent is primed to make here, and it fails as a convincing "no results" rather than an error. A `refine` over the split codes rejects anything that is not two alphanumeric characters, with a message naming the difference and pointing at `worldbank_get_country` for the `iso2` field. Alphanumeric rather than letters: `3A` (230 projects), `1W` (145), `4E`, `7E`, `8S` and 29 more regional codes are real filter values, and a letters-only rule would have made them unreachable. |
+| 2026-08-09 | Multi-value filters join with `^`; the tool splits commas itself | The API's list separator is a caret, and a comma is read as part of one value — `countrycode_exact=BR,IN` returns `total: 0` while `BR^IN` returns 1,946, exactly `BR` (831) plus `IN` (1,115). Region names contain commas of their own, so no comma-joined list could express them regardless. The tool keeps the comma/semicolon input its sibling tools accept and converts in the service. |
+| 2026-08-09 | Closed-vocabulary filters are Zod enums, read off the endpoint's facets | An exact filter that matches nothing is a silent zero-hit, so the fix is to make an unknown value unreachable. `fct=status_exact` enumerates four statuses and `fct=regionname_exact` nine regions, which is the whole vocabulary in both cases, so both become enums and a typo fails at the schema with the accepted values in the error. |
+| 2026-08-09 | An empty result probes the country filter alone, and never throws for it | With enums, patterns, and a page-size cap in place, country codes are the only filter left that can be well-formed and meaningless. One `rows=0` request asking `countrycode_exact` on its own separates the two causes an agent needs to tell apart. It stays a notice rather than an error because a real ISO2 code for an economy with no World Bank lending history is a legitimate empty result, not a bad input — the notice offers both readings rather than asserting one. The same reasoning covers the probe failing: the search it is diagnosing already succeeded, so the failure is logged and the empty result stands. Facets are no help here: they are query-scoped, so a zero-hit response carries an empty `facets` object. |
+| 2026-08-09 | `include_abstract` defaults to false | Measured: abstracts have a median length of ~1,200 characters and take a default 50-row page from 53 KB to 111 KB. They arrive regardless of what `fl` asks for, so the only decision is whether to emit them, and narrowing a search rarely needs the prose. The applied value is echoed so a `null` abstract is never ambiguous between "not requested" and "none published". |
+| 2026-08-09 | Both Projects error tiers report as `upstream_unavailable`, with 4xx marked non-retryable | The schema validates every filter before the request, so a rejection upstream is the API's state rather than something the caller can fix — a recovery hint telling the agent to change its input would be wrong for every case that reaches it. The one caller-fixable failure, a page past the 100,000-result offset, is its own `page_out_of_range` thrown before any request goes out. |
 | 2026-05-23 | DataCanvas deferred | Typical query sizes don't exceed context budget. DuckDB adds startup overhead and worker-mode incompatibility. Revisit if `all`-country queries with long date ranges prove costly in practice. |
 | 2026-05-23 | `nullCount` field on data response | The WDI has significant data gaps — sparse series are the rule, not the exception. Surfacing `nullCount` gives the agent a quantitative sparsity signal without requiring it to count nulls manually. |
 | 2026-05-23 | Seven tools total | Covers all discovery and data workflows without overlap. `worldbank_list_topics` and `worldbank_list_sources` are small reference tools that pay for themselves by enabling natural discovery flows and reducing indicator search failures. |

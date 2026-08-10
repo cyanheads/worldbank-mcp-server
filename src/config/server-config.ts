@@ -15,6 +15,10 @@ const ServerConfigSchema = z.object({
     .string()
     .default('https://api.worldbank.org/pip/v1')
     .describe('World Bank Poverty and Inequality Platform (PIP) API base URL.'),
+  projectsBaseUrl: z
+    .string()
+    .default('https://search.worldbank.org/api/v3')
+    .describe('World Bank Projects API base URL.'),
   defaultPerPage: z.coerce
     .number()
     .default(50)
@@ -35,6 +39,7 @@ export function getServerConfig() {
   _config ??= parseEnvConfig(ServerConfigSchema, {
     apiBaseUrl: 'WORLDBANK_API_BASE_URL',
     pipBaseUrl: 'WORLDBANK_PIP_BASE_URL',
+    projectsBaseUrl: 'WORLDBANK_PROJECTS_BASE_URL',
     defaultPerPage: 'WORLDBANK_DEFAULT_PER_PAGE',
     catalogCacheTtlMs: 'WORLDBANK_CATALOG_CACHE_TTL_MS',
   });
