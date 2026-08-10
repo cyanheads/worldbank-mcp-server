@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.17](changelog/0.1.x/0.1.17.md) — 2026-08-09
+
+Add appliedFilters echo to worldbank_search_indicators/worldbank_get_data; fix resource not-found misclassification and duplicate indicator IDs (#12, #19, #23)
+
 ## [0.1.16](changelog/0.1.x/0.1.16.md) — 2026-08-09
 
 Fix worldbank_get_data error classification, date_range/countries validation, aggregate detection, and mrv ceiling (#13, #17, #18, #20, #22)

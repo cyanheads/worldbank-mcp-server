@@ -1,7 +1,7 @@
 {
   "manifest_version": "0.3",
   "name": "worldbank-mcp-server",
-  "version": "0.1.16",
+  "version": "0.1.17",
   "description": "Query 29,500+ World Bank development indicators for 200+ countries across 60+ years via MCP. STDIO or Streamable HTTP.",
   "author": {
     "name": "cyanheads"
