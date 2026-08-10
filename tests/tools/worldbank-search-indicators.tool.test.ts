@@ -268,6 +268,36 @@ describe('worldbankSearchIndicators', () => {
     expect(enrichment.effectiveQuery).not.toContain('  GDP');
   });
 
+  it('echoes the applied filters field by field, omitting the ones not given', async () => {
+    const { worldbankSearchIndicators } = await import(
+      '@/mcp-server/tools/definitions/worldbank-search-indicators.tool.js'
+    );
+    const ctx = createMockContext({ errors: worldbankSearchIndicators.errors });
+    const input = worldbankSearchIndicators.input.parse({
+      query: '  GDP per capita  ',
+      source_id: '2',
+    });
+    await worldbankSearchIndicators.handler(input, ctx);
+    expect(getEnrichment(ctx).appliedFilters).toEqual({
+      query: 'GDP per capita',
+      sourceId: '2',
+    });
+  });
+
+  /**
+   * The trailer sits directly above the `effectiveQuery` line, which carries the
+   * same pairs — without the label the two are indistinguishable in `content[]`.
+   */
+  it('renders the applied-filters trailer as a labelled run of key=value pairs', async () => {
+    const { worldbankSearchIndicators } = await import(
+      '@/mcp-server/tools/definitions/worldbank-search-indicators.tool.js'
+    );
+    const render = worldbankSearchIndicators.enrichmentTrailer?.appliedFilters?.render;
+    expect(render?.({ query: 'GDP', topicId: '3' })).toBe(
+      '**Applied Filters:** query="GDP", topic_id=3',
+    );
+  });
+
   it('sets non-query empty-results notice when only topic filter used', async () => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
     vi.mocked(getWorldBankApiService).mockReturnValue({

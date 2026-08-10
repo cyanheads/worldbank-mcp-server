@@ -93,6 +93,57 @@ describe('worldbankGetData', () => {
     expect(enrichment.totalPages).toBe(1);
   });
 
+  it('echoes the applied filters, with an array of countries semicolon-joined', async () => {
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const ctx = createMockContext({ errors: worldbankGetData.errors });
+    const input = worldbankGetData.input.parse({
+      indicator_id: 'NY.GDP.PCAP.CD',
+      countries: ['US', 'CN', 'ZW'],
+      date_range: ' 2010:2023 ',
+    });
+    await worldbankGetData.handler(input, ctx);
+    expect(getEnrichment(ctx).appliedFilters).toEqual({
+      indicatorId: 'NY.GDP.PCAP.CD',
+      countries: 'US;CN;ZW',
+      dateRange: '2010:2023',
+      page: 1,
+      perPage: 50,
+    });
+  });
+
+  it('omits date_range and mrv from the filter echo when neither was requested', async () => {
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const ctx = createMockContext({ errors: worldbankGetData.errors });
+    const input = worldbankGetData.input.parse({
+      indicator_id: 'NY.GDP.PCAP.CD',
+      countries: 'USA',
+      per_page: 10,
+    });
+    await worldbankGetData.handler(input, ctx);
+    expect(getEnrichment(ctx).appliedFilters).toEqual({
+      indicatorId: 'NY.GDP.PCAP.CD',
+      countries: 'USA',
+      page: 1,
+      perPage: 10,
+    });
+  });
+
+  it('renders the applied-filters trailer as a labelled run of key=value pairs', async () => {
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const render = worldbankGetData.enrichmentTrailer?.appliedFilters?.render;
+    expect(
+      render?.({ indicatorId: 'SP.POP.TOTL', countries: 'USA', mrv: 5, page: 2, perPage: 50 }),
+    ).toBe(
+      '**Applied Filters:** indicator_id=SP.POP.TOTL, countries=USA, mrv=5, page=2, per_page=50',
+    );
+  });
+
   it('sets enrichment notice on empty data', async () => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
     vi.mocked(getWorldBankApiService).mockReturnValue({

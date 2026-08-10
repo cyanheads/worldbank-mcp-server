@@ -46,6 +46,15 @@ function rawIndicator(id: string, name: string, sourceNote = '') {
   return { id, name, source: { id: '2', value: 'WDI' }, sourceNote, topics: [] };
 }
 
+/**
+ * Raw indicator with an explicit source. The catalog republishes dozens of
+ * indicators under a second source — a live dataset and an archived copy — and
+ * the two rows are identical but for this block.
+ */
+function rawIndicatorFrom(id: string, name: string, sourceId: string, sourceName: string) {
+  return { id, name, source: { id: sourceId, value: sourceName }, sourceNote: '', topics: [] };
+}
+
 /** Minimal raw country. Aggregates carry region.id = incomeLevel.id = "NA". */
 function rawCountry(id: string, name: string, aggregate = false) {
   return {
@@ -295,6 +304,20 @@ describe('WorldBankApiService', () => {
     expect(result.sourceName).toBe('World Development Indicators');
     expect(result.topics).toHaveLength(1); // empty-id topic filtered out
     expect(result.topics[0]).toMatchObject({ id: '3', name: 'Economy & Growth' });
+  });
+
+  it('getIndicator: resolves a duplicate ID to the same row search keeps', async () => {
+    // Upstream returns the archived copy first for this ID.
+    mockResponse([
+      pagingObj({ total: 2 }),
+      [
+        rawIndicatorFrom('CoCA_fexp', 'Affordability', '93', 'FPN Datahub Archive'),
+        rawIndicatorFrom('CoCA_fexp', 'Affordability', '88', 'Food Prices for Nutrition'),
+      ],
+    ]);
+    const ctx = createMockContext();
+    const result = await service.getIndicator('CoCA_fexp', ctx);
+    expect(result).toMatchObject({ sourceId: '88', sourceName: 'Food Prices for Nutrition' });
   });
 
   it('getIndicator: throws notFound when WbErrorEnvelope returned (object form)', async () => {
@@ -911,6 +934,90 @@ describe('WorldBankApiService', () => {
     const result = await service.searchIndicators({ query: 'GDP', page: 1, perPage: 50 }, ctx);
     expect(result.indicators[0].topics).toHaveLength(1);
     expect(result.indicators[0].topics[0].id).toBe('3');
+  });
+
+  /**
+   * Upstream row order for a duplicate pair is arbitrary — the live catalog
+   * returns the archived copy first for some IDs and second for others — so the
+   * survivor is asserted from both orders.
+   */
+  it.each([
+    ['archived row first', ['93', '88']],
+    ['archived row second', ['88', '93']],
+  ])(
+    'searchIndicators: collapses a duplicate ID, dropping the archived source (%s)',
+    async (_label, [first, second]) => {
+      const bySourceId: Record<string, string> = {
+        '88': 'Food Prices for Nutrition',
+        '93': 'FPN Datahub Archive',
+      };
+      const name = 'Affordability of an energy sufficient diet';
+      mockResponse([
+        pagingObj({ total: 2 }),
+        [
+          rawIndicatorFrom(
+            'CoCA_fexp',
+            name,
+            first as string,
+            bySourceId[first as string] as string,
+          ),
+          rawIndicatorFrom(
+            'CoCA_fexp',
+            name,
+            second as string,
+            bySourceId[second as string] as string,
+          ),
+        ],
+      ]);
+      const ctx = createMockContext();
+      const result = await service.searchIndicators(
+        { query: 'CoCA_fexp', page: 1, perPage: 50 },
+        ctx,
+      );
+      expect(result.indicators).toHaveLength(1);
+      expect(result.indicators[0]).toMatchObject({
+        id: 'CoCA_fexp',
+        sourceId: '88',
+        sourceName: 'Food Prices for Nutrition',
+      });
+      expect(result.total).toBe(1);
+      expect(result.pages).toBe(1);
+    },
+  );
+
+  it('searchIndicators: keeps the lower source ID when neither row is archived', async () => {
+    mockResponse([
+      pagingObj({ total: 2 }),
+      [
+        rawIndicatorFrom('SP.POP.TOTL', 'Population, total', '57', 'WDI Database Extract'),
+        rawIndicatorFrom('SP.POP.TOTL', 'Population, total', '2', 'World Development Indicators'),
+      ],
+    ]);
+    const ctx = createMockContext();
+    const result = await service.searchIndicators(
+      { query: 'population total', page: 1, perPage: 50 },
+      ctx,
+    );
+    expect(result.indicators).toHaveLength(1);
+    expect(result.indicators[0]).toMatchObject({ sourceId: '2' });
+    expect(result.total).toBe(1);
+  });
+
+  it('searchIndicators: topic-scoped keyword search collapses duplicates too', async () => {
+    mockResponse([
+      pagingObj({ total: 2 }),
+      [
+        rawIndicatorFrom('CoCA_fexp', 'Affordability', '93', 'FPN Datahub Archive'),
+        rawIndicatorFrom('CoCA_fexp', 'Affordability', '88', 'Food Prices for Nutrition'),
+      ],
+    ]);
+    const ctx = createMockContext();
+    const result = await service.searchIndicators(
+      { query: 'affordability', topicId: '1', page: 1, perPage: 50 },
+      ctx,
+    );
+    expect(result.indicators).toHaveLength(1);
+    expect(result.indicators[0]).toMatchObject({ sourceId: '88' });
   });
 
   // ─── getData ──────────────────────────────────────────────────────────────

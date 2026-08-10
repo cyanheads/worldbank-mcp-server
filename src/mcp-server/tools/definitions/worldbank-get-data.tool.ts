@@ -141,6 +141,28 @@ export const worldbankGetData = tool('worldbank_get_data', {
   // Agent-facing context: pagination totals and query orientation. Kept out of the
   // domain return so it reaches both structuredContent and content[] automatically.
   enrichment: {
+    appliedFilters: z
+      .object({
+        indicatorId: z.string().describe('Indicator ID queried.'),
+        countries: z
+          .string()
+          .describe(
+            'Country codes as sent to the API — an array input is joined with semicolons, so this shows the normalized value.',
+          ),
+        dateRange: z
+          .string()
+          .optional()
+          .describe('Date window applied, omitted when none was requested.'),
+        mrv: z
+          .number()
+          .optional()
+          .describe('Most-recent-values count applied, omitted when none was requested.'),
+        page: z.number().describe('Page number requested.'),
+        perPage: z.number().describe('Results per page used, including the server default.'),
+      })
+      .describe(
+        'The effective parameters sent to the World Bank API — confirms country code normalization and which filters were in force for these observations.',
+      ),
     totalCount: z.number().describe('Total observations before pagination.'),
     currentPage: z.number().describe('Current page number.'),
     totalPages: z.number().describe('Total number of pages.'),
@@ -150,6 +172,26 @@ export const worldbankGetData = tool('worldbank_get_data', {
       .describe(
         'Recovery hint for sparse or empty result sets — suggests how to broaden the query.',
       ),
+  },
+
+  enrichmentTrailer: {
+    appliedFilters: {
+      /**
+       * A per-field `render` replaces the whole trailer line, `label` included,
+       * so the heading has to be part of what it returns — otherwise the echo
+       * lands as a bare run of `key=value` pairs among `**field:** value` lines
+       * with nothing naming it.
+       */
+      render: (filters) =>
+        `**Applied Filters:** ${[
+          `indicator_id=${filters.indicatorId}`,
+          `countries=${filters.countries}`,
+          ...(filters.dateRange === undefined ? [] : [`date_range=${filters.dateRange}`]),
+          ...(filters.mrv === undefined ? [] : [`mrv=${filters.mrv}`]),
+          `page=${filters.page}`,
+          `per_page=${filters.perPage}`,
+        ].join(', ')}`,
+    },
   },
 
   errors: [
@@ -189,10 +231,13 @@ export const worldbankGetData = tool('worldbank_get_data', {
 
     const dateRange = input.date_range?.trim() ? input.date_range.trim() : undefined;
     const perPage = input.per_page ?? getServerConfig().defaultPerPage;
+    const countryCodes = Array.isArray(input.countries)
+      ? input.countries.join(';')
+      : input.countries;
 
     ctx.log.info('Fetching indicator data', {
       indicatorId: input.indicator_id,
-      countries: Array.isArray(input.countries) ? input.countries.join(';') : input.countries,
+      countries: countryCodes,
       dateRange,
       mrv: input.mrv,
       page: input.page,
@@ -237,6 +282,16 @@ export const worldbankGetData = tool('worldbank_get_data', {
       throw err;
     }
 
+    ctx.enrich({
+      appliedFilters: {
+        indicatorId: input.indicator_id,
+        countries: countryCodes,
+        ...(dateRange !== undefined && { dateRange }),
+        ...(input.mrv !== undefined && { mrv: input.mrv }),
+        page: input.page,
+        perPage,
+      },
+    });
     ctx.enrich({ totalCount: result.total, currentPage: result.page, totalPages: result.pages });
 
     if (result.data.length === 0) {

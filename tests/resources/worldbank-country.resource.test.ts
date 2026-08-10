@@ -3,6 +3,12 @@
  * @module tests/resources/worldbank-country.resource.test
  */
 
+import {
+  JsonRpcErrorCode,
+  notFound,
+  serviceUnavailable,
+  timeout,
+} from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -23,6 +29,14 @@ const mockCountry = {
   latitude: '38.8895',
   isAggregate: false,
 };
+
+/** The rejection WorldBankApiService.getCountry throws for a code upstream rejects. */
+function unknownCountry(countryCode: string) {
+  return notFound(
+    `Country code "${countryCode}" not found. Use worldbank_list_countries to browse valid codes.`,
+    { reason: 'country_not_found', countryCode },
+  );
+}
 
 const mockAggregate = {
   id: 'EAS',
@@ -49,7 +63,7 @@ describe('worldbankCountryResource', () => {
     const { worldbankCountryResource } = await import(
       '@/mcp-server/resources/definitions/worldbank-country.resource.js'
     );
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: worldbankCountryResource.errors });
     const params = worldbankCountryResource.params.parse({ countryCode: 'USA' });
     const result = await worldbankCountryResource.handler(params, ctx);
     expect(result).toMatchObject({
@@ -71,25 +85,56 @@ describe('worldbankCountryResource', () => {
     const { worldbankCountryResource } = await import(
       '@/mcp-server/resources/definitions/worldbank-country.resource.js'
     );
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: worldbankCountryResource.errors });
     const params = worldbankCountryResource.params.parse({ countryCode: 'EAS' });
     const result = await worldbankCountryResource.handler(params, ctx);
     expect(result.isAggregate).toBe(true);
     expect(result.id).toBe('EAS');
   });
 
-  it('throws notFound when the service rejects', async () => {
+  it('throws notFound with a recovery hint when the country code is unknown', async () => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
     vi.mocked(getWorldBankApiService).mockReturnValue({
-      getCountry: vi.fn().mockRejectedValue(new Error('not found')),
+      getCountry: vi.fn().mockRejectedValue(unknownCountry('ZZZZ')),
     } as never);
 
     const { worldbankCountryResource } = await import(
       '@/mcp-server/resources/definitions/worldbank-country.resource.js'
     );
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: worldbankCountryResource.errors });
     const params = worldbankCountryResource.params.parse({ countryCode: 'ZZZZ' });
-    await expect(worldbankCountryResource.handler(params, ctx)).rejects.toThrow('ZZZZ" not found');
+    const err = await worldbankCountryResource.handler(params, ctx).catch((e: unknown) => e);
+    expect(err).toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: { reason: 'country_not_found', countryCode: 'ZZZZ' },
+    });
+    expect((err as { data: { recovery: { hint: string } } }).data.recovery.hint).toMatch(
+      /worldbank_list_countries/,
+    );
+  });
+
+  /**
+   * A transient upstream failure must not be relabelled as a definitive miss —
+   * an agent told the country does not exist changes its input instead of
+   * retrying.
+   */
+  it.each([
+    ['serviceUnavailable', serviceUnavailable('Network error during fetch'), -32000],
+    ['timeout', timeout('Request timed out after 15000ms'), -32004],
+  ])('propagates a %s rejection unchanged', async (_label, upstreamError, expectedCode) => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      getCountry: vi.fn().mockRejectedValue(upstreamError),
+    } as never);
+
+    const { worldbankCountryResource } = await import(
+      '@/mcp-server/resources/definitions/worldbank-country.resource.js'
+    );
+    const ctx = createMockContext({ errors: worldbankCountryResource.errors });
+    const params = worldbankCountryResource.params.parse({ countryCode: 'BRA' });
+    const err = await worldbankCountryResource.handler(params, ctx).catch((e: unknown) => e);
+    expect(err).toBe(upstreamError);
+    expect((err as { code: number }).code).toBe(expectedCode);
   });
 
   it('handles sparse payload with empty optional fields', async () => {
@@ -112,7 +157,7 @@ describe('worldbankCountryResource', () => {
     const { worldbankCountryResource } = await import(
       '@/mcp-server/resources/definitions/worldbank-country.resource.js'
     );
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: worldbankCountryResource.errors });
     const params = worldbankCountryResource.params.parse({ countryCode: 'TCA' });
     const result = await worldbankCountryResource.handler(params, ctx);
     expect(result.capitalCity).toBe('');
@@ -135,13 +180,13 @@ describe('worldbankCountryResource', () => {
   it('notFound error message does not leak env variable names or API keys', async () => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
     vi.mocked(getWorldBankApiService).mockReturnValue({
-      getCountry: vi.fn().mockRejectedValue(new Error('not found')),
+      getCountry: vi.fn().mockRejectedValue(unknownCountry('ZZ')),
     } as never);
 
     const { worldbankCountryResource } = await import(
       '@/mcp-server/resources/definitions/worldbank-country.resource.js'
     );
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: worldbankCountryResource.errors });
     const params = worldbankCountryResource.params.parse({ countryCode: 'ZZ' });
     const err = await worldbankCountryResource.handler(params, ctx).catch((e: unknown) => e);
     const errStr = JSON.stringify(err);

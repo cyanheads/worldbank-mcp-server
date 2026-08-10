@@ -18,6 +18,7 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
     'A keyword query matches every term against indicator ID, name, and description, in any word order, ' +
     'across the whole catalog or the whole selected topic or source; punctuation in the query is ignored. ' +
     'Exact ID or name matches rank first, then whole-phrase matches, then ID/name matches, then description-only matches. ' +
+    'Each indicator ID appears once, even where the catalog publishes it under two sources. ' +
     'Use worldbank_list_topics for topic IDs, worldbank_list_sources for source IDs.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
@@ -82,6 +83,24 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
   // Kept out of the domain return so it reaches both structuredContent and content[]
   // without a format() entry or format-parity concern.
   enrichment: {
+    appliedFilters: z
+      .object({
+        query: z
+          .string()
+          .optional()
+          .describe('Trimmed keyword query sent to the search, omitted when none was given.'),
+        topicId: z
+          .string()
+          .optional()
+          .describe('Topic ID the results were scoped to, omitted when none was given.'),
+        sourceId: z
+          .string()
+          .optional()
+          .describe('Source ID the results were scoped to, omitted when none was given.'),
+      })
+      .describe(
+        'The effective search parameters, field by field — confirms which filter combination produced these results without parsing the effectiveQuery string.',
+      ),
     effectiveQuery: z
       .string()
       .optional()
@@ -93,6 +112,22 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
       .string()
       .optional()
       .describe('Recovery hint when no indicators matched — suggests how to broaden the search.'),
+  },
+
+  enrichmentTrailer: {
+    appliedFilters: {
+      /**
+       * A per-field `render` replaces the whole trailer line, `label` included,
+       * so the heading has to be part of what it returns. Without it this lands
+       * as an unlabelled copy of the `effectiveQuery` line directly beneath it.
+       */
+      render: (filters) =>
+        `**Applied Filters:** ${[
+          ...(filters.query === undefined ? [] : [`query="${filters.query}"`]),
+          ...(filters.topicId === undefined ? [] : [`topic_id=${filters.topicId}`]),
+          ...(filters.sourceId === undefined ? [] : [`source_id=${filters.sourceId}`]),
+        ].join(', ')}`,
+    },
   },
 
   errors: [
@@ -161,7 +196,14 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
     if (query) filterParts.push(`query="${query}"`);
     if (topicId) filterParts.push(`topic_id=${topicId}`);
     if (sourceId) filterParts.push(`source_id=${sourceId}`);
-    ctx.enrich({ effectiveQuery: filterParts.join(', ') });
+    ctx.enrich({
+      appliedFilters: {
+        ...(query !== undefined && { query }),
+        ...(topicId !== undefined && { topicId }),
+        ...(sourceId !== undefined && { sourceId }),
+      },
+      effectiveQuery: filterParts.join(', '),
+    });
     ctx.enrich({ totalCount: result.total, currentPage: result.page, totalPages: result.pages });
 
     // A search that matched nothing is a valid answer, not a failure: return an

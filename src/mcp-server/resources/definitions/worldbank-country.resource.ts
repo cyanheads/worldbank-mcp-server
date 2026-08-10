@@ -5,7 +5,7 @@
  */
 
 import { resource, z } from '@cyanheads/mcp-ts-core';
-import { notFound } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { getWorldBankApiService } from '@/services/worldbank/worldbank-service.js';
 
 export const worldbankCountryResource = resource('worldbank://country/{countryCode}', {
@@ -44,17 +44,30 @@ export const worldbankCountryResource = resource('worldbank://country/{countryCo
     isAggregate: z.boolean().describe('True for regional or income-group aggregates.'),
   }),
 
+  errors: [
+    {
+      reason: 'country_not_found',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'The country code does not exist in the World Bank API.',
+      recovery: 'Use worldbank_list_countries to browse valid ISO2, ISO3, and aggregate codes.',
+    },
+  ],
+
   async handler(params, ctx) {
     ctx.log.debug('Reading country resource', { countryCode: params.countryCode });
-    const country = await getWorldBankApiService()
-      .getCountry(params.countryCode, ctx)
-      .catch((err: unknown) => {
-        throw notFound(
-          `Country "${params.countryCode}" not found.`,
-          { countryCode: params.countryCode },
-          { cause: err },
-        );
-      });
-    return country;
+    try {
+      return await getWorldBankApiService().getCountry(params.countryCode, ctx);
+    } catch (err) {
+      // Only an upstream miss is a not-found. Network failures, timeouts, and
+      // 5xx keep their own classification so the caller retries instead of
+      // concluding the country doesn't exist.
+      if (err instanceof McpError && err.data?.reason === 'country_not_found') {
+        throw ctx.fail('country_not_found', err.message, {
+          ...ctx.recoveryFor('country_not_found'),
+          countryCode: params.countryCode,
+        });
+      }
+      throw err;
+    }
   },
 });

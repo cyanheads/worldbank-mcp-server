@@ -2,10 +2,10 @@
  * @fileoverview World Bank Indicators API v2 service. Wraps all endpoint categories
  * (indicators, countries, data, topics, sources) with typed fetch methods,
  * retry/timeout, and sparse-payload normalization. Keyword indicator search,
- * aggregate-free country listing, aggregate classification of data rows, and
- * verification of the requested date window are computed locally over
- * exhaustively fetched candidate sets, since the API offers none of them
- * server-side.
+ * collapse of indicators the catalog publishes twice, aggregate-free country
+ * listing, aggregate classification of data rows, and verification of the
+ * requested date window are computed locally over exhaustively fetched
+ * candidate sets, since the API offers none of them server-side.
  * @module services/worldbank/worldbank-service
  */
 
@@ -189,6 +189,40 @@ function normalizeSource(raw: RawSource): Source {
     metadataAvailability: raw.metadataavailability ?? '',
     concepts: raw.concepts ?? '',
   };
+}
+
+// ─── Duplicate indicator collapse ────────────────────────────────────────────
+
+/**
+ * Pick the row to keep out of two catalog entries sharing one indicator ID.
+ * Dozens of indicators are published twice, identical but for their `source`:
+ * a live dataset and an archived copy of it. The archived copy loses; when
+ * neither is archived the lower source ID wins, so the choice never depends on
+ * the order upstream happened to return the rows in.
+ */
+function preferredRow<T extends { sourceId: string; sourceName: string }>(
+  current: T,
+  candidate: T,
+): T {
+  const currentArchived = /archive/i.test(current.sourceName);
+  const candidateArchived = /archive/i.test(candidate.sourceName);
+  if (currentArchived !== candidateArchived) return currentArchived ? candidate : current;
+  return Number(candidate.sourceId) < Number(current.sourceId) ? candidate : current;
+}
+
+/**
+ * Collapse rows sharing an indicator ID down to one, keeping the first
+ * occurrence's position so ranking and pagination stay stable. Without this a
+ * search returns the same ID more than once and counts every copy in `total`,
+ * and an agent chaining the results issues duplicate data requests for one series.
+ */
+function dedupeIndicators(indicators: readonly Indicator[]): Indicator[] {
+  const byId = new Map<string, Indicator>();
+  for (const indicator of indicators) {
+    const existing = byId.get(indicator.id);
+    byId.set(indicator.id, existing ? preferredRow(existing, indicator) : indicator);
+  }
+  return [...byId.values()];
 }
 
 // ─── Keyword matching ────────────────────────────────────────────────────────
@@ -481,7 +515,7 @@ export class WorldBankApiService {
           )
         : await this.loadIndicatorCatalog(ctx);
 
-    const matches = matchIndicators(pool, query);
+    const matches = matchIndicators(dedupeIndicators(pool), query);
     const start = (page - 1) * perPage;
     return {
       indicators: matches.slice(start, start + perPage),
@@ -512,7 +546,10 @@ export class WorldBankApiService {
       );
     }
 
-    return normalizeIndicatorDetail(items[0] as RawIndicator);
+    // An ID published under both a live and an archived source resolves to two
+    // rows here, in upstream's arbitrary order. Same tie-break as the catalog
+    // search, so both report the same source for the same ID.
+    return items.map(normalizeIndicatorDetail).reduce(preferredRow);
   }
 
   /**

@@ -5,7 +5,7 @@
  */
 
 import { resource, z } from '@cyanheads/mcp-ts-core';
-import { notFound } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { getWorldBankApiService } from '@/services/worldbank/worldbank-service.js';
 
 export const worldbankIndicatorResource = resource('worldbank://indicator/{indicatorId}', {
@@ -38,18 +38,30 @@ export const worldbankIndicatorResource = resource('worldbank://indicator/{indic
       .describe('Thematic topics.'),
   }),
 
+  errors: [
+    {
+      reason: 'indicator_not_found',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'The indicator ID does not exist in the World Bank API.',
+      recovery: 'Use worldbank_search_indicators to find valid indicator IDs by keyword or topic.',
+    },
+  ],
+
   async handler(params, ctx) {
     ctx.log.debug('Reading indicator resource', { indicatorId: params.indicatorId });
-    const indicator = await getWorldBankApiService()
-      .getIndicator(params.indicatorId, ctx)
-      .catch((err: unknown) => {
-        // Rethrow as notFound for resource semantics
-        throw notFound(
-          `Indicator "${params.indicatorId}" not found.`,
-          { indicatorId: params.indicatorId },
-          { cause: err },
-        );
-      });
-    return indicator;
+    try {
+      return await getWorldBankApiService().getIndicator(params.indicatorId, ctx);
+    } catch (err) {
+      // Only an upstream miss is a not-found. Network failures, timeouts, and
+      // 5xx keep their own classification so the caller retries instead of
+      // concluding the indicator doesn't exist.
+      if (err instanceof McpError && err.data?.reason === 'indicator_not_found') {
+        throw ctx.fail('indicator_not_found', err.message, {
+          ...ctx.recoveryFor('indicator_not_found'),
+          indicatorId: params.indicatorId,
+        });
+      }
+      throw err;
+    }
   },
 });
