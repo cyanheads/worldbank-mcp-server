@@ -13,6 +13,7 @@
 | `worldbank_get_country` | Fetch metadata for a specific country: region, income level, capital, coordinates, lending type. | `country_code` | `readOnlyHint: true` |
 | `worldbank_list_topics` | List all 21 thematic topics (Economy & Growth, Health, Education, etc.) with descriptions. Use to browse the indicator space or find a `topic_id` for `worldbank_search_indicators`. | — | `readOnlyHint: true` |
 | `worldbank_list_sources` | List the 70+ data sources (World Development Indicators, IDS, Doing Business, etc.) with codes. Use to find a `source_id` for filtering indicator search. | `page`, `per_page` | `readOnlyHint: true` |
+| `worldbank_get_poverty` | Poverty headcount, gap, and severity at any poverty line, plus the Gini coefficient, mean log deviation, polarization, and decile shares, from the Poverty and Inequality Platform. Individual economies only. | `countries`, `year`, `poverty_line`, `welfare_type`, `reporting_level`, `fill_gaps`, `page`, `per_page` | `readOnlyHint: true` |
 
 ### Resources
 
@@ -43,20 +44,23 @@ Designed as the global complement to BLS (US detail) and EIA (US energy) — pro
 - No API key required; no rate-limit enforcement needed at server level
 - Response data can be sparse: individual country×year cells may be `null` when the WDI doesn't have a value
 - Aggregates (regions, income groups, World) are returned alongside individual countries in `all` queries; the server must communicate what type each entry is
+- Poverty at a caller-chosen threshold, and the inequality distribution behind it, come from the Poverty and Inequality Platform rather than the WDI series — a second upstream API, with its own envelope, error convention, and survey coverage, and no aggregate support
 
 ## Services
 
 | Service | Wraps | Used By |
 |:--------|:------|:--------|
-| `WorldBankApiService` | World Bank Indicators API v2 (`https://api.worldbank.org/v2/`) | All tools and resources |
+| `WorldBankApiService` | World Bank Indicators API v2 (`https://api.worldbank.org/v2/`) | All tools and resources except `worldbank_get_poverty` |
+| `PipService` | World Bank Poverty and Inequality Platform (`https://api.worldbank.org/pip/v1/`) | `worldbank_get_poverty` |
 
-One service wrapping the entire API. All endpoints share the same base URL and response envelope pattern, so a single service with typed fetch methods covers the full surface.
+One service per upstream API. Every Indicators v2 endpoint shares a base URL and the `[paging, items]` envelope, so a single service covers that whole surface. PIP shares none of it — flat JSON array, no pagination, real HTTP status codes — so it gets its own client rather than an extension of `WorldBankApiService`, whose `buildUrl`, `fetchAllPages`, and `isWbErrorEnvelope` are all specific to Indicators v2. What the two share is the framework layer beneath them: `fetchWithTimeout`, `withRetry`, the init/accessor pattern, and HTML-error-page detection against the common Cloudflare front.
 
 ## Config
 
 | Env Var | Required | Description |
 |:--------|:---------|:------------|
-| `WORLDBANK_API_BASE_URL` | No | Override base URL (default: `https://api.worldbank.org/v2`). Useful for testing against local mirrors. |
+| `WORLDBANK_API_BASE_URL` | No | Override the Indicators v2 base URL (default: `https://api.worldbank.org/v2`). Useful for testing against local mirrors. |
+| `WORLDBANK_PIP_BASE_URL` | No | Override the PIP base URL (default: `https://api.worldbank.org/pip/v1`). |
 | `WORLDBANK_DEFAULT_PER_PAGE` | No | Default page size for list/search operations (default: `50`). |
 | `WORLDBANK_CATALOG_CACHE_TTL_MS` | No | Lifetime of the in-process reference caches — the indicator catalog behind keyword-only search and the aggregate-code set behind `isAggregate` (default: `3600000`). `0` disables caching and refetches on every use. |
 
@@ -71,6 +75,7 @@ No API key. The World Bank API is fully public.
 5. `worldbank_search_indicators` + `worldbank_get_indicator` — indicator discovery
 6. `worldbank_get_data` — primary data tool; most complex due to multi-country and aggregate handling
 7. Resources — `worldbank://indicator/{id}` and `worldbank://country/{code}`
+8. `PipService` + `worldbank_get_poverty` — a second upstream API with its own envelope, error convention, and survey-vs-gap-filled merge
 
 Each step is independently testable against the live API.
 
@@ -260,6 +265,33 @@ Lists the ~71 WB data sources (datasets). Supports pagination since the list can
 - `sources: Array<{ id, name, code, lastUpdated, dataAvailability, metadataAvailability, concepts }>` — source list. API fields are lowercase (`lastupdated`, `dataavailability`, `metadataavailability`) — map to camelCase in the server response.
 - `total: number`, `page: number`, `pages: number`
 
+### `worldbank_get_poverty`
+
+Poverty and inequality estimates from the Poverty and Inequality Platform. The only tool backed by `PipService`.
+
+**Input:**
+- `countries: string | string[]` — one or more economies by ISO3 code, or `"all"`. A single string may hold several codes separated by commas or semicolons; both are normalized to the comma-joined form PIP expects, so a caller carrying over `worldbank_get_data`'s semicolon habit is not silently wrong. At least one code is required.
+- `year: string | undefined` — a four-digit year, `"all"` for full history, or `"MRV"` for the most recent available. Enforced by a schema `pattern`. Omitted behaves as `"all"`. Blank is read as absent, for form-based clients.
+- `poverty_line: number | undefined` — PPP dollars per person per day, 0–2700 (the range PIP itself enumerates). No server-side default: PIP's own default tracks the PPP vintage of the release it is serving, and the applied value comes back on every row as `povertyLine`.
+- `welfare_type: 'income' | 'consumption' | undefined` — the two are not directly comparable, so a cross-country comparison is safer pinned to one.
+- `reporting_level: 'national' | 'urban' | 'rural' | undefined` — ten economies publish a split, only China with all three levels; every row carries its own `reportingLevel`.
+- `fill_gaps: boolean` (default: `true`)
+- `page: number` (default: 1), `per_page: number` (default: 50, max: 1000) — applied locally; PIP has no pagination.
+
+**Output:**
+- `estimates: Array<{ countryCode, countryName, regionCode, regionName, reportingYear, reportingLevel, welfareType, povertyLine, headcount, povertyGap, povertySeverity, watts, mean, median, gini, mld, polarization, decileShares, population, surveyYear, surveyAcronym, estimationType, isInterpolated }>` — ordered by country, year, reporting level, then welfare type.
+
+Every measure is nullable. `gini`, `mld`, `polarization`, `decileShares`, `surveyYear`, and `surveyAcronym` are populated only on survey-derived rows; `estimationType` (`survey` / `interpolation` / `extrapolation` / `CMD estimation`) is the field that says which kind of row this is. Across the full dataset the correspondence is exact: every `survey` row carries a `gini`, and no row of any other type does. `decileShares` is all ten shares or `null` — never a partial run, which would misreport which decile each share belongs to.
+
+Enrichment carries `appliedFilters` (including the applied `fillGaps`), `totalCount`, `currentPage`, `totalPages`, and a `notice` when the result is empty or contains gap-filled rows.
+
+**Errors:**
+- `country_not_found` (`NotFound`) — PIP rejected a country code. Recovery: look the ISO3 code up, and query economies rather than aggregates.
+- `invalid_parameter` (`ValidationError`) — PIP rejected some other parameter value. The message names it, and quotes PIP's accepted values when the list is short enough to be useful.
+- `upstream_unavailable` (`ServiceUnavailable`) — a 5xx. An aggregate country code produces the same status with no distinguishing detail, so the message offers both causes rather than asserting either.
+
+PIP answers a rejected parameter with a real HTTP 404 whose body names the parameter and enumerates every accepted value. The framework truncates a captured error body at 500 bytes, which lands mid-array for `country` and `year`, so the parameter names are read out of the body with a regex over the `"<name>": {"msg"` prefixes rather than parsed; those prefixes sit at the head of each `details` entry and `msg` appears nowhere else, so a truncated body can drop a later parameter from the list but can never substitute a wrong name. `country` is always the first `details` entry, so the country-not-found branch survives every truncation. A `valid` list is quoted only when the body arrived intact and holds twelve entries or fewer. Zero rows is a successful empty result with a notice, not an error — PIP returns `[]` for a well-formed query that matches nothing.
+
 ---
 
 ## Design Decisions
@@ -279,6 +311,13 @@ Lists the ~71 WB data sources (datasets). Supports pagination since the list can
 | Empty results are structured success, not `no_match` | A search with zero hits is a valid answer. It returns an empty array plus an `enrichment.notice` carrying the recovery hint, matching `worldbank_get_data`'s empty-result handling. The declared `no_match` error was unreachable and was removed rather than wired up. |
 | No `worldbank_compare_countries` workflow tool | A first-class comparison tool is tempting but adds no real value over `worldbank_get_data` with multiple countries — the agent can do the comparison logic. Keeping the surface tight avoids duplicating the data query with a thin wrapper. |
 | DataCanvas not used | Data result sets are moderate-sized (200 countries × N years). The 1000-row `per_page` ceiling and typical query sizes (10–50 rows for focused country comparisons) don't warrant the DuckDB overhead. An agent doing deep tabular analysis can call multiple times. This can be revisited if large `all`-country time-series queries prove problematic in practice. |
+| One `worldbank_get_poverty`, not a separate `worldbank_get_inequality` | PIP returns the poverty measures and the whole distributional block in the same row, and `poverty_line` does not affect the inequality fields — a second tool would fire an identical upstream request for data the first call already had in hand. The tool-selection cost of hiding "Gini" inside a tool named `get_poverty` is paid in prose: the description names Gini, inequality, and decile distribution explicitly so a search for those concepts lands here. |
+| `fill_gaps` defaults to `true`, and the applied value is echoed | Upstream defaults it to `false`, where an ordinary query (`country=IND&year=2019`) returns a bare `[]` rather than an error, because India has no 2019 survey. Defaulting to `true` makes the common query answerable. It is echoed in `appliedFilters` because an agent cannot reason about a fallback it cannot see. |
+| Survey rows are fetched first and the gap-fill pass only adds what they left uncovered | `fill_gaps=true` is not a superset of `fill_gaps=false`: PIP strips `gini`, `mld`, `polarization`, the ten deciles, and `survey_year` from **every** row it returns in that mode, including rows for years a survey does exist for (`USA&year=2022` returns `gini: 0.417` without the flag and `gini: null` with it). A single request using the caller's `fill_gaps` value would therefore leave the entire inequality half of this tool permanently null. Asking for survey rows first and merging the gap-filled pass around them keeps the real distribution wherever one exists. What counts as uncovered depends on the request: a single reporting year (`YYYY` or `MRV`) is answered per economy — PIP returns the same row grain in both modes for a year it surveyed, so an economy with a survey row needs nothing added, and `MRV` cannot come back as two rows at two different years. A request spanning the window (`all`, or no `year`) is answered per row grain, because PIP surveys a handful of years and estimates every year around them. |
+| Provenance is a first-class output field, not an inference | Gap-filled rows are the common case, since PIP publishes an estimate for nearly every year and surveys only a handful. `estimationType`, `surveyYear`, `surveyAcronym`, and `isInterpolated` ship on every row, and `.describe()` states that null inequality on a gap-filled row is a documented data gap, so an agent can tell "no data for this year" from "this year is an estimate that carries no distributional detail." `isInterpolated` alone is not enough — it is `true` on interpolated and extrapolated rows but `false` on `CMD estimation` rows, which are gap-filled all the same. |
+| No server-side default for `poverty_line` | PIP's own default tracks the PPP vintage of the release it serves, which has already moved once ($2.15 under 2017 PPPs, $3.00 under 2021 PPPs). Pinning a number here would silently express the applied line in the wrong vintage after the next revision. The line PIP applied comes back on every row as `povertyLine`. |
+| `PipService` is a separate service, not an extension of `WorldBankApiService` | Nothing transfers: `buildUrl()` forces `format=json` plus `page`/`per_page`, which PIP takes neither of; `fetchAllPages()` assumes the `[paging, items]` tuple, where PIP returns a flat array; `isWbErrorEnvelope()` detects an HTTP-200 sentinel, where PIP uses real status codes. The reuse is one level down — `fetchWithTimeout`, `withRetry`, the init/accessor pattern, and HTML-error detection against the shared Cloudflare front. |
+| PIP's 5xx retry budget is one retry, not the framework default of three | All 28 aggregate codes PIP advertises among its valid `country` values fail this endpoint with HTTP 500 (`/pip-grp` serves those, and is out of scope), on every attempt. Three retries only delay a settled answer. The one retry is kept for the timeout case instead: PIP computes a query on first sight and caches it, so the attempt that timed out warms the query and the retry usually returns at once. The 500 body carries nothing but `Internal Server Error`, so the message states the status and offers the outage and the aggregate cause side by side rather than asserting one. |
 | Resources for country and indicator | Stable, addressable by ID, read-only, useful as injectable context for agents that support resources. Both entities satisfy the resource criteria without redundancy — their tool path (`worldbank_get_country`, `worldbank_get_indicator`) also covers tool-only clients. |
 
 ## Known Limitations
@@ -289,6 +328,10 @@ Lists the ~71 WB data sources (datasets). Supports pagination since the list can
 - **A keyword-only search costs a full-catalog fetch on a cold cache.** ~15 MB and a few seconds, once per `WORLDBANK_CATALOG_CACHE_TTL_MS` window per process. Topic- and source-scoped searches are far smaller (the largest source is ~1,500 rows).
 - **The catalog contains duplicate indicator IDs.** 43 IDs are published twice in `/indicator`, once under a live source and once under an archived copy of it. Keyword search collapses them to one row per ID and `worldbank_get_indicator` resolves to the same row, so the extra copy's `sourceId`/`sourceName` is not reachable through either path. The no-keyword browse paths page straight through upstream without collapsing, which they can do because the pairs differ only by source: a source-scoped listing filters server-side on that field, and every one of the 43 carries an empty `topics` array, so no topic-scoped listing contains a pair either.
 - **Indicator IDs are opaque and hierarchical.** IDs like `NY.GDP.PCAP.CD` encode source, topic, and unit, but the encoding isn't documented for programmatic parsing. The agent should treat them as opaque strings.
+- **PIP inequality data exists only for survey years.** PIP publishes a poverty estimate for every year from 1981 to 2026 in an economy's coverage window but surveys only a handful — 2,584 survey rows against 10,119 gap-filled ones across the whole dataset — and it attaches the Gini, decile shares, mean log deviation, and polarization to survey-derived rows alone. For most year requests the inequality fields are legitimately null. `estimationType` distinguishes that from an outright absence of data.
+- **PIP serves individual economies only.** Its `/pip` endpoint lists 28 aggregate codes among the 200 valid `country` values — regions, income groups, lending groups, `REST` — and answers HTTP 500 for every one of them; only the 172 individual economies resolve. The aggregates live behind `/pip-grp`, which this server does not expose.
+- **PIP and WDI poverty figures will not match exactly.** `SI.POV.DDAY` and friends are WDI series with their own vintage and revision cycle; `worldbank_get_poverty` reads PIP directly. Comparable questions, different numbers.
+- **A cold PIP query is slow.** PIP computes a query the first time it sees it and serves repeats from cache, so the same request can take 15–60 seconds once and under a second thereafter; 90 seconds has been observed. The request timeout is 60s with a single retry, which recovers the common case because the timed-out attempt leaves the query warm. A full-history request with `fill_gaps` on pays this twice, once per pass.
 - **Update frequency varies widely.** Some indicators are annual, some quarterly, some have multi-year gaps. The API provides no update schedule — agents querying "most recent data" may get values from several years ago.
 
 ## API Reference
@@ -325,6 +368,26 @@ Lists the ~71 WB data sources (datasets). Supports pagination since the list can
 | Inflation, consumer prices (annual %) | `FP.CPI.TOTL.ZG` |
 | Internet users (% of population) | `IT.NET.USER.ZS` |
 
+### Poverty and Inequality Platform
+
+**Base URL:** `https://api.worldbank.org/pip/v1/` — not `pip.worldbank.org/api/v1`, which is the web front-end and serves an HTML app shell.
+
+**Endpoint used:** `/pip?country=&year=&povline=&welfare_type=&reporting_level=&fill_gaps=`. `country` takes one ISO3 code, a comma-separated batch, or `all`; `year` takes a year, `all`, or `MRV`. Codes are case-insensitive and unknown query parameters are ignored.
+
+**Response envelope:** a flat JSON array of row objects. No pagination and no paging metadata — the whole result set arrives at once (`country=all&year=all` is ~2,600 survey rows, ~10,100 gap-filled).
+
+**Error convention:** real HTTP status codes. A rejected parameter value is HTTP 404 with `{"error": [...], "details": {"<param>": {"msg": [...], "valid": [...]}}}`, one `details` entry per rejected parameter, `country` always first. One bad code fails the whole batch (`country=USA,ZZZ` → 404). A well-formed query matching nothing is HTTP 200 with `[]`. An aggregate country code is HTTP 500 with a body carrying no detail beyond `Internal Server Error`.
+
+**Input leniency:** country codes and `year` are case-insensitive (`usa`, `mrv`), unknown query parameters are ignored, and `povline` accepts 0–2700. An empty or absent `country` is read as every economy, so a caller must never let an empty value reach the query string.
+
+**Row grain:** country × reporting year × reporting level × welfare type. Ten economies publish more than one `reporting_level` (only China all three) and thirty-five publish both an income and a consumption series, so the country code alone does not identify a row. `survey_year` may be fractional when the survey spans a fiscal year (India's 2022 HCES reports `2022.58`).
+
+**`estimation_type`:** `survey`, `interpolation`, `extrapolation`, or `CMD estimation` — the last for economies PIP holds no survey for. `is_interpolated` is `true` on the interpolated and extrapolated rows only, so it does not by itself separate survey rows from gap-filled ones.
+
+**Mode asymmetry:** `fill_gaps=true` is a different series, not a superset. It spans 1981–2026 for every economy, drops the whole distributional block from every row it returns, and reports a slightly different `headcount` for a year both modes cover (`USA&year=2022`: `0.014` survey, `0.0132` gap-filled). `fill_gaps=false` spans only the survey years, which for some economies (`USA`) start well before 1981.
+
+**Not exposed:** `/pip-grp` (regional and income-group aggregates), `/aux` (reference tables), `/versions` (data vintages).
+
 ---
 
 ## Decisions Log
@@ -342,6 +405,11 @@ Lists the ~71 WB data sources (datasets). Supports pagination since the list can
 | 2026-08-09 | Upstream error classification comes from the message count plus an indicator lookup | The envelope text is byte-identical whichever path segment was rejected, and the previous heuristic inspected the caller's own `indicator_id` for a `XX.YYY` shape, which inverted the answer in both directions. Upstream does emit one `message` entry per rejected segment: two entries prove both are invalid, and one entry is resolved by a single `/indicator/{id}` request on an already-failed path. A malformed `date_range` produces the same one-entry envelope, so rejecting it at the schema is what keeps the remaining case a two-way choice. |
 | 2026-08-09 | A `date_range` the API drops is applied locally over the whole series | The API discards a window it can't apply — no overlap with the series (`1850:1900`), or a granularity the series doesn't carry (`2019:2021` against quarterly rows) — and returns everything, indistinguishable from a hit. Each returned period is compared against the requested one; periods overlap rather than match exactly, so a year window also selects the quarters and months inside it. Once any row falls outside, upstream's paging describes the unfiltered series, so a windowed query spanning more than one upstream page is re-read exhaustively and paginated locally — the same reason `include_aggregates=false` fetches every page. Judging the drop from one page alone reported the page-local match count as the total and, when the window sat behind page 1, claimed the series held nothing in it. A window that matches nothing reports as an empty result with a notice rather than a thrown error, because a single out-of-range period (`date=1800`) already comes back as an empty upstream envelope — the same request shape must not fail one way and succeed the other. |
 | 2026-08-09 | `date_range` accepts quarterly and monthly periods, not just years | Quarterly and monthly series exist (`DP.DOD.DECD.CR.BC.CD` dates rows `2026Q1`, `CPTOTNSXN` carries 471 monthly rows) and `YYYYQn` / `YYYYMnn` are the only expressions the API honors against them — a plain year returns nothing and a year range is discarded. Restricting the pattern to `YYYY` would have made those series unfilterable. Both endpoints of a range must share a period type because the API rejects a mixed range outright, and an outright rejection is the one-message envelope the indicator/country classification depends on being unambiguous. |
+| 2026-08-09 | PIP gets its own `PipService` rather than extending `WorldBankApiService` | The two APIs share a hostname and nothing else — flat array vs. `[paging, items]` tuple, no pagination vs. `page`/`per_page`, real HTTP status codes vs. an HTTP-200 sentinel envelope. Every reusable piece (`fetchWithTimeout`, `withRetry`, init/accessor, HTML-error detection) sits below the service layer and is used by both. |
+| 2026-08-09 | Poverty and inequality ship as one tool, `worldbank_get_poverty` | Both arrive in the same upstream row and `poverty_line` does not affect the distributional fields, so a separate inequality tool would issue a second identical request for data already in hand. Discoverability is handled in the description, which names Gini, inequality, and decile distribution outright. |
+| 2026-08-09 | `fill_gaps` defaults to `true`, and survey rows win the merge | Measured against the live API: `fill_gaps=false` answers `country=IND&year=2019` with `[]`, so the upstream default makes an ordinary query look like a missing-data bug. But `fill_gaps=true` nulls `gini`, `mld`, `polarization`, all ten deciles, and `survey_year` on *every* row it returns — `USA&year=2022` gives `gini: 0.417` without the flag and `gini: null` with it — so simply passing the flag through would kill the inequality half of the tool outright. Requesting survey rows first and merging the gap-filled pass around them gets both: real distributions where they exist, labelled estimates where they do not. |
+| 2026-08-09 | The gap-fill merge keys on row grain for a multi-year request and on the country for a single-year one | Keying on the country throughout made `fill_gaps` a silent no-op for the most ordinary query there is. `countries=IND` with no `year` — which PIP reads as the full window — returned the 8 survey years and nothing else, because India was "covered" by having any survey row at all, while `appliedFilters.fillGaps` still reported `true`; the honest answer is 47 rows. `country=all&year=all` lost roughly 5,600 rows the same way. Keying on country × year × reporting level × welfare type fixes it, and is safe because a survey row and its gap-filled twin share that key exactly. A single reporting year keeps the country key: `year=MRV` resolves to the most recent *survey* year in one mode and 2026 in the other, so a grain key there would return one economy twice at two different years. |
+| 2026-08-09 | `poverty_line` has no server-side default | PIP's default line follows its PPP vintage and has already moved from $2.15 (2017 PPPs) to $3.00 (2021 PPPs). A hardcoded default would keep expressing the applied threshold in a retired vintage; letting upstream decide and echoing `povertyLine` on every row stays correct across revisions. |
 | 2026-08-09 | `mrv` ceiling raised from 10 to 100 | The cap was the server's; upstream accepts any count and clamps to the series length (`mrv=200` on a 66-year series returns 66). Ten values is a decade against series running 60+ years, and "most recent N" is the only way to read the tail of a sparse series without guessing a `date_range`. 100 spans every World Bank series with headroom while bounding the `mrv` × countries fan-out; `page`/`per_page` handle the rest (`mrv=60` at the default 50-row page returns 60 across two pages). |
 | 2026-08-09 | Full catalog cached in-process, 1 h TTL, single-flight | The catalog is 14.9 MB / 29,544 rows, ~39 MB retained as a normalized projection, and a measured RSS step of roughly 140 MB on the first cold search. Fetching it per search is untenable; caching it on the service instance with a shared in-flight promise makes a warm keyword-only search a local scan in tens of milliseconds. TTL is configurable via `WORLDBANK_CATALOG_CACHE_TTL_MS`; `0` trades the memory back for a refetch per search. |
 | 2026-08-09 | Token-AND keyword matching on alphanumeric terms, ranked by specificity | Word-order sensitivity was producing wrong-looking results ("per capita GDP" → 8 hits, "gdp per capita" → 38). Requiring each term independently makes both return 108. Terms are split on punctuation, not whitespace, so a pasted indicator name survives: `Unemployment, female (%)` split on whitespace yields the term `(%)`, which appears in no indicator name, and the search returns nothing. Punctuation-insensitive terms match more loosely, so exact-ID/name and whole-phrase hits are promoted ahead of the rest — `Population, total` puts `SP.POP.TOTL` first, `GDP (current US$)` puts `NY.GDP.MKTP.CD` first. |

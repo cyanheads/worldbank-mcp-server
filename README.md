@@ -1,13 +1,13 @@
 <div align="center">
   <h1>@cyanheads/worldbank-mcp-server</h1>
   <p><b>Query 29,500+ World Bank development indicators for 200+ countries across 60+ years via MCP. STDIO or Streamable HTTP.</b>
-  <div>7 Tools • 2 Resources</div>
+  <div>8 Tools • 2 Resources</div>
   </p>
 </div>
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.1.17-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.30.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/worldbank-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/worldbank-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.2.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.30.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/worldbank-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/worldbank-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -25,7 +25,7 @@
 
 ## Tools
 
-7 tools for browsing and querying the World Bank Open Data API:
+8 tools for browsing and querying the World Bank Open Data API:
 
 | Tool | Description |
 |:---|:---|
@@ -36,6 +36,7 @@
 | `worldbank_search_indicators` | Search the 29,500+ indicator catalog by keyword, topic, or source |
 | `worldbank_get_indicator` | Fetch complete metadata for a single indicator: name, description, source, unit, and topics |
 | `worldbank_get_data` | Query indicator values for one or more countries across a time range or most-recent N values |
+| `worldbank_get_poverty` | Poverty headcount, gap, and severity at any poverty line, plus the Gini coefficient and decile shares, from the Poverty and Inequality Platform |
 
 ### `worldbank_list_topics`
 
@@ -114,6 +115,22 @@ Query indicator values for countries across time. The primary data-access tool.
 - Output grouped by country for readability; `isAggregate` flag distinguishes all 78 regional, income-group, and lending-group aggregates from individual countries
 - Echoes the parameters it sent upstream — indicator, normalized country codes, date range or `mrv`, page and page size
 - Paginated with up to 1000 entries per page
+
+---
+
+### `worldbank_get_poverty`
+
+Poverty and inequality estimates from the World Bank [Poverty and Inequality Platform](https://pip.worldbank.org/) (PIP) — a separate dataset from the WDI series the other tools read.
+
+- Poverty headcount ratio, poverty gap, poverty severity, and the Watts index at **any** poverty line, not only the published thresholds. Omit `poverty_line` to use the international line of the PIP release currently served, which is echoed back on every row
+- The same row carries the inequality and distribution block: Gini coefficient, mean log deviation, Wolfson polarization, and the ten decile income/consumption shares. One tool, because PIP returns poverty and inequality together and the poverty line does not affect the distribution
+- Every row states how it was produced. `estimationType: "survey"` rows carry the full inequality block; `"interpolation"`, `"extrapolation"`, and `"CMD estimation"` rows are gap-filled estimates for years no survey covers, and their `gini`, `mld`, `polarization`, and `decileShares` are `null` — a gap in the source data, not an error. `surveyYear`, `surveyAcronym`, and `isInterpolated` sit alongside them
+- `fill_gaps` defaults to `true`, so years the surveys don't reach come back as PIP's own estimate rather than as an empty result or a hole in the series. Survey rows win wherever one exists, so a single-year batch can carry real distributions for some economies and labelled estimates for others, and a full-history query returns a row per year with the real distribution on the survey years. Set `fill_gaps=false` for survey-derived rows only
+- Welfare is measured in PPP dollars per person per day. `welfare_type` pins results to income or consumption surveys, which are not directly comparable; thirty-five economies publish both and return a row for each
+- Ten economies publish an urban/rural split and return an extra row per year for it — China alone reports all three levels, the rest pair national with either urban or rural. `reporting_level` narrows to one, and every row states its own
+- `year` accepts a four-digit year, `"all"` for the full history, or `"MRV"` for the most recent available. Coverage starts in 1963
+- Individual economies only, by ISO3 code — PIP does not serve regional, income-group, or world aggregate codes through this endpoint, and a structured error says so
+- Paginated locally with up to 1000 entries per page, since PIP itself has no pagination
 
 ## Resources
 
@@ -237,7 +254,8 @@ All configuration is validated at startup via Zod schemas in `src/config/server-
 | `STORAGE_PROVIDER_TYPE` | Storage backend: `in-memory`, `filesystem`, `supabase`, `cloudflare-kv/r2/d1` | `in-memory` |
 | `OTEL_ENABLED` | Enable OpenTelemetry | `false` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP exporter endpoint | none |
-| `WORLDBANK_API_BASE_URL` | World Bank API base URL override | `https://api.worldbank.org/v2` |
+| `WORLDBANK_API_BASE_URL` | World Bank Indicators API base URL override | `https://api.worldbank.org/v2` |
+| `WORLDBANK_PIP_BASE_URL` | Poverty and Inequality Platform API base URL override | `https://api.worldbank.org/pip/v1` |
 | `WORLDBANK_DEFAULT_PER_PAGE` | Default page size for list/search/data operations | `50` |
 | `WORLDBANK_CATALOG_CACHE_TTL_MS` | Lifetime of the in-process reference caches — the indicator catalog behind keyword-only search and the aggregate-code set behind `isAggregate`; `0` disables both | `3600000` |
 
@@ -267,9 +285,10 @@ All configuration is validated at startup via Zod schemas in `src/config/server-
 
 | Directory | Purpose |
 |:---|:---|
-| `src/mcp-server/tools` | Tool definitions (`*.tool.ts`). Seven tools covering topics, sources, countries, indicators, and data. |
+| `src/mcp-server/tools` | Tool definitions (`*.tool.ts`). Eight tools covering topics, sources, countries, indicators, data, and poverty. |
 | `src/mcp-server/resources` | Resource definitions. Indicator and country metadata resources. |
-| `src/services/worldbank` | World Bank API service layer — API client and domain types. |
+| `src/services/worldbank` | World Bank Indicators API service layer — API client and domain types. |
+| `src/services/pip` | Poverty and Inequality Platform API service layer — separate client and domain types. |
 | `src/config` | Server-specific environment variable parsing and validation with Zod. |
 | `tests/` | Unit and integration tests, mirroring the `src/` structure. |
 
