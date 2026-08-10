@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.1.15-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.30.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/worldbank-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/worldbank-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.1.16-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.30.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/worldbank-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/worldbank-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -104,11 +104,12 @@ Fetch complete metadata for a known indicator ID.
 
 Query indicator values for countries across time. The primary data-access tool.
 
-- Single country, array of countries, regional codes (EAS, LCN, …), income codes (HIC, LMC, …), world code (WLD), or `"all"` for all ~266 entries
-- Time filtering: `date_range` for historical analysis (YYYY or YYYY:YYYY format), or `mrv` for the N most recent available values (1–10). Mutually exclusive.
+- Single country, array of countries, regional codes (EAS, LCN, …), income codes (HIC, LMC, …), world code (WLD), or `"all"` for every entry. At least one code is required — an empty value is rejected rather than read as `"all"`
+- Time filtering: `date_range` for a period or range — annual (`2020`, `2010:2023`), quarterly (`2020Q1:2021Q4`), or monthly (`2020M01:2020M06`) — or `mrv` for the N most recent available values (1–100). Mutually exclusive.
+- A `date_range` the API can't apply is enforced locally over the whole series, so observations outside the requested window are never returned as matches
 - Returns observations with `null` values when data is not available for a country×year cell — common for sparse series
 - Includes `nullCount` per page to surface data sparsity
-- Output grouped by country for readability; `isAggregate` flag distinguishes regional aggregates from individual countries
+- Output grouped by country for readability; `isAggregate` flag distinguishes all 78 regional, income-group, and lending-group aggregates from individual countries
 - Paginated with up to 1000 entries per page
 
 ## Resources
@@ -233,7 +234,7 @@ All configuration is validated at startup via Zod schemas in `src/config/server-
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP exporter endpoint | none |
 | `WORLDBANK_API_BASE_URL` | World Bank API base URL override | `https://api.worldbank.org/v2` |
 | `WORLDBANK_DEFAULT_PER_PAGE` | Default page size for list/search/data operations | `50` |
-| `WORLDBANK_CATALOG_CACHE_TTL_MS` | Lifetime of the in-process indicator-catalog cache used by keyword-only search; `0` disables it | `3600000` |
+| `WORLDBANK_CATALOG_CACHE_TTL_MS` | Lifetime of the in-process reference caches — the indicator catalog behind keyword-only search and the aggregate-code set behind `isAggregate`; `0` disables both | `3600000` |
 
 ## Running the server
 

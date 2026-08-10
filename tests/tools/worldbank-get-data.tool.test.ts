@@ -51,6 +51,7 @@ const mockDataResult = {
   page: 1,
   pages: 1,
   nullCount: 1,
+  dateFilterDropped: false,
 };
 
 describe('worldbankGetData', () => {
@@ -203,6 +204,69 @@ describe('worldbankGetData', () => {
     });
   });
 
+  it('rethrows indicator_and_country_not_found via ctx.fail with recovery.hint', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      getData: vi.fn().mockRejectedValue(
+        new McpError(JsonRpcErrorCode.NotFound, 'Neither the indicator nor the codes are valid.', {
+          reason: 'indicator_and_country_not_found',
+          indicatorId: 'NOT.A.REAL.CODE',
+          countryCodes: 'ZZZ',
+        }),
+      ),
+    } as never);
+
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const ctx = createMockContext({ errors: worldbankGetData.errors });
+    const input = worldbankGetData.input.parse({
+      indicator_id: 'NOT.A.REAL.CODE',
+      countries: 'ZZZ',
+    });
+    const err = await worldbankGetData.handler(input, ctx).catch((e: unknown) => e);
+    expect(err).toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: {
+        reason: 'indicator_and_country_not_found',
+        recovery: { hint: expect.stringContaining('worldbank_list_countries') },
+      },
+    });
+    expect((err as McpError).data?.recovery).toMatchObject({
+      hint: expect.stringContaining('worldbank_search_indicators'),
+    });
+  });
+
+  it('notices that a dropped date_range matched nothing', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      getData: vi.fn().mockResolvedValue({
+        data: [],
+        indicator: { id: 'SP.POP.TOTL', name: 'Population, total' },
+        total: 0,
+        page: 1,
+        pages: 1,
+        nullCount: 0,
+        dateFilterDropped: true,
+      }),
+    } as never);
+
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const ctx = createMockContext({ errors: worldbankGetData.errors });
+    const input = worldbankGetData.input.parse({
+      indicator_id: 'SP.POP.TOTL',
+      countries: 'KEN',
+      date_range: '1850:1900',
+    });
+    const result = await worldbankGetData.handler(input, ctx);
+    expect(result.data).toHaveLength(0);
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment.notice).toContain('1850:1900');
+    expect(enrichment.notice).toContain('outside');
+  });
+
   it('returns empty data (no throw) when service returns no observations', async () => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
     vi.mocked(getWorldBankApiService).mockReturnValue({
@@ -331,16 +395,16 @@ describe('worldbankGetData', () => {
     ).toThrow();
   });
 
-  it('rejects mrv above maximum (11)', async () => {
+  it('rejects mrv above maximum (101)', async () => {
     const { worldbankGetData } = await import(
       '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
     );
     expect(() =>
-      worldbankGetData.input.parse({ indicator_id: 'NY.GDP.PCAP.CD', countries: 'US', mrv: 11 }),
+      worldbankGetData.input.parse({ indicator_id: 'NY.GDP.PCAP.CD', countries: 'US', mrv: 101 }),
     ).toThrow();
   });
 
-  it('accepts mrv at boundary values 1 and 10', async () => {
+  it('accepts mrv at boundary values 1 and 100', async () => {
     const { worldbankGetData } = await import(
       '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
     );
@@ -348,7 +412,99 @@ describe('worldbankGetData', () => {
       worldbankGetData.input.parse({ indicator_id: 'NY.GDP.PCAP.CD', countries: 'US', mrv: 1 }),
     ).not.toThrow();
     expect(() =>
-      worldbankGetData.input.parse({ indicator_id: 'NY.GDP.PCAP.CD', countries: 'US', mrv: 10 }),
+      worldbankGetData.input.parse({ indicator_id: 'NY.GDP.PCAP.CD', countries: 'US', mrv: 100 }),
+    ).not.toThrow();
+  });
+
+  it('forwards an mrv above the former ceiling of 10 to the service', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    const getDataMock = vi.fn().mockResolvedValue(mockDataResult);
+    vi.mocked(getWorldBankApiService).mockReturnValue({ getData: getDataMock } as never);
+
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const ctx = createMockContext({ errors: worldbankGetData.errors });
+    const input = worldbankGetData.input.parse({
+      indicator_id: 'SP.POP.TOTL',
+      countries: 'KEN',
+      mrv: 60,
+    });
+    await worldbankGetData.handler(input, ctx);
+    expect(getDataMock.mock.calls[0][0].mrv).toBe(60);
+  });
+
+  it.each([[[]], [['']], [['  ']], [''], ['   '], [' ; ']])(
+    'rejects an empty countries value: %j',
+    async (countries) => {
+      const { worldbankGetData } = await import(
+        '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+      );
+      expect(() =>
+        worldbankGetData.input.parse({ indicator_id: 'SP.POP.TOTL', countries }),
+      ).toThrow();
+    },
+  );
+
+  it('still accepts a populated countries value', async () => {
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    for (const countries of ['US', 'all', ['US', 'DE']]) {
+      expect(() =>
+        worldbankGetData.input.parse({ indicator_id: 'SP.POP.TOTL', countries }),
+      ).not.toThrow();
+    }
+  });
+
+  it.each([
+    '2020/2023',
+    '20-2023',
+    '202',
+    '2020:202',
+    'last five years',
+    '2030:2020',
+    '2021Q4:2020Q1',
+    '2020Q5',
+    '2020M13',
+    '2020M3', // upstream rejects an unpadded month
+    '2020Q1:2021', // upstream rejects a range mixing period types
+    '2020:2021Q4',
+  ])('rejects a malformed date_range: %s', async (date_range) => {
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    expect(() =>
+      worldbankGetData.input.parse({
+        indicator_id: 'SP.POP.TOTL',
+        countries: 'US',
+        date_range,
+      }),
+    ).toThrow();
+  });
+
+  it.each([
+    '2020',
+    '2010:2023',
+    '  2010:2023  ',
+    '',
+    '   ',
+    '2020Q1',
+    '2020q1',
+    '2020Q1:2021Q4',
+    '2020M03',
+    '2020m03',
+    '2020M01:2020M06',
+  ])('accepts a well-formed date_range: %j', async (date_range) => {
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    expect(() =>
+      worldbankGetData.input.parse({
+        indicator_id: 'SP.POP.TOTL',
+        countries: 'US',
+        date_range,
+      }),
     ).not.toThrow();
   });
 

@@ -21,7 +21,7 @@ const ServerConfigSchema = z.object({
     .min(0)
     .default(3_600_000)
     .describe(
-      'Lifetime in ms of the in-process indicator-catalog cache used by keyword-only search. 0 disables caching.',
+      'Lifetime in ms of the in-process reference caches: the indicator catalog behind keyword-only search and the aggregate-code set behind isAggregate. 0 disables caching.',
     ),
 });
 

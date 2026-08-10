@@ -61,6 +61,33 @@ function rawCountry(id: string, name: string, aggregate = false) {
   };
 }
 
+/**
+ * Aggregate entity as the country listing returns it: an aggregate code in `id`
+ * and an unrelated ISO2 in `iso2Code` (`AFE`/`ZH`), which is the pairing the data
+ * endpoint splits across `countryiso3code` and `country.id`.
+ */
+function rawAggregate(id: string, iso2Code: string, name: string) {
+  return { ...rawCountry(id, name, true), iso2Code };
+}
+
+/** One raw observation from the data endpoint. */
+function rawDataPoint(
+  countryId: string,
+  iso3: string,
+  countryName: string,
+  date: string,
+  value: number | null = 1,
+) {
+  return {
+    indicator: { id: 'SP.POP.TOTL', value: 'Population, total' },
+    country: { id: countryId, value: countryName },
+    countryiso3code: iso3,
+    date,
+    value,
+    obs_status: '',
+  };
+}
+
 /** The WB "invalid parameter value" body, returned with HTTP 200. */
 const WB_ERROR_BODY = [
   {
@@ -81,6 +108,22 @@ describe('WorldBankApiService', () => {
   /** Queue one upstream JSON response on the fetch mock. */
   function mockResponse(body: unknown) {
     fetchWithTimeoutMock.mockResolvedValueOnce({ text: async () => JSON.stringify(body) });
+  }
+
+  /**
+   * Queue the `/country` listing `getData` consults to classify aggregates. It is
+   * fetched after the data response, so queue it after the matching mockResponse.
+   */
+  function mockAggregateLookup() {
+    mockResponse([
+      pagingObj({ total: 4 }),
+      [
+        rawCountry('USA', 'United States'),
+        rawAggregate('AFE', 'ZH', 'Africa Eastern and Southern'),
+        rawAggregate('WLD', '1W', 'World'),
+        rawAggregate('EUU', 'EU', 'European Union'),
+      ],
+    ]);
   }
 
   beforeEach(async () => {
@@ -905,6 +948,7 @@ describe('WorldBankApiService', () => {
           ],
         ]),
     });
+    mockAggregateLookup();
     const ctx = createMockContext();
     const result = await service.getData(
       { indicatorId: 'NY.GDP.PCAP.CD', countries: ['US', 'CN', 'AF'], page: 1, perPage: 50 },
@@ -916,55 +960,105 @@ describe('WorldBankApiService', () => {
     expect(result.total).toBe(3);
   });
 
-  it('getData: classifies known aggregate codes as isAggregate=true', async () => {
-    fetchWithTimeoutMock.mockResolvedValueOnce({
-      text: async () =>
-        JSON.stringify([
-          pagingObj({ total: 1 }),
-          [
-            {
-              indicator: { id: 'NY.GDP.PCAP.CD', value: 'GDP per capita' },
-              country: { id: 'ZH', value: 'Africa Eastern and Southern' },
-              countryiso3code: 'AFE',
-              date: '2022',
-              value: 1500,
-              obs_status: '',
-            },
-          ],
-        ]),
-    });
+  it('getData: classifies aggregates from the country listing, not a code list', async () => {
+    mockResponse([
+      pagingObj({ total: 4 }),
+      [
+        // ISO2 in country.id, aggregate code in countryiso3code — both must resolve.
+        rawDataPoint('ZH', 'AFE', 'Africa Eastern and Southern', '2022'),
+        rawDataPoint('1W', 'WLD', 'World', '2022'),
+        // EUU sits outside the 33 codes the service used to hardcode.
+        rawDataPoint('EU', 'EUU', 'European Union', '2022'),
+        rawDataPoint('US', 'USA', 'United States', '2022'),
+      ],
+    ]);
+    mockAggregateLookup();
     const ctx = createMockContext();
     const result = await service.getData(
-      { indicatorId: 'NY.GDP.PCAP.CD', countries: 'AFE', page: 1, perPage: 50 },
+      {
+        indicatorId: 'SP.POP.TOTL',
+        countries: ['AFE', 'WLD', 'EUU', 'US'],
+        page: 1,
+        perPage: 50,
+      },
       ctx,
     );
-    expect(result.data[0].isAggregate).toBe(true);
-    expect(result.data[0].countryIso3).toBe('AFE');
+    expect(result.data.map((d) => [d.countryIso3, d.isAggregate])).toEqual([
+      ['AFE', true],
+      ['WLD', true],
+      ['EUU', true],
+      ['USA', false],
+    ]);
   });
 
-  it('getData: classifies WLD as isAggregate=true', async () => {
-    fetchWithTimeoutMock.mockResolvedValueOnce({
-      text: async () =>
-        JSON.stringify([
-          pagingObj({ total: 1 }),
-          [
-            {
-              indicator: { id: 'NY.GDP.PCAP.CD', value: 'GDP per capita' },
-              country: { id: '1W', value: 'World' },
-              countryiso3code: 'WLD',
-              date: '2022',
-              value: 12000,
-              obs_status: '',
-            },
-          ],
-        ]),
-    });
+  it('getData: classifies an aggregate whose data rows carry no ISO3 code', async () => {
+    // The income-group aggregates come back with an empty countryiso3code, so
+    // their ISO2 in country.id is the only identifier available to place them.
+    mockResponse([pagingObj({ total: 1 }), [rawDataPoint('XD', '', 'High income', '2022')]]);
+    mockResponse([
+      pagingObj({ total: 2 }),
+      [rawCountry('USA', 'United States'), rawAggregate('HIC', 'XD', 'High income')],
+    ]);
     const ctx = createMockContext();
     const result = await service.getData(
-      { indicatorId: 'NY.GDP.PCAP.CD', countries: 'WLD', page: 1, perPage: 50 },
+      { indicatorId: 'SP.POP.TOTL', countries: 'HIC', page: 1, perPage: 50 },
       ctx,
     );
-    expect(result.data[0].isAggregate).toBe(true);
+    expect(result.data[0]).toMatchObject({ countryCode: 'XD', countryIso3: '', isAggregate: true });
+  });
+
+  it('getData: refetches the aggregate lookup once its TTL lapses', async () => {
+    const { getServerConfig } = await import('@/config/server-config.js');
+    vi.mocked(getServerConfig).mockReturnValue({
+      apiBaseUrl: 'https://api.worldbank.org/v2',
+      defaultPerPage: 50,
+      catalogCacheTtlMs: 60_000,
+    } as never);
+    const { WorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    const shortLived = new WorldBankApiService(makeConfig() as never, createInMemoryStorage());
+
+    vi.useFakeTimers();
+    try {
+      const row = [pagingObj({ total: 1 }), [rawDataPoint('EU', 'EUU', 'European Union', '2022')]];
+      mockResponse(row);
+      mockAggregateLookup();
+      mockResponse(row);
+      mockAggregateLookup();
+      const ctx = createMockContext();
+      await shortLived.getData(
+        { indicatorId: 'SP.POP.TOTL', countries: 'EUU', page: 1, perPage: 50 },
+        ctx,
+      );
+      vi.setSystemTime(Date.now() + 60_001);
+      const second = await shortLived.getData(
+        { indicatorId: 'SP.POP.TOTL', countries: 'EUU', page: 1, perPage: 50 },
+        ctx,
+      );
+      expect(second.data[0].isAggregate).toBe(true);
+      // Two data requests and two country listings — the stale set was not reused.
+      expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(4);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('getData: reuses the cached aggregate lookup across calls', async () => {
+    mockResponse([pagingObj({ total: 1 }), [rawDataPoint('EU', 'EUU', 'European Union', '2022')]]);
+    mockAggregateLookup();
+    mockResponse([pagingObj({ total: 1 }), [rawDataPoint('EU', 'EUU', 'European Union', '2021')]]);
+    const ctx = createMockContext();
+    const first = await service.getData(
+      { indicatorId: 'SP.POP.TOTL', countries: 'EUU', page: 1, perPage: 50 },
+      ctx,
+    );
+    const second = await service.getData(
+      { indicatorId: 'SP.POP.TOTL', countries: 'EUU', page: 1, perPage: 50 },
+      ctx,
+    );
+    expect(first.data[0].isAggregate).toBe(true);
+    expect(second.data[0].isAggregate).toBe(true);
+    // Two data requests plus one country listing — the listing is not refetched.
+    expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(3);
   });
 
   it('getData: returns empty data (no throw) when items array is empty', async () => {
@@ -982,119 +1076,265 @@ describe('WorldBankApiService', () => {
     expect(result.indicator.id).toBe('NY.GDP.PCAP.CD');
   });
 
-  it('getData: throws indicator_not_found for WB-format indicator ID on WbErrorEnvelope', async () => {
-    fetchWithTimeoutMock.mockResolvedValueOnce({
-      text: async () =>
-        JSON.stringify([
-          { message: [{ id: '120', key: 'Invalid indicator', value: 'Not found' }] },
-        ]),
-    });
+  /**
+   * Upstream emits one message per rejected path segment and never names which,
+   * so classification comes from the message count plus an indicator lookup —
+   * never from the shape of the caller's own indicator_id.
+   */
+  it('getData: throws indicator_not_found when the indicator lookup comes back empty', async () => {
+    mockResponse(WB_ERROR_BODY);
+    mockResponse(WB_ERROR_BODY); // /indicator/{id} rejects it too
     const ctx = createMockContext();
     await expect(
       service.getData({ indicatorId: 'NY.INVALID.CD', countries: 'US', page: 1, perPage: 50 }, ctx),
-    ).rejects.toMatchObject({
-      data: { reason: 'indicator_not_found' },
-    });
+    ).rejects.toMatchObject({ data: { reason: 'indicator_not_found' } });
   });
 
-  it('getData: throws country_not_found for non-WB-format indicator on WbErrorEnvelope', async () => {
-    fetchWithTimeoutMock.mockResolvedValueOnce({
-      text: async () =>
-        JSON.stringify([{ message: [{ id: '120', key: 'Invalid country', value: 'Not found' }] }]),
-    });
+  it('getData: throws country_not_found when the indicator resolves', async () => {
+    mockResponse(WB_ERROR_BODY);
+    mockResponse([pagingObj(), [rawIndicator('SP.POP.TOTL', 'Population, total')]]);
     const ctx = createMockContext();
-    // Lowercase indicator ID doesn't match /^[A-Z]{2}\.[A-Z.]+$/ → country_not_found
     await expect(
-      service.getData({ indicatorId: 'invalid_id', countries: 'ZZ', page: 1, perPage: 50 }, ctx),
-    ).rejects.toMatchObject({
-      data: { reason: 'country_not_found' },
-    });
+      service.getData({ indicatorId: 'SP.POP.TOTL', countries: 'ZZ', page: 1, perPage: 50 }, ctx),
+    ).rejects.toMatchObject({ data: { reason: 'country_not_found' } });
   });
 
-  it('getData: joins array of country codes with semicolon in URL', async () => {
-    fetchWithTimeoutMock.mockResolvedValueOnce({
-      text: async () =>
-        JSON.stringify([
-          pagingObj({ total: 2 }),
-          [
-            {
-              indicator: { id: 'SP.POP.TOTL', value: 'Population' },
-              country: { id: 'US', value: 'United States' },
-              countryiso3code: 'USA',
-              date: '2022',
-              value: 330000000,
-              obs_status: '',
-            },
-            {
-              indicator: { id: 'SP.POP.TOTL', value: 'Population' },
-              country: { id: 'DE', value: 'Germany' },
-              countryiso3code: 'DEU',
-              date: '2022',
-              value: 83000000,
-              obs_status: '',
-            },
-          ],
-        ]),
-    });
+  it('getData: blames a malformed indicator ID regardless of its casing', async () => {
+    // Casing used to decide the reason: an ID failing /^[A-Z]{2}\.[A-Z.]+$/ was
+    // blamed on the country. Only the upstream lookup decides now.
+    mockResponse(WB_ERROR_BODY);
+    mockResponse(WB_ERROR_BODY); // /indicator/invalid_id rejects it
     const ctx = createMockContext();
-    await service.getData(
+    await expect(
+      service.getData({ indicatorId: 'invalid_id', countries: 'US', page: 1, perPage: 50 }, ctx),
+    ).rejects.toMatchObject({ data: { reason: 'indicator_not_found' } });
+  });
+
+  it('getData: throws indicator_and_country_not_found on a two-message envelope', async () => {
+    mockResponse([
+      {
+        message: [
+          { id: '120', key: 'Invalid value', value: 'The provided parameter value is not valid' },
+          { id: '120', key: 'Invalid value', value: 'The provided parameter value is not valid' },
+        ],
+      },
+    ]);
+    const ctx = createMockContext();
+    await expect(
+      service.getData(
+        { indicatorId: 'NOT.A.REAL.CODE', countries: 'ZZZ', page: 1, perPage: 50 },
+        ctx,
+      ),
+    ).rejects.toMatchObject({ data: { reason: 'indicator_and_country_not_found' } });
+    // Two bad segments are self-evident — no disambiguating lookup is spent.
+    expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(1);
+  });
+
+  // ─── getData: requested date window ───────────────────────────────────────
+
+  it('getData: reports no observations when upstream ignores a zero-overlap date_range', async () => {
+    // Upstream discards a non-overlapping filter and returns the whole series.
+    const series = [
+      rawDataPoint('KE', 'KEN', 'Kenya', '2025', 57532493),
+      rawDataPoint('KE', 'KEN', 'Kenya', '2024', 56432944),
+    ];
+    mockResponse([pagingObj({ total: 66, pages: 14 }), series]);
+    mockResponse([pagingObj({ total: 66, pages: 1 }), series]); // exhaustive re-read
+    const ctx = createMockContext();
+    const result = await service.getData(
+      {
+        indicatorId: 'SP.POP.TOTL',
+        countries: 'KEN',
+        dateRange: '1850:1900',
+        page: 1,
+        perPage: 50,
+      },
+      ctx,
+    );
+    expect(result.data).toEqual([]);
+    expect(result.total).toBe(0);
+    expect(result.pages).toBe(1);
+    expect(result.dateFilterDropped).toBe(true);
+    expect(result.indicator).toMatchObject({ id: 'SP.POP.TOTL', name: 'Population, total' });
+    // No aggregate listing is fetched for an empty result.
+    expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('getData: returns every row of a partially-overlapping date_range', async () => {
+    mockResponse([
+      pagingObj({ total: 2 }),
+      [
+        rawDataPoint('KE', 'KEN', 'Kenya', '1961', 7987770),
+        rawDataPoint('KE', 'KEN', 'Kenya', '1960', 7695307),
+      ],
+    ]);
+    mockAggregateLookup();
+    const ctx = createMockContext();
+    const result = await service.getData(
+      {
+        indicatorId: 'SP.POP.TOTL',
+        countries: 'KEN',
+        dateRange: '1950:1965',
+        page: 1,
+        perPage: 50,
+      },
+      ctx,
+    );
+    expect(result.data.map((d) => d.date)).toEqual(['1961', '1960']);
+    expect(result.total).toBe(2);
+    expect(result.dateFilterDropped).toBe(false);
+  });
+
+  /**
+   * A year window is finer than upstream applies to a quarterly series: it
+   * discards the filter and pages the whole series newest-first, so the matches
+   * sit past page 1 and upstream's totals describe the unfiltered series.
+   */
+  const QUARTERS = ['2023Q1', '2022Q4', '2021Q3', '2021Q1', '2020Q2'];
+
+  function mockDroppedQuarterlySeries(firstPage: string[]) {
+    const rows = QUARTERS.map((date) => rawDataPoint('US', 'USA', 'United States', date, 1));
+    mockResponse([
+      pagingObj({ total: 5, pages: 3 }),
+      rows.filter((r) => firstPage.includes(r.date)),
+    ]);
+    mockResponse([pagingObj({ total: 5, pages: 1 }), rows]); // exhaustive re-read
+  }
+
+  it('getData: recovers in-window observations upstream dropped past the first page', async () => {
+    mockDroppedQuarterlySeries(['2023Q1', '2022Q4']);
+    mockAggregateLookup();
+    const ctx = createMockContext();
+    const result = await service.getData(
+      { indicatorId: 'SP.POP.TOTL', countries: 'US', dateRange: '2020:2021', page: 1, perPage: 2 },
+      ctx,
+    );
+    expect(result.data.map((d) => d.date)).toEqual(['2021Q3', '2021Q1']);
+    expect(result.total).toBe(3);
+    expect(result.pages).toBe(2);
+    expect(result.dateFilterDropped).toBe(true);
+  });
+
+  it('getData: paginates the matched window, not the series upstream returned', async () => {
+    mockDroppedQuarterlySeries(['2021Q3', '2021Q1']);
+    mockAggregateLookup();
+    const ctx = createMockContext();
+    const result = await service.getData(
+      { indicatorId: 'SP.POP.TOTL', countries: 'US', dateRange: '2020:2021', page: 2, perPage: 2 },
+      ctx,
+    );
+    expect(result.data.map((d) => d.date)).toEqual(['2020Q2']);
+    expect(result.total).toBe(3);
+    expect(result.page).toBe(2);
+    expect(result.pages).toBe(2);
+  });
+
+  it.each([
+    ['2020Q2', ['2020Q2'], ['2020Q1', '2020Q3']],
+    ['2020Q2:2020Q3', ['2020Q2', '2020Q3'], ['2020Q1', '2020Q4']],
+    ['2020M04', ['2020M04'], ['2020M03', '2020M05']],
+    ['2020M12', ['2020Q4'], ['2021Q1']],
+    ['2020M01', ['2020Q1'], ['2019Q4']],
+    ['2020', ['2020Q4', '2020M01'], ['2019Q4', '2021M01']],
+  ])(
+    'getData: matches window %s against its own period boundaries',
+    async (dateRange, inside, outside) => {
+      const rows = [...inside, ...outside].map((date) =>
+        rawDataPoint('US', 'USA', 'United States', date, 1),
+      );
+      // Upstream ignores a window it can't apply and hands back the whole series.
+      mockResponse([pagingObj({ total: rows.length, pages: 2 }), rows]);
+      mockResponse([pagingObj({ total: rows.length, pages: 1 }), rows]);
+      mockAggregateLookup();
+      const ctx = createMockContext();
+      const result = await service.getData(
+        { indicatorId: 'SP.POP.TOTL', countries: 'US', dateRange, page: 1, perPage: 50 },
+        ctx,
+      );
+      expect(result.data.map((d) => d.date).sort()).toEqual([...inside].sort());
+      expect(result.dateFilterDropped).toBe(true);
+    },
+  );
+
+  it.each([
+    ['2020Q1:2021Q4', ['2021Q4', '2020Q1']],
+    ['2020M01:2020M06', ['2020M06', '2020M01']],
+  ])('getData: leaves an honored %s window untouched', async (dateRange, dates) => {
+    mockResponse([
+      pagingObj({ total: 2 }),
+      dates.map((date) => rawDataPoint('US', 'USA', 'United States', date, 1)),
+    ]);
+    mockAggregateLookup();
+    const ctx = createMockContext();
+    const result = await service.getData(
+      { indicatorId: 'SP.POP.TOTL', countries: 'US', dateRange, page: 1, perPage: 50 },
+      ctx,
+    );
+    expect(result.data.map((d) => d.date)).toEqual(dates);
+    expect(result.dateFilterDropped).toBe(false);
+    // Honored window on one page: the data request and the aggregate listing only.
+    expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('getData: joins array of country codes with semicolon and returns every one', async () => {
+    mockResponse([
+      pagingObj({ total: 2 }),
+      [
+        rawDataPoint('US', 'USA', 'United States', '2022', 330000000),
+        rawDataPoint('DE', 'DEU', 'Germany', '2022', 83000000),
+      ],
+    ]);
+    mockAggregateLookup();
+    const ctx = createMockContext();
+    const result = await service.getData(
       { indicatorId: 'SP.POP.TOTL', countries: ['US', 'DE'], page: 1, perPage: 50 },
       ctx,
     );
+    expect(result.data.map((d) => d.countryIso3)).toEqual(['USA', 'DEU']);
     const url = fetchWithTimeoutMock.mock.calls[0][0] as string;
     expect(url).toContain('US%3BDE'); // URL-encoded semicolon
   });
 
   it('getData: includes date param when dateRange provided', async () => {
-    fetchWithTimeoutMock.mockResolvedValueOnce({
-      text: async () =>
-        JSON.stringify([
-          pagingObj(),
-          [
-            {
-              indicator: { id: 'SP.POP.TOTL', value: 'Population' },
-              country: { id: 'US', value: 'United States' },
-              countryiso3code: 'USA',
-              date: '2020',
-              value: 329000000,
-              obs_status: '',
-            },
-          ],
-        ]),
-    });
+    mockResponse([pagingObj(), [rawDataPoint('US', 'USA', 'United States', '2020', 329000000)]]);
+    mockAggregateLookup();
     const ctx = createMockContext();
-    await service.getData(
+    const result = await service.getData(
       { indicatorId: 'SP.POP.TOTL', countries: 'US', dateRange: '2020:2022', page: 1, perPage: 50 },
       ctx,
     );
+    expect(result.data.map((d) => d.date)).toEqual(['2020']);
     const url = fetchWithTimeoutMock.mock.calls[0][0] as string;
     expect(url).toContain('date=2020%3A2022');
   });
 
   it('getData: includes mrv param when provided', async () => {
-    fetchWithTimeoutMock.mockResolvedValueOnce({
-      text: async () =>
-        JSON.stringify([
-          pagingObj(),
-          [
-            {
-              indicator: { id: 'SP.POP.TOTL', value: 'Population' },
-              country: { id: 'US', value: 'United States' },
-              countryiso3code: 'USA',
-              date: '2022',
-              value: 329000000,
-              obs_status: '',
-            },
-          ],
-        ]),
-    });
+    mockResponse([pagingObj(), [rawDataPoint('US', 'USA', 'United States', '2022', 329000000)]]);
+    mockAggregateLookup();
     const ctx = createMockContext();
-    await service.getData(
+    const result = await service.getData(
       { indicatorId: 'SP.POP.TOTL', countries: 'US', mrv: 3, page: 1, perPage: 50 },
       ctx,
     );
+    expect(result.data).toHaveLength(1);
     const url = fetchWithTimeoutMock.mock.calls[0][0] as string;
     expect(url).toContain('mrv=3');
+  });
+
+  it('getData: forwards an mrv above the former ceiling of 10', async () => {
+    mockResponse([
+      pagingObj({ total: 60, pages: 2 }),
+      [rawDataPoint('KE', 'KEN', 'Kenya', '2025', 57532493)],
+    ]);
+    mockAggregateLookup();
+    const ctx = createMockContext();
+    const result = await service.getData(
+      { indicatorId: 'SP.POP.TOTL', countries: 'KEN', mrv: 60, page: 1, perPage: 50 },
+      ctx,
+    );
+    expect(result.total).toBe(60);
+    expect(result.pages).toBe(2);
+    expect(fetchWithTimeoutMock.mock.calls[0][0] as string).toContain('mrv=60');
   });
 
   it('getData: preserves obsStatus in normalized data point', async () => {
@@ -1114,6 +1354,7 @@ describe('WorldBankApiService', () => {
           ],
         ]),
     });
+    mockAggregateLookup();
     const ctx = createMockContext();
     const result = await service.getData(
       { indicatorId: 'NY.GDP.PCAP.CD', countries: 'US', page: 1, perPage: 50 },

@@ -1,9 +1,11 @@
 /**
  * @fileoverview World Bank Indicators API v2 service. Wraps all endpoint categories
  * (indicators, countries, data, topics, sources) with typed fetch methods,
- * retry/timeout, and sparse-payload normalization. Keyword indicator search and
- * aggregate-free country listing are computed locally over an exhaustively
- * fetched candidate set, since the API offers neither server-side.
+ * retry/timeout, and sparse-payload normalization. Keyword indicator search,
+ * aggregate-free country listing, aggregate classification of data rows, and
+ * verification of the requested date window are computed locally over
+ * exhaustively fetched candidate sets, since the API offers none of them
+ * server-side.
  * @module services/worldbank/worldbank-service
  */
 
@@ -119,9 +121,54 @@ function normalizeDataPoint(raw: RawDataPoint, aggregateCodes: Set<string>): Dat
     value: raw.value ?? null,
     obsStatus: raw.obs_status ?? '',
     // Data endpoint returns country.id as ISO2 (e.g. "ZH" for AFE), but
-    // countryiso3code carries the aggregate code (e.g. "AFE"). Check both.
+    // countryiso3code carries the aggregate code (e.g. "AFE"). Check both;
+    // aggregateCodes holds both identifiers for every aggregate.
     isAggregate: aggregateCodes.has(raw.countryiso3code ?? '') || aggregateCodes.has(countryCode),
   };
+}
+
+// ─── Date-range verification ─────────────────────────────────────────────────
+
+/** An inclusive span of calendar months, each numbered `year * 12 + monthIndex`. */
+type MonthSpan = { start: number; end: number };
+
+/**
+ * Expand one World Bank period token into the months it covers: `2020` is the
+ * whole year, `2020Q2` is April–June, `2020M03` is March alone. Anything else
+ * yields `undefined` — the tool's schema is the validator for the input's shape,
+ * and an observation whose date can't be placed is kept rather than discarded.
+ */
+function monthSpan(token: string): MonthSpan | undefined {
+  const match = /^(\d{4})(?:([QMqm])(\d{1,2}))?$/.exec(token.trim());
+  if (!match) return;
+  const firstMonth = Number(match[1]) * 12;
+  if (!match[2]) return { start: firstMonth, end: firstMonth + 11 };
+
+  const ordinal = Number(match[3]);
+  if (match[2].toUpperCase() === 'Q') {
+    if (ordinal < 1 || ordinal > 4) return;
+    return { start: firstMonth + (ordinal - 1) * 3, end: firstMonth + ordinal * 3 - 1 };
+  }
+  if (ordinal < 1 || ordinal > 12) return;
+  return { start: firstMonth + ordinal - 1, end: firstMonth + ordinal - 1 };
+}
+
+/** Parse the requested `date` filter into the span of months it asks for. */
+function parseDateWindow(dateRange: string | undefined): MonthSpan | undefined {
+  if (!dateRange) return;
+  const [startToken, endToken, ...rest] = dateRange.trim().split(':');
+  if (rest.length > 0 || startToken === undefined) return;
+  const start = monthSpan(startToken);
+  const end = endToken === undefined ? start : monthSpan(endToken);
+  if (!start || !end || start.start > end.end) return;
+  return { start: start.start, end: end.end };
+}
+
+/** True when an observation's own period overlaps the requested window. */
+function isWithinWindow(date: string, window: MonthSpan): boolean {
+  const span = monthSpan(date);
+  if (!span) return true;
+  return span.start <= window.end && span.end >= window.start;
 }
 
 function normalizeTopic(raw: RawTopic): Topic {
@@ -226,6 +273,15 @@ export class WorldBankApiService {
 
   /** In-flight catalog fetch, shared so concurrent searches trigger one request. */
   private catalogInFlight: Promise<Indicator[]> | undefined;
+
+  /**
+   * Cached identifiers of every World Bank aggregate entity, used to classify
+   * data rows. Same instance-scoped, TTL'd shape as {@link catalogCache}.
+   */
+  private aggregateCodesCache: { codes: Set<string>; expiresAt: number } | undefined;
+
+  /** In-flight aggregate-code fetch, shared so concurrent queries trigger one request. */
+  private aggregateCodesInFlight: Promise<Set<string>> | undefined;
 
   constructor(_config: AppConfig, _storage: StorageService) {
     const serverConfig = getServerConfig();
@@ -459,6 +515,22 @@ export class WorldBankApiService {
     return normalizeIndicatorDetail(items[0] as RawIndicator);
   }
 
+  /**
+   * Resolve whether an indicator ID exists. Called only from the data endpoint's
+   * error path: its envelope proves a path segment was rejected but never names
+   * which one, and `/indicator/{id}` is unambiguous by construction.
+   */
+  private async indicatorExists(indicatorId: string, ctx: Context): Promise<boolean> {
+    const url = this.buildUrl(`/indicator/${encodeURIComponent(indicatorId)}`);
+    ctx.log.debug('Resolving which parameter upstream rejected', { indicatorId, url });
+
+    const data = await this.fetchWithRetry<WbEnvelope<RawIndicator> | WbErrorEnvelope>(url, ctx);
+    if (isWbErrorEnvelope(data)) return false;
+
+    const [, items] = data as WbEnvelope<RawIndicator>;
+    return Boolean(items?.length);
+  }
+
   // ─── Countries ───────────────────────────────────────────────────────────
 
   async listCountries(
@@ -544,6 +616,45 @@ export class WorldBankApiService {
     return normalizeCountry(items[0] as RawCountry);
   }
 
+  /**
+   * Load and cache the identifiers of every aggregate entity. The data endpoint's
+   * rows carry no `region`/`incomeLevel` field, so an observation can only be
+   * classified by looking its code up in the country listing — the same
+   * `region.id === "NA"` rule {@link normalizeCountry} applies, which keeps the
+   * data tool in agreement with the country tools by construction.
+   *
+   * Both identifiers go in the set: a data row names an aggregate by ISO2 in
+   * `country.id` (`ZH`) and by its aggregate code in `countryiso3code` (`AFE`).
+   */
+  private loadAggregateCodes(ctx: Context): Promise<Set<string>> {
+    const cached = this.aggregateCodesCache;
+    if (cached && cached.expiresAt > Date.now()) return Promise.resolve(cached.codes);
+
+    this.aggregateCodesInFlight ??= this.fetchAllPages<RawCountry>('/country', {}, ctx, () => {
+      throw serviceUnavailable(
+        'World Bank returned an error response for the country listing used to classify aggregates.',
+      );
+    })
+      .then((raw) => {
+        const codes = new Set<string>();
+        for (const country of raw) {
+          if (!normalizeCountry(country).isAggregate) continue;
+          if (country.id) codes.add(country.id);
+          if (country.iso2Code) codes.add(country.iso2Code);
+        }
+        if (this.catalogCacheTtlMs > 0) {
+          this.aggregateCodesCache = { codes, expiresAt: Date.now() + this.catalogCacheTtlMs };
+        }
+        ctx.log.debug('Aggregate code set loaded', { count: codes.size });
+        return codes;
+      })
+      .finally(() => {
+        this.aggregateCodesInFlight = undefined;
+      });
+
+    return this.aggregateCodesInFlight;
+  }
+
   // ─── Data ─────────────────────────────────────────────────────────────────
 
   async getData(
@@ -563,39 +674,47 @@ export class WorldBankApiService {
     page: number;
     pages: number;
     nullCount: number;
+    dateFilterDropped: boolean;
   }> {
     const { indicatorId, countries, dateRange, mrv, page, perPage } = opts;
 
     const countryCodes = Array.isArray(countries) ? countries.join(';') : countries;
 
-    const params: Record<string, string | number | undefined> = { page, per_page: perPage };
-    if (dateRange) params.date = dateRange;
-    if (mrv !== undefined) params.mrv = mrv;
+    const scope: Record<string, string | number | undefined> = {};
+    if (dateRange) scope.date = dateRange;
+    if (mrv !== undefined) scope.mrv = mrv;
 
     const path = `/country/${encodeURIComponent(countryCodes)}/indicator/${encodeURIComponent(indicatorId)}`;
-    const url = this.buildUrl(path, params);
+    const url = this.buildUrl(path, { ...scope, page, per_page: perPage });
     ctx.log.debug('Fetching data', { indicatorId, countryCodes, url });
 
     const data = await this.fetchWithRetry<WbEnvelope<RawDataPoint> | WbErrorEnvelope>(url, ctx);
 
     if (isWbErrorEnvelope(data)) {
-      // Could be invalid indicator or country — message is the same either way.
-      // The /country/{code}/indicator/{id} endpoint wraps errors in an array:
+      // The /country/{codes}/indicator/{id} endpoint wraps errors in an array:
       // [{ message: [...] }], so data itself is an array and data.message would
       // be undefined. Unwrap before accessing.
       const envelope = (Array.isArray(data) ? data[0] : data) as WbErrorEnvelope;
-      const msg = envelope.message[0]?.value ?? 'Invalid value';
-      // Try to classify by checking if the indicator ID looks like a WB code
-      const isLikelyIndicator = /^[A-Z]{2}\.[A-Z.]+$/.test(indicatorId);
-      if (isLikelyIndicator) {
+      const detail = envelope.message[0]?.value ?? 'Invalid value';
+
+      // Upstream emits one message per rejected path segment and never names
+      // which, so two entries prove both segments are bad; one entry needs a
+      // second lookup to place. The envelope text is identical in every case.
+      if (envelope.message.length > 1) {
+        throw notFound(
+          `Neither indicator "${indicatorId}" nor country code(s) "${countryCodes}" are valid. Detail: ${detail}. Use worldbank_search_indicators and worldbank_list_countries.`,
+          { reason: 'indicator_and_country_not_found', indicatorId, countryCodes, detail },
+        );
+      }
+      if (!(await this.indicatorExists(indicatorId, ctx))) {
         throw notFound(
           `Indicator "${indicatorId}" not found. Use worldbank_search_indicators to find valid IDs.`,
-          { reason: 'indicator_not_found', indicatorId, detail: msg },
+          { reason: 'indicator_not_found', indicatorId, detail },
         );
       }
       throw notFound(
-        `Invalid country code or indicator ID. Detail: ${msg}. Use worldbank_list_countries or worldbank_search_indicators.`,
-        { reason: 'country_not_found', countryCodes, indicatorId, detail: msg },
+        `Country code(s) "${countryCodes}" not valid. Detail: ${detail}. Use worldbank_list_countries to browse valid codes.`,
+        { reason: 'country_not_found', countryCodes, indicatorId, detail },
       );
     }
 
@@ -611,63 +730,74 @@ export class WorldBankApiService {
         page: paging.page ?? page,
         pages: paging.pages ?? 1,
         nullCount: 0,
+        dateFilterDropped: false,
       };
     }
 
-    // Determine aggregate codes from the data itself (region.id = "NA" detection isn't
-    // available in the data endpoint — use a known set of WB aggregate codes instead)
-    const knownAggregates = new Set([
-      'EAS',
-      'ECS',
-      'LCN',
-      'MEA',
-      'SAS',
-      'SSF',
-      'NAC',
-      'MNA',
-      'HIC',
-      'UMC',
-      'LMC',
-      'LIC',
-      'WLD',
-      '1W',
-      'OED',
-      'INX',
-      'IDA',
-      'IBD',
-      'IBT',
-      'IDB',
-      'IDX',
-      'PRE',
-      'PST',
-      'EMU',
-      'LAC',
-      'CEB',
-      'EAP',
-      'ECA',
-      'LTE',
-      'MIC',
-      'AFR',
-      'AFE',
-      'AFW',
-    ]);
-
-    const dataPoints = items.map((raw) => normalizeDataPoint(raw, knownAggregates));
-    const nullCount = dataPoints.filter((d) => d.value === null).length;
-
-    // Extract indicator metadata from the first item
     const indicatorMeta = items[0]?.indicator;
+    const indicator = { id: indicatorMeta?.id ?? indicatorId, name: indicatorMeta?.value ?? '' };
+
+    /**
+     * A date window the API can't apply — one overlapping no part of the series,
+     * or finer-grained than the series it was asked of — makes upstream discard
+     * the filter and return the whole thing, which is indistinguishable from a
+     * hit until the returned periods are checked against the ones asked for.
+     * Whether that happened can only be judged over the complete response, so a
+     * windowed query that spans more than one upstream page is re-read in full
+     * and paginated locally; otherwise in-window observations past this page are
+     * unreachable and total/pages report the series length instead of the match
+     * count.
+     */
+    const dateWindow = parseDateWindow(dateRange);
+
+    let matched = items;
+    let total = paging.total;
+    let pages = paging.pages;
+    let currentPage = paging.page ?? page;
+    let dateFilterDropped = false;
+
+    if (dateWindow) {
+      const reRead = paging.pages > 1;
+      const candidates = reRead
+        ? await this.fetchAllPages<RawDataPoint>(path, scope, ctx, () => {
+            throw serviceUnavailable(
+              'World Bank returned an error response for the observation series.',
+            );
+          })
+        : items;
+      const inWindow = candidates.filter((raw) => isWithinWindow(raw.date ?? '', dateWindow));
+      const start = (page - 1) * perPage;
+
+      matched = reRead ? inWindow.slice(start, start + perPage) : inWindow;
+      total = inWindow.length;
+      pages = Math.max(1, Math.ceil(inWindow.length / perPage));
+      currentPage = page;
+      dateFilterDropped = inWindow.length < candidates.length;
+    }
+
+    if (!matched.length) {
+      return {
+        data: [],
+        indicator,
+        total,
+        page: currentPage,
+        pages,
+        nullCount: 0,
+        dateFilterDropped,
+      };
+    }
+
+    const aggregateCodes = await this.loadAggregateCodes(ctx);
+    const dataPoints = matched.map((raw) => normalizeDataPoint(raw, aggregateCodes));
 
     return {
       data: dataPoints,
-      indicator: {
-        id: indicatorMeta?.id ?? indicatorId,
-        name: indicatorMeta?.value ?? '',
-      },
-      total: paging.total,
-      page: paging.page,
-      pages: paging.pages,
-      nullCount,
+      indicator,
+      total,
+      page: currentPage,
+      pages,
+      nullCount: dataPoints.filter((d) => d.value === null).length,
+      dateFilterDropped,
     };
   }
 }
