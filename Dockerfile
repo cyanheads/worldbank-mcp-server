@@ -4,7 +4,7 @@
 # This stage installs all dependencies (including dev), builds the TypeScript
 # source code into JavaScript, and prepares the production assets.
 # ==============================================================================
-FROM oven/bun:1.4.0 AS build
+FROM --platform=$BUILDPLATFORM oven/bun:1.4.0 AS build
 
 WORKDIR /usr/src/app
 
@@ -52,7 +52,12 @@ LABEL org.opencontainers.image.source="https://github.com/cyanheads/worldbank-mc
 COPY package.json bun.lock ./
 
 # Install only production dependencies, ignoring any lifecycle scripts (like 'prepare')
-# that are not needed in the final production image.
+# that are not needed in the final production image. `--omit=peer` drops the
+# framework's optional peer tiers (test runner, service SDKs, parsers) that Bun
+# would otherwise auto-install. Anything this server actually imports belongs in
+# its own `dependencies`, so nothing needed at runtime is lost. The OTEL step
+# below carries the same flag — without it, that install re-resolves the graph
+# and pulls every optional peer back in.
 RUN --mount=type=cache,target=/root/.bun/install/cache \
     bun install --production --omit=peer --frozen-lockfile --ignore-scripts
 
