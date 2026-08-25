@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.1](changelog/0.3.x/0.3.1.md) — 2026-08-24
+
+Adopts mcp-ts-core 0.12.3 and the MCP SDK v2 wire it brings — HTTP endpoints serve protocol revision 2026-07-28 alongside the 2025 era, tool arguments are strict, and the advertised outputSchema declares the error envelope.
+
 ## [0.3.0](changelog/0.3.x/0.3.0.md) — 2026-08-09
 
 Add worldbank_search_projects — search the World Bank lending portfolio by text, country, region, status, and board approval date (#8)

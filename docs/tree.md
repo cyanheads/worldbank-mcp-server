@@ -1,10 +1,9 @@
 # worldbank-mcp-server - Directory Structure
 
-Generated on: 2026-08-10 03:23:34
+Generated on: 2026-08-25 06:43:09
 
 ```text
 worldbank-mcp-server/
-├── .claude/
 ├── .claude-plugin/
 │   └── plugin.json
 ├── .codex-plugin/
@@ -15,6 +14,8 @@ worldbank-mcp-server/
 │   │   ├── bug_report.yml
 │   │   ├── config.yml
 │   │   └── feature_request.yml
+│   ├── CODE_OF_CONDUCT.md
+│   ├── CONTRIBUTING.md
 │   ├── FUNDING.yml
 │   └── SECURITY.md
 ├── .vscode/
@@ -189,6 +190,7 @@ worldbank-mcp-server/
 ├── .gitattributes
 ├── .gitignore
 ├── .mcpbignore
+├── AGENTS.md
 ├── biome.json
 ├── bun.lock
 ├── bunfig.toml
