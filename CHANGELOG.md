@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.4](changelog/0.3.x/0.3.4.md) — 2026-09-12
+
+Single-item lookups reject \"all\" and code lists, worldbank_search_indicators combines topic and source filters and rejects punctuation-only queries, and provider HTML is removed from indicator source notes.
+
 ## [0.3.3](changelog/0.3.x/0.3.3.md) — 2026-09-12
 
 worldbank_get_data reports archived/retired indicators by name instead of blaming valid country codes, and accepts comma- or semicolon-separated countries strings like the other tools.
