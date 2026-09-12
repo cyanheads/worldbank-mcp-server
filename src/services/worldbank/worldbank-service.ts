@@ -960,9 +960,26 @@ export class WorldBankApiService {
 
     const [paging, items] = data as WbEnvelope<RawDataPoint>;
 
-    if (!items?.length) {
-      // Return empty data — let the handler surface recovery guidance via
-      // enrichment notice so structured clients see it in ctx.enrich.notice.
+    /**
+     * A date window the API can't apply — one overlapping no part of the series,
+     * or finer-grained than the series it was asked of — makes upstream discard
+     * the filter and return the whole thing, which is indistinguishable from a
+     * hit until the returned periods are checked against the ones asked for.
+     * Whether that happened can only be judged over the complete response, so a
+     * windowed query is re-read in full and paginated locally unless the page in
+     * hand already is the whole series; otherwise in-window observations past
+     * this page are unreachable and total/pages report the series length instead
+     * of the match count.
+     *
+     * That includes a page past the end, which comes back empty: upstream's
+     * paging on it still describes whatever series it chose to serve, so only
+     * a response with nothing in it at all (`total: 0`) — or one with no window
+     * to verify — can be reported as-is. An empty page is no reason to skip the
+     * window check, or the total would depend on which page was requested.
+     */
+    const dateWindow = parseDateWindow(dateRange);
+
+    if (!items?.length && (!dateWindow || !(paging.total > 0))) {
       return {
         data: [],
         indicator: { id: indicatorId, name: '' },
@@ -974,46 +991,34 @@ export class WorldBankApiService {
       };
     }
 
-    const indicatorMeta = items[0]?.indicator;
-    const indicator = { id: indicatorMeta?.id ?? indicatorId, name: indicatorMeta?.value ?? '' };
-
-    /**
-     * A date window the API can't apply — one overlapping no part of the series,
-     * or finer-grained than the series it was asked of — makes upstream discard
-     * the filter and return the whole thing, which is indistinguishable from a
-     * hit until the returned periods are checked against the ones asked for.
-     * Whether that happened can only be judged over the complete response, so a
-     * windowed query that spans more than one upstream page is re-read in full
-     * and paginated locally; otherwise in-window observations past this page are
-     * unreachable and total/pages report the series length instead of the match
-     * count.
-     */
-    const dateWindow = parseDateWindow(dateRange);
-
-    let matched = items;
+    let matched = items ?? [];
     let total = paging.total;
     let pages = paging.pages;
     let currentPage = paging.page ?? page;
     let dateFilterDropped = false;
+    let indicatorMeta = matched[0]?.indicator;
 
     if (dateWindow) {
-      const reRead = paging.pages > 1;
-      const candidates = reRead
-        ? await this.fetchAllPages<RawDataPoint>(path, scope, ctx, () => {
+      const wholeSeriesInHand = page === 1 && paging.pages <= 1;
+      const candidates = wholeSeriesInHand
+        ? matched
+        : await this.fetchAllPages<RawDataPoint>(path, scope, ctx, () => {
             throw serviceUnavailable(
               'World Bank returned an error response for the observation series.',
             );
-          })
-        : items;
+          });
       const inWindow = candidates.filter((raw) => isWithinWindow(raw.date ?? '', dateWindow));
       const start = (page - 1) * perPage;
 
-      matched = reRead ? inWindow.slice(start, start + perPage) : inWindow;
+      matched = inWindow.slice(start, start + perPage);
       total = inWindow.length;
       pages = Math.max(1, Math.ceil(inWindow.length / perPage));
       currentPage = page;
       dateFilterDropped = inWindow.length < candidates.length;
+      indicatorMeta ??= candidates[0]?.indicator;
     }
+
+    const indicator = { id: indicatorMeta?.id ?? indicatorId, name: indicatorMeta?.value ?? '' };
 
     if (!matched.length) {
       return {

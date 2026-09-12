@@ -1,13 +1,13 @@
 /**
- * @fileoverview Tests for worldbank_search_projects — ISO2 enforcement at the
- * schema, country-code normalization and the applied-filter echo, the abstract
+ * @fileoverview Tests for worldbank_search_projects — ISO2 enforcement in the
+ * handler, country-code normalization and the applied-filter echo, the abstract
  * opt-in, the three empty-result notices the zero-hit probe distinguishes,
  * error mapping, and format() parity.
  * @module tests/tools/worldbank-search-projects.tool.test
  */
 
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@/services/projects/projects-service.js', () => ({
@@ -61,14 +61,16 @@ const sparseProject = {
 /** Stub the service with a fixed result and hand back the spy for assertions. */
 async function stubService(result: Record<string, unknown>) {
   const { getProjectsService } = await import('@/services/projects/projects-service.js');
-  const searchProjects = vi.fn().mockResolvedValue({
+  // The service echoes the page size it served; a stub that doesn't cap echoes the request.
+  const searchProjects = vi.fn().mockImplementation(async (opts: { perPage: number }) => ({
     projects: [],
     total: 0,
     page: 1,
     pages: 1,
+    perPage: opts.perPage,
     countryOnlyTotal: null,
     ...result,
-  });
+  }));
   vi.mocked(getProjectsService).mockReturnValue({ searchProjects } as never);
   return searchProjects;
 }
@@ -79,6 +81,11 @@ async function stubServiceError(code: JsonRpcErrorCode, message: string, reason:
   vi.mocked(getProjectsService).mockReturnValue({
     searchProjects: vi.fn().mockRejectedValue(new McpError(code, message, { reason })),
   } as never);
+}
+
+/** Every text block of a tool result, joined — the whole content[] surface. */
+function textOf(result: { content: Array<{ type: string; text?: string }> }) {
+  return result.content.map((block) => block.text ?? '').join('\n');
 }
 
 async function loadTool() {
@@ -110,17 +117,43 @@ describe('worldbankSearchProjects', () => {
 
   // ─── Country codes ────────────────────────────────────────────────────────
 
-  it('rejects ISO3 codes at the schema, naming the code system this API uses', async () => {
-    const tool = await loadTool();
-    const parsed = tool.input.safeParse({ countries: 'BRA' });
+  it.each([
+    ['BRA', ['BRA']],
+    [
+      ['BRA', 'IND'],
+      ['BRA', 'IND'],
+    ],
+    ['BR,IND', ['IND']],
+    ['B', ['B']],
+    ['B-', ['B-']],
+  ])(
+    'rejects countries=%j as invalid_country_code before any request, on both surfaces',
+    async (countries, invalidCodes) => {
+      const searchProjects = await stubService({ projects: [project], total: 1 });
+      const tool = await loadTool();
 
-    expect(parsed.success).toBe(false);
-    expect(JSON.stringify(parsed.error?.issues)).toMatch(/ISO2/);
-    expect(tool.input.safeParse({ countries: ['BRA', 'IND'] }).success).toBe(false);
-    expect(tool.input.safeParse({ countries: 'BR,IND' }).success).toBe(false);
-    expect(tool.input.safeParse({ countries: 'B' }).success).toBe(false);
-    expect(tool.input.safeParse({ countries: 'B-' }).success).toBe(false);
-  });
+      // Shape-valid, so the schema lets it through to the handler's code check.
+      expect(tool.input.safeParse({ countries }).success).toBe(true);
+      const result = await runToolContract(tool, { countries });
+
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ValidationError,
+          data: {
+            reason: 'invalid_country_code',
+            invalidCodes,
+            recovery: { hint: expect.stringContaining('worldbank_get_country') },
+          },
+        },
+      });
+      const text = textOf(result);
+      expect(text).toContain(`"${invalidCodes.join(', ')}"`);
+      expect(text).toMatch(/ISO2/);
+      expect(text).toMatch(/Recovery:.*worldbank_get_country/);
+      expect(searchProjects).not.toHaveBeenCalled();
+    },
+  );
 
   it('accepts the digit-bearing regional codes the portfolio files multi-country operations under', async () => {
     const tool = await loadTool();
@@ -204,6 +237,105 @@ describe('worldbankSearchProjects', () => {
     expect(sent).not.toHaveProperty('query');
     expect(sent).not.toHaveProperty('approvedFrom');
     expect(sent).not.toHaveProperty('approvedTo');
+  });
+
+  // ─── Board approval window ────────────────────────────────────────────────
+
+  it('passes a one-sided window and a single-day inclusive window through', async () => {
+    const searchProjects = await stubService({ projects: [project], total: 1 });
+    const tool = await loadTool();
+
+    await tool.handler(
+      tool.input.parse({ approved_from: '2020-01-01' }),
+      createMockContext({ errors: tool.errors }),
+    );
+    expect(searchProjects.mock.calls[0]?.[0]).toMatchObject({ approvedFrom: '2020-01-01' });
+    expect(searchProjects.mock.calls[0]?.[0]).not.toHaveProperty('approvedTo');
+
+    await tool.handler(
+      tool.input.parse({ approved_to: '2024-02-29' }),
+      createMockContext({ errors: tool.errors }),
+    );
+    expect(searchProjects.mock.calls[1]?.[0]).toMatchObject({ approvedTo: '2024-02-29' });
+
+    await tool.handler(
+      tool.input.parse({ approved_from: '2021-06-30', approved_to: '2021-06-30' }),
+      createMockContext({ errors: tool.errors }),
+    );
+    expect(searchProjects.mock.calls[2]?.[0]).toMatchObject({
+      approvedFrom: '2021-06-30',
+      approvedTo: '2021-06-30',
+    });
+  });
+
+  it.each([
+    ['approved_from', '2020-13-01'],
+    ['approved_from', '2020-00-15'],
+    ['approved_to', '0000-00-00'],
+    ['approved_from', '2020-02-30'],
+    ['approved_to', '2023-02-29'],
+    ['approved_from', '2021-04-31'],
+  ])('rejects %s=%s as invalid_date before any request, on both surfaces', async (field, value) => {
+    const searchProjects = await stubService({ projects: [project], total: 1 });
+    const tool = await loadTool();
+
+    // Shape-valid, so the schema lets it through to the handler's calendar check.
+    expect(tool.input.safeParse({ [field]: value }).success).toBe(true);
+    const result = await runToolContract(tool, { [field]: value });
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.ValidationError,
+        data: {
+          reason: 'invalid_date',
+          field,
+          value,
+          recovery: { hint: expect.stringContaining('YYYY-MM-DD') },
+        },
+      },
+    });
+    const text = textOf(result);
+    expect(text).toContain(`${field} "${value}"`);
+    expect(text).toMatch(/Recovery:.*YYYY-MM-DD/);
+    expect(searchProjects).not.toHaveBeenCalled();
+  });
+
+  it('rejects approved_from after approved_to as reversed_date_range, on both surfaces', async () => {
+    const searchProjects = await stubService({ projects: [project], total: 1 });
+    const tool = await loadTool();
+    const result = await runToolContract(tool, {
+      approved_from: '2025-01-01',
+      approved_to: '2020-01-01',
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.ValidationError,
+        data: {
+          reason: 'reversed_date_range',
+          approvedFrom: '2025-01-01',
+          approvedTo: '2020-01-01',
+          recovery: { hint: expect.stringContaining('on or before') },
+        },
+      },
+    });
+    expect(textOf(result)).toMatch(/approved_from "2025-01-01" is after approved_to "2020-01-01"/);
+    expect(textOf(result)).toMatch(/Recovery:.*on or before/);
+    expect(searchProjects).not.toHaveBeenCalled();
+  });
+
+  it('checks the calendar before the ordering, so a bad date is not reported as reversed', async () => {
+    await stubService({ projects: [project], total: 1 });
+    const tool = await loadTool();
+    const result = await runToolContract(tool, {
+      approved_from: '2025-02-30',
+      approved_to: '2020-01-01',
+    });
+    expect(result.structuredContent).toMatchObject({
+      error: { data: { reason: 'invalid_date', field: 'approved_from' } },
+    });
   });
 
   // ─── Abstract opt-in ──────────────────────────────────────────────────────
@@ -366,6 +498,84 @@ describe('worldbankSearchProjects', () => {
     expect(getEnrichment(ctx).notice).toMatch(
       /Page 900 is past the end.*18 projects span 18 pages/,
     );
+  });
+
+  // ─── Output budget ────────────────────────────────────────────────────────
+
+  it('discloses a page reduced to the abstract cap on both surfaces, with the size that continues it', async () => {
+    const searchProjects = await stubService({
+      projects: [{ ...project, abstract: 'Rehabilitation of the dam.' }],
+      total: 28_113,
+      page: 1,
+      pages: 3515,
+      perPage: 8,
+    });
+    const tool = await loadTool();
+    const result = await runToolContract(tool, { per_page: 1000, include_abstract: true });
+
+    expect(searchProjects.mock.calls[0]?.[0]).toMatchObject({
+      perPage: 1000,
+      includeAbstract: true,
+    });
+    const structured = result.structuredContent as Record<string, unknown>;
+    expect(structured).toMatchObject({
+      appliedFilters: { perPage: 8, requestedPerPage: 1000, includeAbstract: true },
+      totalCount: 28_113,
+      totalPages: 3515,
+    });
+    const notice = structured.notice as string;
+    expect(notice).toMatch(/per_page=1000 was reduced to 8/);
+    expect(notice).toMatch(/80 with include_abstract off/);
+    expect(notice).toMatch(/50 KB/);
+    expect(notice).toMatch(
+      /totalPages counts pages of 8, so page 2 with the same filters continues/,
+    );
+    expect(notice).toMatch(/Abstracts are never shortened/);
+    const text = textOf(result);
+    expect(text).toContain('per_page=8 (requested 1000)');
+    expect(text).toContain('per_page=1000 was reduced to 8');
+  });
+
+  it('holds the server default to the same cap', async () => {
+    await stubService({ projects: [project], total: 100, pages: 13, perPage: 8 });
+    const tool = await loadTool();
+    const ctx = createMockContext({ errors: tool.errors });
+    await tool.handler(tool.input.parse({ include_abstract: true }), ctx);
+
+    const enrichment = getEnrichment(ctx);
+    expect(enrichment).toMatchObject({ appliedFilters: { perPage: 8, requestedPerPage: 50 } });
+    expect(enrichment.notice).toMatch(/per_page=50 was reduced to 8/);
+  });
+
+  it('keeps the page-past-end notice alongside the reduction', async () => {
+    await stubService({ projects: [], total: 100, page: 90, pages: 2, perPage: 80 });
+    const tool = await loadTool();
+    const ctx = createMockContext({ errors: tool.errors });
+    await tool.handler(tool.input.parse({ page: 90, per_page: 1000 }), ctx);
+
+    const notice = getEnrichment(ctx).notice as string;
+    expect(notice).toMatch(
+      /^Page 90 is past the end of the results — 100 projects span 2 pages \(1–2\) at per_page=80\./,
+    );
+    expect(notice).toMatch(/per_page=1000 was reduced to 80, the most one page holds/);
+    expect(notice).not.toMatch(/include_abstract off/);
+  });
+
+  it('echoes no requestedPerPage when the requested size fit', async () => {
+    await stubService({ projects: [project], total: 1 });
+    const tool = await loadTool();
+    const ctx = createMockContext({ errors: tool.errors });
+    await tool.handler(tool.input.parse({ per_page: 80 }), ctx);
+
+    const enrichment = getEnrichment(ctx) as { appliedFilters: Record<string, unknown> };
+    expect(enrichment.appliedFilters).toMatchObject({ perPage: 80 });
+    expect(enrichment.appliedFilters).not.toHaveProperty('requestedPerPage');
+    expect(getEnrichment(ctx).notice).toBeUndefined();
+  });
+
+  it('keeps accepting per_page up to 1000 at the schema', async () => {
+    const tool = await loadTool();
+    expect(tool.input.safeParse({ per_page: 1000 }).success).toBe(true);
   });
 
   it('raises no notice when the search returned results', async () => {

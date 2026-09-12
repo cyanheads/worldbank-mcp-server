@@ -7,6 +7,7 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { getServerConfig } from '@/config/server-config.js';
+import { pagePastEndNotice } from '@/mcp-server/tools/page-past-end-notice.js';
 import {
   INDICATOR_ID,
   INDICATOR_ID_MESSAGE,
@@ -31,9 +32,12 @@ function mixesAll(codes: string[]): boolean {
   return codes.length > 1 && codes.some((code) => code.toLowerCase() === 'all');
 }
 
+/**
+ * An empty value is a missing required input, so the schema rejects it. A mixed
+ * `"all"` and a reversed `date_range` are well-shaped mistakes a caller corrects
+ * and retries, so the handler rejects those against declared reasons.
+ */
 const EMPTY_COUNTRIES_MESSAGE = 'Provide at least one country code, or "all" for every entry.';
-const MIXED_ALL_MESSAGE =
-  '"all" cannot be combined with other country codes — pass "all" alone, or list the codes.';
 
 export const worldbankGetData = tool('worldbank_get_data', {
   title: 'Get World Bank Indicator Data',
@@ -52,7 +56,6 @@ export const worldbankGetData = tool('worldbank_get_data', {
         z
           .string()
           .regex(/[^\s;,]/, EMPTY_COUNTRIES_MESSAGE)
-          .refine((value) => !mixesAll(splitCodes(value)), MIXED_ALL_MESSAGE)
           .describe('A single country code, a comma- or semicolon-separated list, or "all".'),
         z
           .array(z.string().describe('A country code.'))
@@ -63,7 +66,6 @@ export const worldbankGetData = tool('worldbank_get_data', {
            * entry, so an array holding nothing but separators must not reach it.
            */
           .refine((codes) => codes.flatMap(splitCodes).length > 0, EMPTY_COUNTRIES_MESSAGE)
-          .refine((codes) => !mixesAll(codes.flatMap(splitCodes)), MIXED_ALL_MESSAGE)
           .describe('An array of country codes.'),
       ])
       .describe(
@@ -81,18 +83,9 @@ export const worldbankGetData = tool('worldbank_get_data', {
         /^\s*(?:\d{4}(?::\d{4})?|\d{4}[Qq][1-4](?::\d{4}[Qq][1-4])?|\d{4}[Mm](?:0[1-9]|1[0-2])(?::\d{4}[Mm](?:0[1-9]|1[0-2]))?)?\s*$/,
         'date_range must be a single period or a range of two periods of the same type: YYYY, YYYYQ1–Q4, or YYYYM01–M12 (e.g. "2020", "2010:2023", "2020Q1:2021Q4", "2020M01:2020M06").',
       )
-      /**
-       * Every period form is fixed-width and zero-padded, and the pattern above
-       * already forces both endpoints to the same form, so ordering is a plain
-       * string comparison.
-       */
-      .refine((value) => {
-        const [start, end] = value.trim().toUpperCase().split(':');
-        return end === undefined || (start ?? '') <= end;
-      }, 'date_range must run earliest period first.')
       .optional()
       .describe(
-        'Time window to filter observations to. Accepts a whole year (`2020`), a quarter (`2020Q1`), or a month (`2020M03`), or a range of two periods of the same type separated by a colon, earliest first (`2010:2023`, `2020Q1:2021Q4`, `2020M01:2020M06`). A window and an observation match whenever the periods overlap, so a year window also selects the quarters and months inside it. A window covering no part of the series returns zero observations rather than the full series. Mutually exclusive with mrv.',
+        'Time window to filter observations to. Accepts a whole year (`2020`), a quarter (`2020Q1`), or a month (`2020M03`), or a range of two periods of the same type separated by a colon, earliest first (`2010:2023`, `2020Q1:2021Q4`, `2020M01:2020M06`); a range running latest first is rejected. A window and an observation match whenever the periods overlap, so a year window also selects the quarters and months inside it. A window covering no part of the series returns zero observations rather than the full series. Mutually exclusive with mrv.',
       ),
     mrv: z
       .number()
@@ -182,13 +175,15 @@ export const worldbankGetData = tool('worldbank_get_data', {
         'The effective parameters sent to the World Bank API — confirms country code normalization and which filters were in force for these observations.',
       ),
     totalCount: z.number().describe('Total observations before pagination.'),
-    currentPage: z.number().describe('Current page number.'),
+    currentPage: z
+      .number()
+      .describe('Page number requested — past totalPages when the request ran off the end.'),
     totalPages: z.number().describe('Total number of pages.'),
     notice: z
       .string()
       .optional()
       .describe(
-        'Recovery hint for sparse or empty result sets — suggests how to broaden the query.',
+        'Recovery hint for an empty result set — how to broaden the query when nothing matched, or the page range that exists when the requested page is past the end.',
       ),
   },
 
@@ -218,6 +213,20 @@ export const worldbankGetData = tool('worldbank_get_data', {
       code: JsonRpcErrorCode.ValidationError,
       when: 'Both date_range and mrv are provided simultaneously.',
       recovery: 'Remove date_range to use mrv, or remove mrv to use date_range.',
+    },
+    {
+      reason: 'mixed_all_selector',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'countries combines "all" with one or more country codes.',
+      recovery:
+        'Pass "all" on its own for every entry, or drop it and list only the country codes.',
+    },
+    {
+      reason: 'reversed_date_range',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'date_range names a range whose first period comes after its second.',
+      recovery:
+        'Swap the two periods so date_range runs earliest period first, e.g. 2010:2020 rather than 2020:2010.',
     },
     {
       reason: 'multiple_indicators',
@@ -280,6 +289,30 @@ export const worldbankGetData = tool('worldbank_get_data', {
       ? input.countries.flatMap(splitCodes)
       : splitCodes(input.countries);
     const countryCodes = codes.join(';');
+
+    if (mixesAll(codes)) {
+      throw ctx.fail(
+        'mixed_all_selector',
+        `"all" cannot be combined with other country codes (${codes.join(', ')}): it already selects every entry.`,
+        { ...ctx.recoveryFor('mixed_all_selector'), countries: codes },
+      );
+    }
+
+    if (dateRange !== undefined) {
+      /**
+       * Every period form is fixed-width and zero-padded, and the schema pattern
+       * forces both endpoints to the same form, so ordering is a plain string
+       * comparison.
+       */
+      const [start = '', end] = dateRange.toUpperCase().split(':');
+      if (end !== undefined && start > end) {
+        throw ctx.fail(
+          'reversed_date_range',
+          `date_range "${dateRange}" runs backwards: ${start} comes after ${end}.`,
+          { ...ctx.recoveryFor('reversed_date_range'), dateRange },
+        );
+      }
+    }
 
     ctx.log.info('Fetching indicator data', {
       indicatorId: input.indicator_id,
@@ -347,13 +380,23 @@ export const worldbankGetData = tool('worldbank_get_data', {
     });
     ctx.enrich({ totalCount: result.total, currentPage: result.page, totalPages: result.pages });
 
-    if (result.data.length === 0) {
+    if (result.total === 0) {
       ctx.enrich.notice(
         result.dateFilterDropped
           ? `No observations fall inside date_range "${dateRange}", though the series does carry data outside it. ` +
               'Broaden date_range or use mrv to fetch the most recent available values.'
           : 'No observations returned for the requested filter. ' +
               'Try broadening the date range, removing date filters, or using mrv=5 to fetch the most recent available values.',
+      );
+    } else if (result.data.length === 0) {
+      ctx.enrich.notice(
+        pagePastEndNotice({
+          noun: ['observation', 'observations'],
+          page: result.page,
+          pages: result.pages,
+          perPage,
+          total: result.total,
+        }),
       );
     }
 

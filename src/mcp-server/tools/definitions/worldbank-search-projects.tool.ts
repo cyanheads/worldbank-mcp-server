@@ -8,7 +8,13 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { getServerConfig } from '@/config/server-config.js';
+import { pagePastEndNotice } from '@/mcp-server/tools/page-past-end-notice.js';
 import { getProjectsService } from '@/services/projects/projects-service.js';
+import {
+  MAX_PROJECTS_PER_PAGE,
+  MAX_PROJECTS_PER_PAGE_WITH_ABSTRACT,
+  RESPONSE_BUDGET_KB,
+} from '@/services/response-budget.js';
 
 /** Split a caller-supplied country string on either separator this server's tools use. */
 function splitCodes(value: string): string[] {
@@ -29,14 +35,11 @@ function collectCodes(value: string | string[] | undefined): string[] {
  * individual economy, and a World Bank regional code such as `3A` for a
  * multi-country operation. Every other tool on this server takes ISO3, and an
  * ISO3 code here is well-formed enough to reach upstream and comes back as a
- * plain zero-hit rather than an error, so the length is enforced at the schema.
- * Digits are accepted because the regional codes carry them: 34 of the 218 codes
- * the portfolio uses are not two letters.
+ * plain zero-hit rather than an error, so the length is enforced before the
+ * request. Digits are accepted because the regional codes carry them: 34 of the
+ * 218 codes the portfolio uses are not two letters.
  */
 const COUNTRY_CODE = /^[A-Za-z0-9]{2}$/;
-
-const COUNTRY_CODE_MESSAGE =
-  'Country codes must be two characters — ISO2 for an economy (BR, IN, ZA) or a World Bank regional code for a multi-country operation (3A, 4E). The World Bank Projects API keys on ISO2, unlike the ISO3 codes worldbank_get_poverty and worldbank_get_data accept. worldbank_get_country resolves either form and reports the iso2 field.';
 
 /** Statuses the portfolio publishes. Every project carries exactly one. */
 const PROJECT_STATUSES = ['Active', 'Closed', 'Dropped', 'Pipeline'] as const;
@@ -59,6 +62,22 @@ const PROJECT_REGIONS = [
 ] as const;
 
 const CALENDAR_DATE = /^\d{4}-\d{2}-\d{2}$/;
+
+const DAYS_IN_MONTH = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31] as const;
+
+/**
+ * Whether a `YYYY-MM-DD` string names a day that exists. The schema pattern
+ * settles the shape; this settles the calendar, which the Projects API does not:
+ * an out-of-range month crashes it with an HTTP 500, and an out-of-range day
+ * (`2020-02-30`, `2023-02-29`) is accepted and searched as though it were real.
+ */
+function isCalendarDate(value: string): boolean {
+  const [year, month, day] = value.split('-').map(Number) as [number, number, number];
+  if (month < 1 || month > 12) return false;
+  const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+  const lastDay = month === 2 && leap ? 29 : (DAYS_IN_MONTH[month - 1] as number);
+  return day >= 1 && day <= lastDay;
+}
 
 export const worldbankSearchProjects = tool('worldbank_search_projects', {
   title: 'Search World Bank Projects',
@@ -83,10 +102,6 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
           .array(z.string().describe('A two-character country code.'))
           .describe('An array of two-character codes.'),
       ])
-      .refine(
-        (value) => collectCodes(value).every((code) => COUNTRY_CODE.test(code)),
-        COUNTRY_CODE_MESSAGE,
-      )
       .optional()
       .describe(
         'Borrowing countries, by the two-character code this API keys on: ISO2 for an economy (BR), or a World Bank regional code for a multi-country operation (3A for Africa, 4E for East Asia and Pacific). Several codes are combined as OR — a project matching any of them is returned. Omit for every country.',
@@ -113,7 +128,7 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
       ])
       .optional()
       .describe(
-        'Earliest board approval date, as YYYY-MM-DD and inclusive. Board approval is the date the Bank committed to the operation; pipeline projects carry a scheduled date in the future.',
+        'Earliest board approval date, as YYYY-MM-DD and inclusive. It must be a real calendar day (2024-02-29, not 2023-02-29) and, when approved_to is also set, on or before it. Board approval is the date the Bank committed to the operation; pipeline projects carry a scheduled date in the future.',
       ),
     approved_to: z
       .union([
@@ -124,12 +139,14 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
           .describe('Latest board approval date to include.'),
       ])
       .optional()
-      .describe('Latest board approval date, as YYYY-MM-DD and inclusive.'),
+      .describe(
+        'Latest board approval date, as YYYY-MM-DD and inclusive. It must be a real calendar day.',
+      ),
     include_abstract: z
       .boolean()
       .default(false)
       .describe(
-        "Include each project's abstract. Abstracts run long — a median of roughly 1,200 characters — so a full page of them roughly doubles the response; leave this off while narrowing a search and turn it on once the result set is small enough to read. Projects that publish no abstract report null either way, which appliedFilters.includeAbstract distinguishes.",
+        `Include each project's abstract. Abstracts run long — a median of roughly 1,200 characters, up to 8,000 — so a page carrying them holds at most ${MAX_PROJECTS_PER_PAGE_WITH_ABSTRACT} projects rather than ${MAX_PROJECTS_PER_PAGE}, with every abstract returned whole; leave this off while narrowing a search and turn it on once the result set is small enough to read. Projects that publish no abstract report null either way, which appliedFilters.includeAbstract distinguishes.`,
       ),
     page: z.number().int().min(1).default(1).describe('Pagination page number (1-based).'),
     per_page: z
@@ -139,7 +156,7 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
       .max(1000)
       .optional()
       .describe(
-        'Results per page (default: server default, max: 1000, which is also the most the API will return for one request).',
+        `Results per page (default: server default, max: 1000). One page holds at most ${MAX_PROJECTS_PER_PAGE} projects, or ${MAX_PROJECTS_PER_PAGE_WITH_ABSTRACT} with include_abstract, which keeps a response within about ${RESPONSE_BUDGET_KB} KB; a larger value, the server default included, is reduced to that cap, disclosed in notice, and echoed as appliedFilters.perPage, and totalPages is counted at the reduced size.`,
       ),
   }),
   output: z.object({
@@ -226,19 +243,31 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
             'Whether abstracts were requested, including the server default of false. A null abstract means "not requested" when this is false and "none published" when it is true.',
           ),
         page: z.number().describe('Page number requested.'),
-        perPage: z.number().describe('Results per page used, including the server default.'),
+        perPage: z
+          .number()
+          .describe(
+            'Results per page actually served — the requested size or server default, reduced to the page cap when larger. totalPages is counted at this size.',
+          ),
+        requestedPerPage: z
+          .number()
+          .optional()
+          .describe(
+            'Page size asked for, requested or server default, present only when it exceeded the page cap and perPage was reduced.',
+          ),
       })
       .describe(
         'The effective search sent upstream — confirms country-code normalization and which filters were in force for these results.',
       ),
     totalCount: z.number().describe('Total projects matching the search, before pagination.'),
-    currentPage: z.number().describe('Current page number.'),
+    currentPage: z
+      .number()
+      .describe('Page number requested — past totalPages when the request ran off the end.'),
     totalPages: z.number().describe('Total number of pages.'),
     notice: z
       .string()
       .optional()
       .describe(
-        'Context for an empty result set — including whether the country filter matched anything on its own — or for a page past the end of the results.',
+        'Context for an empty result set — including whether the country filter matched anything on its own — for a page past the end of the results, or for a page size reduced to the page cap.',
       ),
   },
 
@@ -258,12 +287,33 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
           ...(filters.approvedTo === undefined ? [] : [`approved_to=${filters.approvedTo}`]),
           `include_abstract=${filters.includeAbstract}`,
           `page=${filters.page}`,
-          `per_page=${filters.perPage}`,
+          `per_page=${filters.perPage}${filters.requestedPerPage === undefined ? '' : ` (requested ${filters.requestedPerPage})`}`,
         ].join(', ')}`,
     },
   },
 
   errors: [
+    {
+      reason: 'invalid_country_code',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A countries entry is not a two-character code — most often an ISO3 code such as BRA, which the Projects API does not key on.',
+      recovery:
+        'Replace each code with its two-character ISO2 form, BR rather than BRA; worldbank_get_country resolves either form and reports the iso2 field.',
+    },
+    {
+      reason: 'invalid_date',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'approved_from or approved_to is shaped YYYY-MM-DD but names no real day — a month outside 01–12, or a day outside its month.',
+      recovery:
+        'Correct the date to a real calendar day as YYYY-MM-DD, such as 2024-02-29 or 2023-02-28, and retry.',
+    },
+    {
+      reason: 'reversed_date_range',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'approved_from falls after approved_to, an interval no project can match.',
+      recovery:
+        'Swap the two dates so approved_from is on or before approved_to, or drop one of them for an open-ended window.',
+    },
     {
       reason: 'page_out_of_range',
       code: JsonRpcErrorCode.ValidationError,
@@ -288,6 +338,38 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
     const approvedFrom = input.approved_from || undefined;
     const approvedTo = input.approved_to || undefined;
     const perPage = input.per_page ?? getServerConfig().defaultPerPage;
+
+    /**
+     * Checked here rather than on the schema so each failure carries a reason and
+     * a recovery hint; a schema refinement would reject with neither.
+     */
+    const invalidCodes = codes.filter((code) => !COUNTRY_CODE.test(code));
+    if (invalidCodes.length > 0) {
+      throw ctx.fail(
+        'invalid_country_code',
+        `Country code(s) "${invalidCodes.join(', ')}" must be two characters — ISO2 for an economy (BR, IN, ZA) or a World Bank regional code for a multi-country operation (3A, 4E). The World Bank Projects API keys on ISO2, unlike the ISO3 codes worldbank_get_poverty and worldbank_get_data accept.`,
+        { ...ctx.recoveryFor('invalid_country_code'), invalidCodes },
+      );
+    }
+    for (const [field, value] of [
+      ['approved_from', approvedFrom],
+      ['approved_to', approvedTo],
+    ] as const) {
+      if (value !== undefined && !isCalendarDate(value)) {
+        throw ctx.fail(
+          'invalid_date',
+          `${field} "${value}" is not a real calendar date: the month must be 01–12 and the day must fall inside that month, with February 29 only in a leap year.`,
+          { ...ctx.recoveryFor('invalid_date'), field, value },
+        );
+      }
+    }
+    if (approvedFrom !== undefined && approvedTo !== undefined && approvedFrom > approvedTo) {
+      throw ctx.fail(
+        'reversed_date_range',
+        `approved_from "${approvedFrom}" is after approved_to "${approvedTo}", so no project can match the window.`,
+        { ...ctx.recoveryFor('reversed_date_range'), approvedFrom, approvedTo },
+      );
+    }
 
     ctx.log.info('Searching World Bank projects', {
       query,
@@ -335,7 +417,8 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
         ...(approvedTo !== undefined && { approvedTo }),
         includeAbstract: input.include_abstract,
         page: input.page,
-        perPage,
+        perPage: result.perPage,
+        ...(result.perPage < perPage && { requestedPerPage: perPage }),
       },
     });
     ctx.enrich({ totalCount: result.total, currentPage: result.page, totalPages: result.pages });
@@ -381,10 +464,26 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
           `No project matches this search. Filters combine by AND and match exactly${applied.length > 0 ? ` — ${applied.join(', ')} ${applied.length === 1 ? 'was' : 'were'} applied` : ''}. Widen the date window, add statuses, or drop words from the query, which requires every word to appear.`,
         );
       }
-    } else if (result.projects.length === 0) {
-      ctx.enrich.notice(
-        `Page ${result.page} is past the end of the results — ${result.total} projects span ${result.pages} pages at this page size.`,
-      );
+    } else {
+      const notices = [
+        ...(result.projects.length === 0
+          ? [
+              pagePastEndNotice({
+                noun: ['project', 'projects'],
+                page: result.page,
+                pages: result.pages,
+                perPage: result.perPage,
+                total: result.total,
+              }),
+            ]
+          : []),
+        ...(result.perPage < perPage
+          ? [
+              `per_page=${perPage} was reduced to ${result.perPage}, the most one page holds${input.include_abstract ? ` with include_abstract on (${MAX_PROJECTS_PER_PAGE} with include_abstract off)` : ''}, to keep this response within about ${RESPONSE_BUDGET_KB} KB. totalPages counts pages of ${result.perPage}${result.page < result.pages ? `, so page ${result.page + 1} with the same filters continues where this page ends` : ''}.${input.include_abstract ? ' Abstracts are never shortened; the smaller page is how they fit.' : ''}`,
+            ]
+          : []),
+      ];
+      if (notices.length > 0) ctx.enrich.notice(notices.join(' '));
     }
 
     return { projects: result.projects };

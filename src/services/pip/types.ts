@@ -13,6 +13,7 @@
  * gap-filled row — including gap-filled rows for years a survey does exist for.
  */
 export interface RawPipRow {
+  comparable_spell?: string | null;
   country_code?: string | null;
   country_name?: string | null;
   decile1?: number | null;
@@ -42,9 +43,23 @@ export interface RawPipRow {
   reporting_pop?: number | null;
   reporting_year?: number | null;
   survey_acronym?: string | null;
+  survey_comparability?: number | null;
   survey_year?: number | null;
   watts?: number | null;
   welfare_type?: string | null;
+}
+
+/**
+ * One entry of `/versions`: a data release (`release_version`, a `YYYYMMDD`
+ * stamp) built at one PPP vintage (`ppp_version`), joined into the opaque
+ * `version` string `/pip` accepts. Every release is listed once per vintage it
+ * was built at.
+ */
+export interface RawPipVersion {
+  identity?: string | null;
+  ppp_version?: string | null;
+  release_version?: string | null;
+  version?: string | null;
 }
 
 /**
@@ -60,6 +75,11 @@ export interface PipValidationBody {
 
 /** A single country × year × reporting-level poverty and inequality estimate. */
 export interface PovertyRow {
+  /**
+   * The span of years the row's comparable series covers, as PIP labels it
+   * (`"2022"`, `"2011 - 2022"`). Null on a gap-filled row.
+   */
+  comparableSpell: string | null;
   countryCode: string;
   countryName: string;
   /** Ten income/consumption shares, poorest decile first, or null when absent. */
@@ -90,6 +110,13 @@ export interface PovertyRow {
   reportingLevel: string;
   reportingYear: number;
   surveyAcronym: string;
+  /**
+   * PIP's series comparability code within an economy: 0 is its oldest
+   * comparable series, and the code steps up each time comparability breaks, so
+   * two survey rows of one economy compare over time only when they share it.
+   * Null on a gap-filled row.
+   */
+  surveyComparability: number | null;
   /**
    * Year of the survey the estimate derives from, fractional when the survey
    * spans a fiscal year (India's 2022 survey reports `2022.58`). Null on a

@@ -305,36 +305,71 @@ describe('ProjectsService', () => {
     expect(result).toMatchObject({ projects: [], total: 0, page: 1, pages: 1 });
   });
 
-  it('clamps the page size to the 1000 rows the API actually returns', async () => {
+  it('leaves a page size under the cap as requested and echoes it', async () => {
     mockBody(envelope([rawProject('P100')], 28_074));
-    // Upstream accepts a larger `rows`, echoes it back, and still returns 1000 —
-    // the truncation shows nowhere but the body, so the ceiling is enforced here.
+    const result = await service.searchProjects({ ...baseOpts, perPage: 80 }, createMockContext());
+    expect(requestedUrl().searchParams.get('rows')).toBe('80');
+    expect(result.perPage).toBe(80);
+  });
+
+  it('caps a page at 80 projects, offsetting and counting pages at the capped size', async () => {
+    mockBody(envelope([rawProject('P100')], 28_074));
     const result = await service.searchProjects(
-      { ...baseOpts, perPage: 5000 },
+      { ...baseOpts, page: 3, perPage: 1000 },
       createMockContext(),
     );
 
-    expect(requestedUrl().searchParams.get('rows')).toBe('1000');
-    expect(result.pages).toBe(29);
+    const params = requestedUrl().searchParams;
+    expect(params.get('rows')).toBe('80');
+    // Page 3 at the capped size, so pages 1 and 2 at that size cover rows 0–159.
+    expect(params.get('os')).toBe('160');
+    expect(result).toMatchObject({ perPage: 80, page: 3, pages: 351 });
   });
 
-  it('rejects a page starting past the offset ceiling before issuing a request', async () => {
-    await expect(
-      service.searchProjects({ ...baseOpts, page: 200, perPage: 1000 }, createMockContext()),
-    ).rejects.toMatchObject({ data: { reason: 'page_out_of_range', page: 200, retryable: false } });
-    expect(fetchWithTimeoutMock).not.toHaveBeenCalled();
+  it('caps a page at 8 projects when abstracts are requested, whole abstracts included', async () => {
+    const long = 'x'.repeat(8_000);
+    mockBody(envelope([rawProject('P100', { project_abstract: long })], 28_074));
+    const result = await service.searchProjects(
+      { ...baseOpts, includeAbstract: true, page: 2, perPage: 50 },
+      createMockContext(),
+    );
+
+    const params = requestedUrl().searchParams;
+    expect(params.get('rows')).toBe('8');
+    expect(params.get('os')).toBe('8');
+    expect(result).toMatchObject({ perPage: 8, pages: 3510 });
+    expect(result.projects[0]?.abstract).toHaveLength(8_000);
+  });
+
+  it('walks contiguously whether the caller repeats per_page=1000 or follows the echo', async () => {
+    const ctx = createMockContext();
+    for (let request = 0; request < 3; request++) {
+      mockBody(envelope([rawProject('P100')], 28_074));
+    }
+
+    await service.searchProjects({ ...baseOpts, page: 1, perPage: 1000 }, ctx);
+    await service.searchProjects({ ...baseOpts, page: 2, perPage: 1000 }, ctx);
+    await service.searchProjects({ ...baseOpts, page: 3, perPage: 80 }, ctx);
+
+    expect([0, 1, 2].map((i) => requestedUrl(i).searchParams.get('os'))).toEqual([
+      '0',
+      '80',
+      '160',
+    ]);
   });
 
   it('allows the last offset the API serves and rejects the first one past it', async () => {
     // Upstream accepts `os` 0–100,000 inclusive and answers 100,001 with HTTP 400,
-    // so page 101 at 1,000 rows is the last page that can be requested.
+    // so page 1251 at 80 rows is the last page that can be requested.
     mockBody(envelope([], 28_074));
-    await service.searchProjects({ ...baseOpts, page: 101, perPage: 1000 }, createMockContext());
+    await service.searchProjects({ ...baseOpts, page: 1251, perPage: 80 }, createMockContext());
     expect(requestedUrl().searchParams.get('os')).toBe('100000');
 
     await expect(
-      service.searchProjects({ ...baseOpts, page: 102, perPage: 1000 }, createMockContext()),
-    ).rejects.toMatchObject({ data: { reason: 'page_out_of_range' } });
+      service.searchProjects({ ...baseOpts, page: 1252, perPage: 1000 }, createMockContext()),
+    ).rejects.toMatchObject({
+      data: { reason: 'page_out_of_range', page: 1252, perPage: 80, retryable: false },
+    });
     expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(1);
   });
 

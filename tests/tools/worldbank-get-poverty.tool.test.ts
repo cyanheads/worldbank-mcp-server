@@ -6,7 +6,7 @@
  */
 
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@/services/pip/pip-service.js', () => ({
@@ -46,6 +46,8 @@ const surveyRow = {
   population: 334017321,
   surveyYear: 2022,
   surveyAcronym: 'CPS-ASEC-LIS',
+  surveyComparability: 3,
+  comparableSpell: '2019 - 2023',
   estimationType: 'survey',
   isInterpolated: false,
 };
@@ -62,6 +64,8 @@ const gapFilledRow = {
   decileShares: null,
   surveyYear: null,
   surveyAcronym: '',
+  surveyComparability: null,
+  comparableSpell: null,
   estimationType: 'interpolation',
   isInterpolated: true,
 };
@@ -69,14 +73,18 @@ const gapFilledRow = {
 /** Stub the service with a fixed result and hand back the spy for assertions. */
 async function stubService(result: Record<string, unknown>) {
   const { getPipService } = await import('@/services/pip/pip-service.js');
-  const getPoverty = vi.fn().mockResolvedValue({
+  // The service echoes the page size it served; a stub that doesn't cap echoes the request.
+  const getPoverty = vi.fn().mockImplementation(async (opts: { perPage: number }) => ({
     rows: [],
     total: 0,
     page: 1,
     pages: 1,
+    perPage: opts.perPage,
     gapFilled: false,
+    pppVersion: '2021',
+    releaseVersion: '20260324',
     ...result,
-  });
+  }));
   vi.mocked(getPipService).mockReturnValue({ getPoverty } as never);
   return getPoverty;
 }
@@ -87,6 +95,11 @@ async function stubServiceError(code: JsonRpcErrorCode, message: string, reason:
   vi.mocked(getPipService).mockReturnValue({
     getPoverty: vi.fn().mockRejectedValue(new McpError(code, message, { reason })),
   } as never);
+}
+
+/** Every text block of a tool result, joined — the whole content[] surface. */
+function textOf(result: { content: Array<{ type: string; text?: string }> }) {
+  return result.content.map((block) => block.text ?? '').join('\n');
 }
 
 async function loadTool() {
@@ -247,6 +260,95 @@ describe('worldbankGetPoverty', () => {
     expect(getEnrichment(ctx).notice).toMatch(/fill_gaps is false/);
   });
 
+  it('flags a page past the end on both surfaces, echoing the page it was asked for', async () => {
+    await stubService({ rows: [], total: 1, page: 2, pages: 1 });
+    const tool = await loadTool();
+    const result = await runToolContract(tool, {
+      countries: 'IND',
+      year: '2022',
+      fill_gaps: false,
+      page: 2,
+      per_page: 1,
+    });
+
+    const structured = result.structuredContent as Record<string, unknown>;
+    expect(structured).toMatchObject({
+      estimates: [],
+      totalCount: 1,
+      currentPage: 2,
+      totalPages: 1,
+    });
+    expect(structured.notice).toMatch(
+      /Page 2 is past the end of the results — 1 estimate spans 1 page at per_page=1\. Keep the same filters and request page 1\./,
+    );
+    expect(structured.notice).not.toMatch(/No estimates for the requested filter/);
+    expect(textOf(result)).toContain('Page 2 is past the end of the results');
+  });
+
+  // ─── Output budget ────────────────────────────────────────────────────────
+
+  it('discloses a page reduced to the cap on both surfaces, with the size that continues it', async () => {
+    const getPoverty = await stubService({
+      rows: [surveyRow],
+      total: 2584,
+      page: 1,
+      pages: 37,
+      perPage: 70,
+    });
+    const tool = await loadTool();
+    const result = await runToolContract(tool, {
+      countries: 'all',
+      year: 'all',
+      fill_gaps: false,
+      per_page: 1000,
+    });
+
+    expect(getPoverty.mock.calls[0]?.[0]).toMatchObject({ perPage: 1000 });
+    const structured = result.structuredContent as Record<string, unknown>;
+    expect(structured).toMatchObject({
+      appliedFilters: { perPage: 70, requestedPerPage: 1000 },
+      totalCount: 2584,
+      totalPages: 37,
+    });
+    const notice = structured.notice as string;
+    expect(notice).toMatch(/per_page=1000 was reduced to 70, the most one page holds/);
+    expect(notice).toMatch(/50 KB/);
+    expect(notice).toMatch(
+      /totalPages counts pages of 70, so page 2 with the same filters continues/,
+    );
+    const text = textOf(result);
+    expect(text).toContain('per_page=70 (requested 1000)');
+    expect(text).toContain('per_page=1000 was reduced to 70');
+  });
+
+  it('keeps the gap-filled caveat alongside the reduction', async () => {
+    await stubService({ rows: [gapFilledRow], total: 500, pages: 8, perPage: 70, gapFilled: true });
+    const tool = await loadTool();
+    const ctx = createMockContext({ errors: tool.errors });
+    await tool.handler(tool.input.parse({ countries: 'IND', per_page: 500 }), ctx);
+
+    const notice = getEnrichment(ctx).notice as string;
+    expect(notice).toMatch(/per_page=500 was reduced to 70/);
+    expect(notice).toMatch(/Some rows are gap-filled/);
+  });
+
+  it('echoes no requestedPerPage when the requested size fit', async () => {
+    await stubService({ rows: [surveyRow], total: 1 });
+    const tool = await loadTool();
+    const ctx = createMockContext({ errors: tool.errors });
+    await tool.handler(tool.input.parse({ countries: 'USA', per_page: 70 }), ctx);
+
+    const enrichment = getEnrichment(ctx) as { appliedFilters: Record<string, unknown> };
+    expect(enrichment.appliedFilters).toMatchObject({ perPage: 70 });
+    expect(enrichment.appliedFilters).not.toHaveProperty('requestedPerPage');
+    expect(getEnrichment(ctx).notice).toBeUndefined();
+  });
+
+  it('keeps accepting per_page up to 1000 at the schema', async () => {
+    const tool = await loadTool();
+    expect(tool.input.safeParse({ countries: 'all', per_page: 1000 }).success).toBe(true);
+  });
+
   // ─── Input validation ─────────────────────────────────────────────────────
 
   it('rejects malformed input at the schema, before any request goes out', async () => {
@@ -341,6 +443,92 @@ describe('worldbankGetPoverty', () => {
     await expect(tool.handler(tool.input.parse({ countries: 'USA' }), ctx)).rejects.toMatchObject({
       data: { reason: 'something_else' },
     });
+  });
+
+  // ─── PPP vintage ──────────────────────────────────────────────────────────
+
+  it('forwards ppp_version to the service and reads a blank one as absent', async () => {
+    const getPoverty = await stubService({ rows: [surveyRow], total: 1 });
+    const tool = await loadTool();
+
+    await tool.handler(
+      tool.input.parse({ countries: 'IND', ppp_version: '2017' }),
+      createMockContext({ errors: tool.errors }),
+    );
+    expect(getPoverty.mock.calls[0]?.[0]).toMatchObject({ pppVersion: '2017' });
+
+    await tool.handler(
+      tool.input.parse({ countries: 'IND', ppp_version: '' }),
+      createMockContext({ errors: tool.errors }),
+    );
+    expect(getPoverty.mock.calls[1]?.[0]).not.toHaveProperty('pppVersion');
+  });
+
+  it('accepts only a four-digit vintage year at the schema', async () => {
+    const tool = await loadTool();
+    expect(tool.input.safeParse({ countries: 'IND', ppp_version: '2021' }).success).toBe(true);
+    expect(tool.input.safeParse({ countries: 'IND', ppp_version: '17' }).success).toBe(false);
+    expect(tool.input.safeParse({ countries: 'IND', ppp_version: '2017 PPP' }).success).toBe(false);
+    expect(tool.input.safeParse({ countries: 'IND', ppp_version: 2017 }).success).toBe(false);
+  });
+
+  it('echoes the resolved vintage and release on both surfaces, requested or not', async () => {
+    await stubService({
+      rows: [surveyRow],
+      total: 1,
+      pppVersion: '2017',
+      releaseVersion: '20260324',
+    });
+    const tool = await loadTool();
+    const result = await runToolContract(tool, { countries: 'USA', year: '2022' });
+
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({
+      appliedFilters: { pppVersion: '2017', releaseVersion: '20260324' },
+    });
+    expect(textOf(result)).toContain('ppp_version=2017');
+    expect(textOf(result)).toContain('release_version=20260324');
+  });
+
+  it('maps ppp_version_unavailable to a declared failure with a recovery hint on both surfaces', async () => {
+    await stubServiceError(
+      JsonRpcErrorCode.ValidationError,
+      "PPP vintage 2011 is not available: PIP's current data release (20260324) is published at PPP vintages 2021, 2017.",
+      'ppp_version_unavailable',
+    );
+    const tool = await loadTool();
+    const result = await runToolContract(tool, { countries: 'USA', ppp_version: '2011' });
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.ValidationError,
+        data: {
+          reason: 'ppp_version_unavailable',
+          recovery: { hint: expect.stringContaining('omit ppp_version') },
+        },
+      },
+    });
+    expect(textOf(result)).toMatch(/2021, 2017/);
+    expect(textOf(result)).toMatch(/Recovery:.*omit ppp_version/);
+  });
+
+  // ─── Survey comparability ─────────────────────────────────────────────────
+
+  it('carries survey comparability on both surfaces, null on a gap-filled row', async () => {
+    await stubService({ rows: [surveyRow, gapFilledRow], total: 2, gapFilled: true });
+    const tool = await loadTool();
+    const result = await runToolContract(tool, { countries: ['USA', 'IND'] });
+
+    const estimates = (result.structuredContent as { estimates: Array<Record<string, unknown>> })
+      .estimates;
+    expect(estimates.map((row) => [row.surveyComparability, row.comparableSpell])).toEqual([
+      [3, '2019 - 2023'],
+      [null, null],
+    ]);
+    const text = textOf(result);
+    expect(text).toContain('**surveyComparability:** 3 | **comparableSpell:** 2019 - 2023');
+    expect(text).toContain('**surveyComparability:** null | **comparableSpell:** null');
   });
 
   // ─── Rendering ────────────────────────────────────────────────────────────

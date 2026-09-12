@@ -1,10 +1,12 @@
 /**
  * @fileoverview Tests for PipService — the survey-first merge and the row grain
  * it keys on, normalization of PIP's flat row shape, local pagination, and the
- * classification of PIP's real HTTP status codes into domain errors.
+ * classification of PIP's real HTTP status codes into domain errors, resolution
+ * of the PPP vintage against the versions listing, and survey comparability.
  * @module tests/services/pip/pip-service.test
  */
 
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createInMemoryStorage, createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -55,6 +57,8 @@ function surveyRow(countryCode: string, reportingYear: number, overrides = {}) {
     survey_acronym: 'CPS-ASEC-LIS',
     survey_year: reportingYear,
     welfare_type: 'income',
+    survey_comparability: 3,
+    comparable_spell: '2019 - 2023',
     poverty_line: 3,
     headcount: 0.014,
     poverty_gap: 0.0104,
@@ -82,6 +86,8 @@ function gapFilledRow(countryCode: string, reportingYear: number, overrides = {}
     ...surveyRow(countryCode, reportingYear),
     survey_acronym: null,
     survey_year: null,
+    survey_comparability: null,
+    comparable_spell: null,
     mld: null,
     gini: null,
     polarization: null,
@@ -100,6 +106,50 @@ function gapFilledRow(countryCode: string, reportingYear: number, overrides = {}
     ...overrides,
   };
 }
+
+/**
+ * The `/versions` listing: every release × PPP vintage PIP publishes, newest
+ * release first. The newest release carries 2021 and 2017 builds; 2011 survives
+ * only on an older release.
+ */
+const VERSIONS = [
+  {
+    version: '20260324_2021_01_02_PROD',
+    release_version: '20260324',
+    ppp_version: '2021',
+    identity: 'PROD',
+  },
+  {
+    version: '20260324_2017_01_02_PROD',
+    release_version: '20260324',
+    ppp_version: '2017',
+    identity: 'PROD',
+  },
+  {
+    version: '20250930_2021_01_02_PROD',
+    release_version: '20250930',
+    ppp_version: '2021',
+    identity: 'PROD',
+  },
+  {
+    version: '20250930_2017_01_02_PROD',
+    release_version: '20250930',
+    ppp_version: '2017',
+    identity: 'PROD',
+  },
+  {
+    version: '20240627_2017_01_02_PROD',
+    release_version: '20240627',
+    ppp_version: '2017',
+    identity: 'PROD',
+  },
+  {
+    version: '20240627_2011_02_02_PROD',
+    release_version: '20240627',
+    ppp_version: '2011',
+    identity: 'PROD',
+  },
+];
 
 /** PIP's HTTP-404 body for a rejected parameter value, as an McpError's captured body. */
 function validationBody(parameter: string, valid: unknown[]) {
@@ -122,21 +172,51 @@ describe('PipService', () => {
   let fetchWithTimeoutMock: ReturnType<typeof vi.fn>;
   let service: InstanceType<typeof import('@/services/pip/pip-service.js')['PipService']>;
 
-  /** Queue one upstream response on the fetch mock. */
+  /**
+   * Responses for `/pip` requests, served in order. Kept apart from the
+   * `/versions` listing, which the service may consult at any point, so a queued
+   * row set always reaches the data request it was written for.
+   */
+  let pipQueue: Array<() => Promise<unknown>>;
+
+  /** What `/versions` answers with for the current test. */
+  let versionsListing: unknown[];
+
+  /** URLs of the `/versions` listing requests made so far. */
+  function versionsCalls(): string[] {
+    return fetchWithTimeoutMock.mock.calls
+      .map((call) => String(call[0]))
+      .filter((url) => url.includes('/versions'));
+  }
+
+  /** Queue one upstream `/pip` response. */
   function mockRows(rows: unknown[]) {
-    fetchWithTimeoutMock.mockResolvedValueOnce({ text: async () => JSON.stringify(rows) });
+    mockBody(JSON.stringify(rows));
+  }
+
+  /** Queue one raw `/pip` response body. */
+  function mockBody(text: string) {
+    pipQueue.push(async () => ({ text: async () => text }));
   }
 
   /** Queue a non-2xx, which `fetchWithTimeout` surfaces as a thrown McpError. */
   async function mockHttpError(status: number, body: string) {
     const { McpError, JsonRpcErrorCode } = await import('@cyanheads/mcp-ts-core/errors');
-    fetchWithTimeoutMock.mockRejectedValueOnce(
-      new McpError(
-        status === 404 ? JsonRpcErrorCode.NotFound : JsonRpcErrorCode.InternalError,
-        `Fetch failed with status ${status}.`,
-        { status, statusText: '', body },
-      ),
+    const error = new McpError(
+      status === 404 ? JsonRpcErrorCode.NotFound : JsonRpcErrorCode.InternalError,
+      `Fetch failed with status ${status}.`,
+      { status, statusText: '', body },
     );
+    pipQueue.push(async () => {
+      throw error;
+    });
+  }
+
+  /** URLs of the `/pip` data requests made so far, in order. */
+  function pipCalls(): string[] {
+    return fetchWithTimeoutMock.mock.calls
+      .map((call) => String(call[0]))
+      .filter((url) => url.includes('/pip?'));
   }
 
   const baseOpts = { countries: ['USA'], year: '2022', fillGaps: true, page: 1, perPage: 50 };
@@ -144,6 +224,16 @@ describe('PipService', () => {
   beforeEach(async () => {
     const { fetchWithTimeout } = await import('@cyanheads/mcp-ts-core/utils');
     fetchWithTimeoutMock = vi.mocked(fetchWithTimeout);
+    pipQueue = [];
+    versionsListing = VERSIONS;
+    fetchWithTimeoutMock.mockImplementation(async (url: string) => {
+      if (url.includes('/versions')) {
+        return { text: async () => JSON.stringify(versionsListing) };
+      }
+      const next = pipQueue.shift();
+      if (!next) throw new Error(`No response queued for ${url}`);
+      return next();
+    });
 
     const { getServerConfig } = await import('@/config/server-config.js');
     vi.mocked(getServerConfig).mockReturnValue({
@@ -167,8 +257,8 @@ describe('PipService', () => {
     mockRows([surveyRow('USA', 2022)]);
     const result = await service.getPoverty(baseOpts, createMockContext());
 
-    expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(1);
-    expect(fetchWithTimeoutMock.mock.calls[0]?.[0]).toContain('fill_gaps=false');
+    expect(pipCalls()).toHaveLength(1);
+    expect(pipCalls()[0]).toContain('fill_gaps=false');
     expect(result.gapFilled).toBe(false);
     expect(result.rows[0]).toMatchObject({
       countryCode: 'USA',
@@ -189,7 +279,7 @@ describe('PipService', () => {
   it('does not gap-fill when the survey response already covers every country', async () => {
     mockRows([surveyRow('USA', 2022)]);
     await service.getPoverty(baseOpts, createMockContext());
-    expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(1);
+    expect(pipCalls()).toHaveLength(1);
   });
 
   // ─── Gap-filled rows ──────────────────────────────────────────────────────
@@ -203,8 +293,8 @@ describe('PipService', () => {
       createMockContext(),
     );
 
-    expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(2);
-    expect(fetchWithTimeoutMock.mock.calls[1]?.[0]).toContain('fill_gaps=true');
+    expect(pipCalls()).toHaveLength(2);
+    expect(pipCalls()[1]).toContain('fill_gaps=true');
     expect(result.gapFilled).toBe(true);
     expect(result.rows[0]).toMatchObject({
       countryCode: 'IND',
@@ -227,7 +317,7 @@ describe('PipService', () => {
       createMockContext(),
     );
 
-    expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(1);
+    expect(pipCalls()).toHaveLength(1);
     expect(result.rows).toEqual([]);
     expect(result.total).toBe(0);
     expect(result.gapFilled).toBe(false);
@@ -251,7 +341,7 @@ describe('PipService', () => {
       createMockContext(),
     );
 
-    expect(fetchWithTimeoutMock.mock.calls[0]?.[0]).toContain('country=IND%2CUSA%2CBRA');
+    expect(pipCalls()[0]).toContain('country=IND%2CUSA%2CBRA');
     expect(result.total).toBe(3);
     // Sorted by country code, and the survey rows win over their gap-filled twins.
     expect(result.rows.map((row) => [row.countryCode, row.estimationType])).toEqual([
@@ -271,7 +361,7 @@ describe('PipService', () => {
       createMockContext(),
     );
 
-    expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(2);
+    expect(pipCalls()).toHaveLength(2);
     expect(result.rows.map((row) => row.countryCode)).toEqual(['IND', 'USA']);
   });
 
@@ -292,7 +382,7 @@ describe('PipService', () => {
 
     // Covered by a survey row, but the years around it are not — the country
     // key alone would have skipped the second request and returned two rows.
-    expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(2);
+    expect(pipCalls()).toHaveLength(2);
     expect(result.total).toBe(4);
     expect(result.gapFilled).toBe(true);
     expect(result.rows.map((row) => [row.reportingYear, row.estimationType])).toEqual([
@@ -317,7 +407,7 @@ describe('PipService', () => {
       createMockContext(),
     );
 
-    expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(2);
+    expect(pipCalls()).toHaveLength(2);
     expect(result.rows.map((row) => row.reportingYear)).toEqual([2021, 2022]);
   });
 
@@ -352,7 +442,7 @@ describe('PipService', () => {
 
     // MRV is the most recent survey year in one mode and the last projected year
     // in the other; a second request would answer "most recent value" twice.
-    expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(1);
+    expect(pipCalls()).toHaveLength(1);
     expect(result.rows.map((row) => row.reportingYear)).toEqual([2024]);
   });
 
@@ -365,7 +455,7 @@ describe('PipService', () => {
       createMockContext(),
     );
 
-    expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(2);
+    expect(pipCalls()).toHaveLength(2);
     // USA answered at its survey year; the gap-filled USA row is not a second answer.
     expect(result.rows.map((row) => [row.countryCode, row.reportingYear])).toEqual([
       ['ABW', 2026],
@@ -397,7 +487,32 @@ describe('PipService', () => {
     expect(page2.total).toBe(5);
     expect(page2.pages).toBe(3);
     expect(page2.rows.map((row) => row.reportingYear)).toEqual([2020, 2021]);
-    expect(fetchWithTimeoutMock.mock.calls[0]?.[0]).not.toContain('per_page');
+    expect(pipCalls()[0]).not.toContain('per_page');
+  });
+
+  it('caps a page at 70 estimates, slicing and counting pages at the capped size', async () => {
+    const years = Array.from({ length: 200 }, (_, index) => 1800 + index);
+    mockRows(years.map((year) => surveyRow('USA', year)));
+
+    const result = await service.getPoverty(
+      { ...baseOpts, year: 'all', fillGaps: false, page: 2, perPage: 1000 },
+      createMockContext(),
+    );
+
+    expect(result).toMatchObject({ total: 200, perPage: 70, page: 2, pages: 3 });
+    expect(result.rows).toHaveLength(70);
+    // Page 2 at the capped size starts right after page 1's 70 rows.
+    expect(result.rows[0]?.reportingYear).toBe(1870);
+    expect(result.rows.at(-1)?.reportingYear).toBe(1939);
+  });
+
+  it('leaves a page size under the cap as requested and echoes it', async () => {
+    mockRows([2018, 2019, 2020].map((year) => surveyRow('USA', year)));
+    const result = await service.getPoverty(
+      { ...baseOpts, year: 'all', fillGaps: false, perPage: 70 },
+      createMockContext(),
+    );
+    expect(result).toMatchObject({ perPage: 70, pages: 1 });
   });
 
   // ─── Query construction ───────────────────────────────────────────────────
@@ -414,7 +529,7 @@ describe('PipService', () => {
       createMockContext(),
     );
 
-    const url = String(fetchWithTimeoutMock.mock.calls[0]?.[0]);
+    const url = String(pipCalls()[0]);
     expect(url).toContain('https://api.worldbank.org/pip/v1/pip?');
     expect(url).toContain('povline=2.15');
     expect(url).toContain('welfare_type=income');
@@ -424,7 +539,7 @@ describe('PipService', () => {
   it('omits povline entirely when the caller did not pick a poverty line', async () => {
     mockRows([surveyRow('USA', 2022)]);
     await service.getPoverty(baseOpts, createMockContext());
-    expect(String(fetchWithTimeoutMock.mock.calls[0]?.[0])).not.toContain('povline');
+    expect(String(pipCalls()[0])).not.toContain('povline');
   });
 
   // ─── Error classification ─────────────────────────────────────────────────
@@ -483,18 +598,146 @@ describe('PipService', () => {
   });
 
   it('throws serviceUnavailable when the gateway returns an HTML error page', async () => {
-    fetchWithTimeoutMock.mockResolvedValueOnce({
-      text: async () => '<!DOCTYPE html><html><body>503 Service Unavailable</body></html>',
-    });
+    mockBody('<!DOCTYPE html><html><body>503 Service Unavailable</body></html>');
     await expect(service.getPoverty(baseOpts, createMockContext())).rejects.toThrow(
       /HTML error page/,
     );
   });
 
   it('throws a serialization error when the payload is not an array of rows', async () => {
-    fetchWithTimeoutMock.mockResolvedValueOnce({ text: async () => '{"unexpected":"object"}' });
+    mockBody('{"unexpected":"object"}');
     await expect(service.getPoverty(baseOpts, createMockContext())).rejects.toThrow(
       /not the expected array/,
     );
+  });
+
+  // ─── PPP vintage ──────────────────────────────────────────────────────────
+
+  it('resolves no selector to the newest release at its newest PPP vintage, on both requests', async () => {
+    mockRows([]);
+    mockRows([gapFilledRow('IND', 2019)]);
+
+    const result = await service.getPoverty(
+      { ...baseOpts, countries: ['IND'], year: '2019' },
+      createMockContext(),
+    );
+
+    expect(result).toMatchObject({ pppVersion: '2021', releaseVersion: '20260324' });
+    expect(pipCalls()).toHaveLength(2);
+    for (const url of pipCalls()) {
+      expect(url).toContain('version=20260324_2021_01_02_PROD');
+      expect(url).not.toContain('ppp_version=');
+    }
+  });
+
+  it('resolves ppp_version alone to that vintage in the newest release, on both requests', async () => {
+    mockRows([]);
+    mockRows([gapFilledRow('IND', 2019)]);
+
+    const result = await service.getPoverty(
+      { ...baseOpts, countries: ['IND'], year: '2019', pppVersion: '2017' },
+      createMockContext(),
+    );
+
+    expect(result).toMatchObject({ pppVersion: '2017', releaseVersion: '20260324' });
+    expect(pipCalls().map((url) => new URL(url).searchParams.get('version'))).toEqual([
+      '20260324_2017_01_02_PROD',
+      '20260324_2017_01_02_PROD',
+    ]);
+  });
+
+  it('picks the newest release by its date stamp, not by where the listing puts it', async () => {
+    versionsListing = [...VERSIONS].reverse();
+    mockRows([surveyRow('USA', 2022)]);
+
+    const result = await service.getPoverty(baseOpts, createMockContext());
+    expect(result).toMatchObject({ pppVersion: '2021', releaseVersion: '20260324' });
+  });
+
+  it('rejects a vintage the newest release does not carry, naming the ones it does', async () => {
+    const promise = service.getPoverty({ ...baseOpts, pppVersion: '2011' }, createMockContext());
+
+    await expect(promise).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: {
+        reason: 'ppp_version_unavailable',
+        pppVersion: '2011',
+        availablePppVersions: ['2021', '2017'],
+        releaseVersion: '20260324',
+      },
+    });
+    await expect(promise).rejects.toThrow(/2021, 2017/);
+    expect(pipCalls()).toHaveLength(0);
+  });
+
+  it('reads the versions listing once and reuses it across requests', async () => {
+    mockRows([surveyRow('USA', 2022)]);
+    mockRows([surveyRow('USA', 2022)]);
+    const ctx = createMockContext();
+
+    await service.getPoverty(baseOpts, ctx);
+    await service.getPoverty({ ...baseOpts, pppVersion: '2017' }, ctx);
+
+    expect(versionsCalls()).toHaveLength(1);
+    expect(pipCalls()).toHaveLength(2);
+  });
+
+  it('rereads the versions listing on every request when caching is disabled', async () => {
+    const { getServerConfig } = await import('@/config/server-config.js');
+    vi.mocked(getServerConfig).mockReturnValue({
+      pipBaseUrl: 'https://api.worldbank.org/pip/v1',
+      defaultPerPage: 50,
+      catalogCacheTtlMs: 0,
+    } as never);
+    const { PipService } = await import('@/services/pip/pip-service.js');
+    const uncached = new PipService({} as never, createInMemoryStorage());
+    mockRows([surveyRow('USA', 2022)]);
+    mockRows([surveyRow('USA', 2022)]);
+
+    await uncached.getPoverty(baseOpts, createMockContext());
+    await uncached.getPoverty(baseOpts, createMockContext());
+    expect(versionsCalls()).toHaveLength(2);
+  });
+
+  it('throws a serialization error when the versions listing names no release', async () => {
+    versionsListing = [];
+    await expect(service.getPoverty(baseOpts, createMockContext())).rejects.toMatchObject({
+      code: JsonRpcErrorCode.SerializationError,
+    });
+    expect(pipCalls()).toHaveLength(0);
+  });
+
+  // ─── Survey comparability ─────────────────────────────────────────────────
+
+  it('passes survey comparability through on survey rows and keeps it null on gap-filled ones', async () => {
+    mockRows([surveyRow('IND', 2022, { survey_comparability: 9, comparable_spell: '2022' })]);
+    mockRows([
+      gapFilledRow('IND', 2021, { survey_comparability: null, comparable_spell: null }),
+      gapFilledRow('IND', 2022),
+    ]);
+
+    const result = await service.getPoverty(
+      { ...baseOpts, countries: ['IND'], year: 'all' },
+      createMockContext(),
+    );
+
+    expect(
+      result.rows.map((row) => [
+        row.reportingYear,
+        row.estimationType,
+        row.surveyComparability,
+        row.comparableSpell,
+      ]),
+    ).toEqual([
+      [2021, 'interpolation', null, null],
+      [2022, 'survey', 9, '2022'],
+    ]);
+  });
+
+  it('reports comparability as null when a row omits the fields entirely', async () => {
+    const { survey_comparability: _a, comparable_spell: _b, ...sparse } = surveyRow('USA', 2022);
+    mockRows([sparse]);
+    const result = await service.getPoverty(baseOpts, createMockContext());
+    expect(result.rows[0]).toMatchObject({ surveyComparability: null, comparableSpell: null });
   });
 });

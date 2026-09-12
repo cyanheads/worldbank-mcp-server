@@ -22,6 +22,10 @@ import {
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
+import {
+  MAX_PROJECTS_PER_PAGE,
+  MAX_PROJECTS_PER_PAGE_WITH_ABSTRACT,
+} from '@/services/response-budget.js';
 import type { ProjectSummary, RawProject, RawProjectsEnvelope } from './types.js';
 
 /** Minimal request-context shape that satisfies fetchWithTimeout and withRetry. */
@@ -34,14 +38,6 @@ type ReqCtx = Context & Record<string, unknown>;
  * query computation.
  */
 const REQUEST_TIMEOUT_MS = 15_000;
-
-/**
- * Rows the endpoint will actually return for one request. It accepts a larger
- * `rows` and echoes it back in the envelope while still returning 1,000 records,
- * so the ceiling has to be enforced here — the response body is the only place
- * the truncation shows.
- */
-const MAX_ROWS_PER_REQUEST = 1000;
 
 /**
  * Largest `os` the endpoint accepts. Past it the request fails with an HTTP 400
@@ -203,6 +199,8 @@ export type ProjectSearchResult = {
   countryOnlyTotal: number | null;
   page: number;
   pages: number;
+  /** Page size actually served: the requested size, reduced to the page cap when larger. */
+  perPage: number;
   projects: ProjectSummary[];
   total: number;
 };
@@ -313,7 +311,15 @@ export class ProjectsService {
   async searchProjects(opts: ProjectSearchOptions, ctx: Context): Promise<ProjectSearchResult> {
     const { countryCodes, includeAbstract, page, perPage } = opts;
 
-    const rows = Math.min(perPage, MAX_ROWS_PER_REQUEST);
+    /**
+     * Both caps sit below the 1,000 records the endpoint returns for one request
+     * — it accepts a larger `rows` and silently returns 1,000 — so capping here
+     * also keeps `pages` honest about what a request can actually hold.
+     */
+    const rows = Math.min(
+      perPage,
+      includeAbstract ? MAX_PROJECTS_PER_PAGE_WITH_ABSTRACT : MAX_PROJECTS_PER_PAGE,
+    );
     const offset = (page - 1) * rows;
     if (offset > MAX_OFFSET) {
       throw validationError(
@@ -364,6 +370,7 @@ export class ProjectsService {
       total,
       page,
       pages: Math.max(1, Math.ceil(total / rows)),
+      perPage: rows,
       countryOnlyTotal,
     };
   }

@@ -7,6 +7,7 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { getServerConfig } from '@/config/server-config.js';
+import { pagePastEndNotice } from '@/mcp-server/tools/page-past-end-notice.js';
 import { getWorldBankApiService } from '@/services/worldbank/worldbank-service.js';
 
 export const worldbankListCountries = tool('worldbank_list_countries', {
@@ -85,8 +86,16 @@ export const worldbankListCountries = tool('worldbank_list_countries', {
       .describe(
         'Total matching entries before pagination (includes aggregates if include_aggregates=true).',
       ),
-    currentPage: z.number().describe('Current page number.'),
+    currentPage: z
+      .number()
+      .describe('Page number requested — past totalPages when the request ran off the end.'),
     totalPages: z.number().describe('Total number of pages.'),
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'Context for an empty page: which filters matched nothing, or the page range that exists when the requested page is past the end.',
+      ),
   },
 
   errors: [
@@ -132,6 +141,30 @@ export const worldbankListCountries = tool('worldbank_list_countries', {
       throw err;
     }
     ctx.enrich({ totalCount: result.total, currentPage: result.page, totalPages: result.pages });
+
+    if (result.total === 0) {
+      const filters = [
+        ...(region === undefined ? [] : [`region=${region}`]),
+        ...(incomeLevel === undefined ? [] : [`income_level=${incomeLevel}`]),
+      ];
+      ctx.enrich.notice(
+        filters.length > 1
+          ? `No countries matched ${filters.join(', ')}. The two filters combine by AND, so no country in that region has that income level — drop one of them to widen the list.`
+          : filters.length === 1
+            ? `No countries matched ${filters[0]}.`
+            : 'The World Bank returned no countries.',
+      );
+    } else if (result.countries.length === 0) {
+      ctx.enrich.notice(
+        pagePastEndNotice({
+          noun: ['country', 'countries'],
+          page: result.page,
+          pages: result.pages,
+          perPage,
+          total: result.total,
+        }),
+      );
+    }
     return { countries: result.countries };
   },
 
@@ -147,7 +180,7 @@ export const worldbankListCountries = tool('worldbank_list_countries', {
       if (c.capitalCity) lines.push(`**Capital:** ${c.capitalCity}`);
       if (c.longitude && c.latitude) lines.push(`**Coordinates:** ${c.latitude}, ${c.longitude}`);
     }
-    if (lines.length === 0) lines.push('No countries matched the specified filters.');
+    if (lines.length === 0) lines.push('No countries returned.');
     return [{ type: 'text', text: lines.join('\n') }];
   },
 });

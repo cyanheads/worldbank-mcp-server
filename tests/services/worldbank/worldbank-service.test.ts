@@ -1837,6 +1837,76 @@ describe('WorldBankApiService', () => {
     expect(result.pages).toBe(2);
   });
 
+  // ─── getData: exhausted pages ─────────────────────────────────────────────
+
+  it('getData: reports upstream paging for a page past the end with no date window', async () => {
+    mockResponse([pagingObj({ page: 9, pages: 3, total: 125 }), null]);
+    const result = await service.getData(
+      { indicatorId: 'SP.POP.TOTL', countries: 'US', page: 9, perPage: 50 },
+      createMockContext(),
+    );
+    expect(result).toMatchObject({ data: [], total: 125, pages: 3, page: 9 });
+    expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('getData: skips the re-read when upstream matched nothing under a date window', async () => {
+    mockResponse([pagingObj({ total: 0, pages: 0 }), null]);
+    const result = await service.getData(
+      { indicatorId: 'SP.POP.TOTL', countries: 'US', dateRange: '2020', page: 1, perPage: 50 },
+      createMockContext(),
+    );
+    expect(result).toMatchObject({ data: [], total: 0 });
+    expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('getData: keeps an honored window total on a page past the end', async () => {
+    const rows = ['2021', '2020'].map((date) => rawDataPoint('US', 'USA', 'United States', date));
+    mockResponse([pagingObj({ page: 3, pages: 1, total: 2 }), null]);
+    mockResponse([pagingObj({ total: 2, pages: 1 }), rows]); // exhaustive re-read
+    const result = await service.getData(
+      { indicatorId: 'SP.POP.TOTL', countries: 'US', dateRange: '2020:2021', page: 3, perPage: 50 },
+      createMockContext(),
+    );
+    expect(result).toMatchObject({ data: [], total: 2, pages: 1, page: 3 });
+    expect(result.dateFilterDropped).toBe(false);
+  });
+
+  it.each([
+    // Page 3 is still inside the raw series' page count: upstream returns rows.
+    [3, QUARTERS.slice(4)],
+    // Page 50 is past the raw series' page count too: upstream returns none.
+    [50, []],
+  ])(
+    'getData: reports the filtered total on page %i when upstream drops the date window',
+    async (page, upstreamRows) => {
+      const series = QUARTERS.map((date) => rawDataPoint('US', 'USA', 'United States', date));
+      mockResponse([
+        pagingObj({ page, pages: 3, total: 5 }),
+        series.filter((row) => upstreamRows.includes(row.date)),
+      ]);
+      mockResponse([pagingObj({ total: 5, pages: 1 }), series]); // exhaustive re-read
+      const result = await service.getData(
+        { indicatorId: 'SP.POP.TOTL', countries: 'US', dateRange: '2020:2021', page, perPage: 2 },
+        createMockContext(),
+      );
+      // Three quarters fall inside 2020:2021 whichever page was asked for.
+      expect(result).toMatchObject({ data: [], total: 3, pages: 2, page });
+      expect(result.dateFilterDropped).toBe(true);
+      expect(result.indicator).toMatchObject({ id: 'SP.POP.TOTL', name: 'Population, total' });
+    },
+  );
+
+  it('getData: re-reads a single-page series for page 2 rather than reading it as empty', async () => {
+    const series = QUARTERS.map((date) => rawDataPoint('US', 'USA', 'United States', date));
+    mockResponse([pagingObj({ page: 2, pages: 1, total: 5 }), null]);
+    mockResponse([pagingObj({ total: 5, pages: 1 }), series]); // exhaustive re-read
+    const result = await service.getData(
+      { indicatorId: 'SP.POP.TOTL', countries: 'US', dateRange: '2020:2021', page: 2, perPage: 50 },
+      createMockContext(),
+    );
+    expect(result).toMatchObject({ data: [], total: 3, pages: 1, page: 2 });
+  });
+
   it.each([
     ['2020Q2', ['2020Q2'], ['2020Q1', '2020Q3']],
     ['2020Q2:2020Q3', ['2020Q2', '2020Q3'], ['2020Q1', '2020Q4']],

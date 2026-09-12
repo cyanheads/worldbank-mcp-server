@@ -3,7 +3,7 @@
  * @module tests/tools/worldbank-list-sources.tool.test
  */
 
-import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@/services/worldbank/worldbank-service.js', () => ({
@@ -71,6 +71,53 @@ describe('worldbankListSources', () => {
     expect(enrichment.totalCount).toBe(71);
     expect(enrichment.currentPage).toBe(1);
     expect(enrichment.totalPages).toBe(2);
+  });
+
+  it('flags a page past the end on both surfaces', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      listSources: vi.fn().mockResolvedValue({ sources: [], total: 71, page: 2, pages: 1 }),
+    } as never);
+    const { worldbankListSources } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-sources.tool.js'
+    );
+    const result = await runToolContract(worldbankListSources, { page: 2, per_page: 100 });
+
+    const structured = result.structuredContent as Record<string, unknown>;
+    expect(structured).toMatchObject({
+      sources: [],
+      totalCount: 71,
+      currentPage: 2,
+      totalPages: 1,
+    });
+    expect(structured.notice).toBe(
+      'Page 2 is past the end of the results — 71 sources span 1 page at per_page=100. Keep the same filters and request page 1.',
+    );
+    const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+    expect(text).toContain('Page 2 is past the end of the results');
+  });
+
+  it('says no sources came back when the listing itself is empty', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      listSources: vi.fn().mockResolvedValue({ sources: [], total: 0, page: 1, pages: 1 }),
+    } as never);
+    const { worldbankListSources } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-sources.tool.js'
+    );
+    const ctx = createMockContext();
+    await worldbankListSources.handler(worldbankListSources.input.parse({}), ctx);
+    expect(getEnrichment(ctx).notice).toMatch(/returned no data sources/);
+    expect(getEnrichment(ctx).notice).not.toMatch(/past the end/);
+  });
+
+  it('raises no notice on a page with sources', async () => {
+    const { worldbankListSources } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-sources.tool.js'
+    );
+    const ctx = createMockContext();
+    await worldbankListSources.handler(worldbankListSources.input.parse({ page: 1 }), ctx);
+    expect(getEnrichment(ctx).notice).toBeUndefined();
   });
 
   it('formats all fields including metadataAvailability and concepts', async () => {

@@ -4,7 +4,7 @@
  */
 
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@/services/worldbank/worldbank-service.js', () => ({
@@ -245,13 +245,70 @@ describe('worldbankListCountries', () => {
 
   // ─── Format edge cases ────────────────────────────────────────────────────
 
-  it('format renders fallback message when countries list is empty', async () => {
+  it('format renders a neutral line for an empty page, leaving the cause to the notice', async () => {
     const { worldbankListCountries } = await import(
       '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
     );
     const blocks = worldbankListCountries.format!({ countries: [] });
     const text = (blocks[0] as { text: string }).text;
-    expect(text).toContain('No countries matched');
+    // format() sees only the page, so it cannot tell "nothing matched" from "past the end".
+    expect(text).toBe('No countries returned.');
+  });
+
+  it('flags a page past the end on both surfaces without claiming nothing matched', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      listCountries: vi.fn().mockResolvedValue({ countries: [], total: 6, page: 2, pages: 1 }),
+    } as never);
+    const { worldbankListCountries } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
+    );
+    const result = await runToolContract(worldbankListCountries, {
+      region: 'SAS',
+      page: 2,
+      per_page: 10,
+    });
+
+    const structured = result.structuredContent as Record<string, unknown>;
+    expect(structured).toMatchObject({
+      countries: [],
+      totalCount: 6,
+      currentPage: 2,
+      totalPages: 1,
+    });
+    expect(structured.notice).toBe(
+      'Page 2 is past the end of the results — 6 countries span 1 page at per_page=10. Keep the same filters and request page 1.',
+    );
+    const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+    expect(text).toContain('Page 2 is past the end of the results');
+    expect(text).not.toContain('No countries matched');
+  });
+
+  it('says which filters matched nothing when the total is zero', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      listCountries: vi.fn().mockResolvedValue({ countries: [], total: 0, page: 1, pages: 1 }),
+    } as never);
+    const { worldbankListCountries } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
+    );
+    const ctx = createMockContext({ errors: worldbankListCountries.errors });
+    await worldbankListCountries.handler(
+      worldbankListCountries.input.parse({ region: 'NAC', income_level: 'LIC' }),
+      ctx,
+    );
+    const notice = getEnrichment(ctx).notice as string;
+    expect(notice).toMatch(/No countries matched region=NAC, income_level=LIC/);
+    expect(notice).not.toMatch(/past the end/);
+  });
+
+  it('raises no notice on a page with countries', async () => {
+    const { worldbankListCountries } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
+    );
+    const ctx = createMockContext({ errors: worldbankListCountries.errors });
+    await worldbankListCountries.handler(worldbankListCountries.input.parse({}), ctx);
+    expect(getEnrichment(ctx).notice).toBeUndefined();
   });
 
   it('format omits capital line when capitalCity is empty', async () => {

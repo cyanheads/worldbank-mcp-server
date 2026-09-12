@@ -417,6 +417,76 @@ describe('worldbankGetData', () => {
     expect(enrichment.notice).toContain('outside');
   });
 
+  it('flags a page past the end rather than claiming the window matched nothing, on both surfaces', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      getData: vi.fn().mockResolvedValue({
+        data: [],
+        indicator: { id: 'DP.DOD.DECD.CR.BC.CD', name: 'Gross PSD' },
+        total: 12,
+        page: 5,
+        pages: 4,
+        nullCount: 0,
+        dateFilterDropped: true,
+      }),
+    } as never);
+
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const result = await runToolContract(worldbankGetData, {
+      indicator_id: 'DP.DOD.DECD.CR.BC.CD',
+      countries: 'CHL',
+      date_range: '2019:2021',
+      page: 5,
+      per_page: 3,
+    });
+
+    const structured = result.structuredContent as Record<string, unknown>;
+    expect(structured).toMatchObject({ totalCount: 12, currentPage: 5, totalPages: 4 });
+    const notice = structured.notice as string;
+    expect(notice).toMatch(
+      /Page 5 is past the end of the results — 12 observations span 4 pages \(1–4\) at per_page=3/,
+    );
+    expect(notice).toMatch(/Keep the same filters and request a page from 1 to 4\./);
+    expect(notice).not.toMatch(/No observations fall inside/);
+    const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+    expect(text).toContain('Page 5 is past the end of the results');
+    expect(text).not.toContain('No observations fall inside');
+  });
+
+  it('keeps the zero-match wording for a window that matched nothing', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      getData: vi.fn().mockResolvedValue({
+        data: [],
+        indicator: { id: 'SP.POP.TOTL', name: 'Population, total' },
+        total: 0,
+        page: 3,
+        pages: 1,
+        nullCount: 0,
+        dateFilterDropped: true,
+      }),
+    } as never);
+
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const ctx = createMockContext({ errors: worldbankGetData.errors });
+    await worldbankGetData.handler(
+      worldbankGetData.input.parse({
+        indicator_id: 'SP.POP.TOTL',
+        countries: 'KEN',
+        date_range: '1850:1900',
+        page: 3,
+      }),
+      ctx,
+    );
+    const notice = getEnrichment(ctx).notice as string;
+    expect(notice).toContain('No observations fall inside date_range "1850:1900"');
+    expect(notice).not.toMatch(/past the end/);
+  });
+
   it('returns empty data (no throw) when service returns no observations', async () => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
     vi.mocked(getWorldBankApiService).mockReturnValue({
@@ -740,36 +810,126 @@ describe('worldbankGetData', () => {
   });
 
   it.each([['all,US'], ['US;all'], [' ALL , us '], [['all', 'US']], [['US', 'all,JP']]])(
-    'rejects "all" mixed with other codes: %j',
+    'rejects "all" mixed with other codes as mixed_all_selector, on both surfaces: %j',
     async (countries) => {
+      const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+      const getDataMock = vi.fn().mockResolvedValue(mockDataResult);
+      vi.mocked(getWorldBankApiService).mockReturnValue({ getData: getDataMock } as never);
+
       const { worldbankGetData } = await import(
         '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
       );
-      expect(() =>
-        worldbankGetData.input.parse({ indicator_id: 'NY.GDP.PCAP.CD', countries }),
-      ).toThrow('cannot be combined with other country codes');
+      // A recoverable mistake, so the schema lets it through to a declared reason.
+      expect(
+        worldbankGetData.input.safeParse({ indicator_id: 'NY.GDP.PCAP.CD', countries }).success,
+      ).toBe(true);
+      const result = await runToolContract(
+        worldbankGetData,
+        { indicator_id: 'NY.GDP.PCAP.CD', countries },
+        { context: { errors: worldbankGetData.errors } },
+      );
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ValidationError,
+          data: {
+            reason: 'mixed_all_selector',
+            recovery: { hint: expect.stringContaining('"all" on its own') },
+          },
+        },
+      });
+      const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+      expect(text).toContain('cannot be combined with other country codes');
+      expect(text).toMatch(/Recovery:.*"all" on its own/);
+      expect(text).not.toMatch(/"US" .*not valid|Country code\(s\)/);
+      expect(getDataMock).not.toHaveBeenCalled();
     },
   );
 
-  it('rejects "all" mixed with a code through the tool contract before any upstream call', async () => {
+  it.each([
+    ['2030:2020', '2030', '2020'],
+    ['2020:2010', '2020', '2010'],
+    ['2021Q4:2020Q1', '2021Q4', '2020Q1'],
+    [' 2020m06:2020m01 ', '2020M06', '2020M01'],
+  ])(
+    'rejects the reversed date_range %j as reversed_date_range before any request, on both surfaces',
+    async (date_range, start, end) => {
+      const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+      const getDataMock = vi.fn().mockResolvedValue(mockDataResult);
+      vi.mocked(getWorldBankApiService).mockReturnValue({ getData: getDataMock } as never);
+
+      const { worldbankGetData } = await import(
+        '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+      );
+      // Well-shaped, so the schema passes it to the handler's ordering check.
+      expect(
+        worldbankGetData.input.safeParse({
+          indicator_id: 'SP.POP.TOTL',
+          countries: 'US',
+          date_range,
+        }).success,
+      ).toBe(true);
+      const result = await runToolContract(
+        worldbankGetData,
+        { indicator_id: 'SP.POP.TOTL', countries: 'US', date_range },
+        { context: { errors: worldbankGetData.errors } },
+      );
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ValidationError,
+          data: {
+            reason: 'reversed_date_range',
+            dateRange: date_range.trim(),
+            recovery: { hint: expect.stringContaining('earliest period first') },
+          },
+        },
+      });
+      const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+      expect(text).toContain(`${start} comes after ${end}`);
+      expect(text).toMatch(/Recovery:.*earliest period first/);
+      expect(getDataMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it('accepts a single-period range whose endpoints are equal', async () => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
     const getDataMock = vi.fn().mockResolvedValue(mockDataResult);
     vi.mocked(getWorldBankApiService).mockReturnValue({ getData: getDataMock } as never);
-
     const { worldbankGetData } = await import(
       '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
     );
     const result = await runToolContract(
       worldbankGetData,
-      { indicator_id: 'NY.GDP.PCAP.CD', countries: 'all,US' },
+      { indicator_id: 'SP.POP.TOTL', countries: 'US', date_range: '2020Q2:2020Q2' },
       { context: { errors: worldbankGetData.errors } },
     );
-    expect(result.isError).toBe(true);
-    expect(result.structuredContent).toMatchObject({ error: { code: expect.any(Number) } });
-    const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
-    expect(text).toContain('cannot be combined with other country codes');
-    expect(text).not.toMatch(/"US" .*not valid|Country code\(s\)/);
-    expect(getDataMock).not.toHaveBeenCalled();
+    expect(result.isError).toBeFalsy();
+    expect(getDataMock.mock.calls[0]?.[0].dateRange).toBe('2020Q2:2020Q2');
+  });
+
+  it('reports both date_range and mrv as invalid_params before checking the range order', async () => {
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const result = await runToolContract(
+      worldbankGetData,
+      { indicator_id: 'SP.POP.TOTL', countries: 'US', date_range: '2020:2010', mrv: 5 },
+      { context: { errors: worldbankGetData.errors } },
+    );
+    expect(result.structuredContent).toMatchObject({
+      error: { data: { reason: 'invalid_params' } },
+    });
+  });
+
+  it('declares no error reason the handler cannot reach', async () => {
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const source = worldbankGetData.handler.toString();
+    for (const { reason } of worldbankGetData.errors ?? []) {
+      expect(source).toContain(reason);
+    }
   });
 
   it.each([
@@ -778,8 +938,6 @@ describe('worldbankGetData', () => {
     '202',
     '2020:202',
     'last five years',
-    '2030:2020',
-    '2021Q4:2020Q1',
     '2020Q5',
     '2020M13',
     '2020M3', // upstream rejects an unpadded month

@@ -6,6 +6,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { getServerConfig } from '@/config/server-config.js';
+import { pagePastEndNotice } from '@/mcp-server/tools/page-past-end-notice.js';
 import { getWorldBankApiService } from '@/services/worldbank/worldbank-service.js';
 
 export const worldbankListSources = tool('worldbank_list_sources', {
@@ -45,23 +46,41 @@ export const worldbankListSources = tool('worldbank_list_sources', {
   // reaches both structuredContent and content[] automatically.
   enrichment: {
     totalCount: z.number().describe('Total number of sources.'),
-    currentPage: z.number().describe('Current page number.'),
+    currentPage: z
+      .number()
+      .describe('Page number requested — past totalPages when the request ran off the end.'),
     totalPages: z.number().describe('Total number of pages.'),
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'Context for an empty page: the page range that exists when the requested page is past the end.',
+      ),
   },
 
-  handler(input, ctx) {
+  async handler(input, ctx) {
     const perPage = input.per_page ?? getServerConfig().defaultPerPage;
     ctx.log.info('Listing World Bank sources', { page: input.page, perPage });
-    return getWorldBankApiService()
-      .listSources(input.page, perPage, ctx)
-      .then((result) => {
-        ctx.enrich({
-          totalCount: result.total,
-          currentPage: result.page,
-          totalPages: result.pages,
-        });
-        return { sources: result.sources };
-      });
+    const result = await getWorldBankApiService().listSources(input.page, perPage, ctx);
+    ctx.enrich({
+      totalCount: result.total,
+      currentPage: result.page,
+      totalPages: result.pages,
+    });
+    if (result.total === 0) {
+      ctx.enrich.notice('The World Bank returned no data sources.');
+    } else if (result.sources.length === 0) {
+      ctx.enrich.notice(
+        pagePastEndNotice({
+          noun: ['source', 'sources'],
+          page: result.page,
+          pages: result.pages,
+          perPage,
+          total: result.total,
+        }),
+      );
+    }
+    return { sources: result.sources };
   },
 
   format: (result) => {
@@ -74,6 +93,7 @@ export const worldbankListSources = tool('worldbank_list_sources', {
         lines.push(`**Metadata availability:** ${s.metadataAvailability}`);
       if (s.concepts) lines.push(`**Concepts:** ${s.concepts}`);
     }
+    if (lines.length === 0) lines.push('No sources returned.');
     return [{ type: 'text', text: lines.join('\n') }];
   },
 });

@@ -22,7 +22,8 @@ import {
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
-import type { PipValidationBody, PovertyRow, RawPipRow } from './types.js';
+import { MAX_ESTIMATES_PER_PAGE } from '@/services/response-budget.js';
+import type { PipValidationBody, PovertyRow, RawPipRow, RawPipVersion } from './types.js';
 
 /** Minimal request-context shape that satisfies fetchWithTimeout and withRetry. */
 type ReqCtx = Context & Record<string, unknown>;
@@ -179,6 +180,8 @@ function normalizeRow(raw: RawPipRow): PovertyRow {
     population: raw.reporting_pop ?? null,
     surveyYear: raw.survey_year ?? null,
     surveyAcronym: raw.survey_acronym ?? '',
+    surveyComparability: raw.survey_comparability ?? null,
+    comparableSpell: raw.comparable_spell ?? null,
     estimationType: raw.estimation_type ?? '',
     isInterpolated: raw.is_interpolated ?? false,
   };
@@ -219,17 +222,31 @@ function compareRows(a: PovertyRow, b: PovertyRow): number {
 /** Query parameters `/pip` accepts, before `fill_gaps` is decided per request. */
 type PipQuery = {
   country: string;
+  version: string;
   year?: string;
   povline?: number;
   welfare_type?: string;
   reporting_level?: string;
 };
 
+/** The data release and PPP vintage every request of one query is pinned to. */
+type ResolvedVersion = { pppVersion: string; releaseVersion: string; version: string };
+
 export class PipService {
   private readonly baseUrl: string;
+  private readonly versionsCacheTtlMs: number;
+
+  /**
+   * The `/versions` listing, cached as a promise so concurrent queries share one
+   * request. Held on the instance, like the Indicators service's reference
+   * caches, so tests and multiple instances stay isolated.
+   */
+  private versionsCache: { expiresAt: number; listing: Promise<RawPipVersion[]> } | undefined;
 
   constructor(_config: AppConfig, _storage: StorageService) {
-    this.baseUrl = getServerConfig().pipBaseUrl.replace(/\/$/, '');
+    const serverConfig = getServerConfig();
+    this.baseUrl = serverConfig.pipBaseUrl.replace(/\/$/, '');
+    this.versionsCacheTtlMs = serverConfig.catalogCacheTtlMs;
   }
 
   private buildUrl(query: PipQuery, fillGaps: boolean): string {
@@ -240,11 +257,12 @@ export class PipService {
     return `${this.baseUrl}/pip?${qs.toString()}`;
   }
 
-  /** Fetch one `/pip` response, mapping PIP's status codes to domain errors. */
-  private fetchRows(query: PipQuery, fillGaps: boolean, ctx: Context): Promise<RawPipRow[]> {
-    const url = this.buildUrl(query, fillGaps);
-    ctx.log.debug('Fetching PIP estimates', { url });
-
+  /** Fetch and parse one PIP response, with non-2xx statuses translated by `classify`. */
+  private fetchJson(
+    url: string,
+    ctx: Context,
+    classify: (error: McpError) => McpError,
+  ): Promise<unknown> {
     return withRetry(
       async () => {
         let text: string;
@@ -255,7 +273,7 @@ export class PipService {
           });
           text = await response.text();
         } catch (error) {
-          if (error instanceof McpError) throw classifyPipError(error, query.country);
+          if (error instanceof McpError) throw classify(error);
           throw error;
         }
 
@@ -266,17 +284,10 @@ export class PipService {
           );
         }
 
-        const parsed: unknown = JSON.parse(text);
-        if (!Array.isArray(parsed)) {
-          throw serializationError(
-            'PIP returned a response that is not the expected array of estimate rows.',
-            { url },
-          );
-        }
-        return parsed as RawPipRow[];
+        return JSON.parse(text) as unknown;
       },
       {
-        operation: 'PipService.fetchRows',
+        operation: 'PipService.fetchJson',
         context: ctx as ReqCtx,
         baseDelayMs: 1000,
         /**
@@ -291,6 +302,101 @@ export class PipService {
         signal: ctx.signal,
       },
     );
+  }
+
+  /** Fetch one `/pip` response, mapping PIP's status codes to domain errors. */
+  private async fetchRows(query: PipQuery, fillGaps: boolean, ctx: Context): Promise<RawPipRow[]> {
+    const url = this.buildUrl(query, fillGaps);
+    ctx.log.debug('Fetching PIP estimates', { url });
+
+    const parsed = await this.fetchJson(url, ctx, (error) =>
+      classifyPipError(error, query.country),
+    );
+    if (!Array.isArray(parsed)) {
+      throw serializationError(
+        'PIP returned a response that is not the expected array of estimate rows.',
+        { url },
+      );
+    }
+    return parsed as RawPipRow[];
+  }
+
+  /** Load the `/versions` listing, from cache while it is fresh. */
+  private loadVersions(ctx: Context): Promise<RawPipVersion[]> {
+    const cached = this.versionsCache;
+    if (cached && cached.expiresAt > Date.now()) return cached.listing;
+
+    const url = `${this.baseUrl}/versions?format=json`;
+    ctx.log.debug('Fetching PIP versions', { url });
+    const listing = this.fetchJson(url, ctx, (error) => error).then((parsed) => {
+      if (!Array.isArray(parsed)) {
+        throw serializationError('PIP returned a versions listing that is not an array.', { url });
+      }
+      return parsed as RawPipVersion[];
+    });
+
+    this.versionsCache = { listing, expiresAt: Date.now() + this.versionsCacheTtlMs };
+    // A failed listing must not be served from cache to the next query.
+    listing.catch(() => {
+      if (this.versionsCache?.listing === listing) this.versionsCache = undefined;
+    });
+    return listing;
+  }
+
+  /**
+   * Pin a query to one release and PPP vintage. The listing keeps older releases
+   * that `/pip` no longer serves — they answer HTTP 500, every 2011-vintage
+   * build among them — so the choice is confined to the newest
+   * `release_version`, and a vintage that release was not built at is rejected
+   * rather than sent. The newest release is found by its `YYYYMMDD` stamp, not
+   * by the listing's order.
+   */
+  private async resolveVersion(
+    pppVersion: string | undefined,
+    ctx: Context,
+  ): Promise<ResolvedVersion> {
+    const entries = (await this.loadVersions(ctx)).flatMap((entry) =>
+      entry.version && entry.release_version && entry.ppp_version
+        ? [
+            {
+              version: entry.version,
+              releaseVersion: entry.release_version,
+              pppVersion: entry.ppp_version,
+            },
+          ]
+        : [],
+    );
+
+    const releaseVersion = entries.reduce(
+      (newest, entry) => (entry.releaseVersion > newest ? entry.releaseVersion : newest),
+      '',
+    );
+    if (!releaseVersion) {
+      throw serializationError('PIP returned a versions listing that names no data release.');
+    }
+
+    const current = entries
+      .filter((entry) => entry.releaseVersion === releaseVersion)
+      .sort((a, b) => b.pppVersion.localeCompare(a.pppVersion));
+    const chosen =
+      pppVersion === undefined
+        ? current[0]
+        : current.find((entry) => entry.pppVersion === pppVersion);
+
+    if (!chosen) {
+      const available = current.map((entry) => entry.pppVersion);
+      throw validationError(
+        `PPP vintage ${pppVersion} is not available: PIP's current data release (${releaseVersion}) is published at PPP vintages ${available.join(', ')}.`,
+        {
+          reason: 'ppp_version_unavailable',
+          pppVersion,
+          availablePppVersions: available,
+          releaseVersion,
+          retryable: false,
+        },
+      );
+    }
+    return chosen;
   }
 
   /**
@@ -316,6 +422,10 @@ export class PipService {
    * economy with survey rows still has gaps between and after them. Gap-filling
    * there is per row grain, which is what keeps `fill_gaps` from silently doing
    * nothing on the most common query of all — one economy, no year.
+   *
+   * Both requests carry the same fully-qualified `version`, resolved once up
+   * front, so the survey rows and the estimates filled around them always come
+   * from one release at one PPP vintage.
    */
   async getPoverty(
     opts: {
@@ -324,6 +434,7 @@ export class PipService {
       povertyLine?: number;
       welfareType?: string;
       reportingLevel?: string;
+      pppVersion?: string;
       fillGaps: boolean;
       page: number;
       perPage: number;
@@ -334,14 +445,20 @@ export class PipService {
     total: number;
     page: number;
     pages: number;
+    /** Page size actually served: the requested size, reduced to the page cap when larger. */
+    perPage: number;
     gapFilled: boolean;
+    pppVersion: string;
+    releaseVersion: string;
   }> {
     const { countries, year, povertyLine, welfareType, reportingLevel, fillGaps, page, perPage } =
       opts;
 
+    const resolved = await this.resolveVersion(opts.pppVersion, ctx);
     const requested = countries.map((code) => code.trim().toUpperCase());
     const query: PipQuery = {
       country: requested.join(','),
+      version: resolved.version,
       ...(year !== undefined && { year }),
       ...(povertyLine !== undefined && { povline: povertyLine }),
       ...(welfareType !== undefined && { welfare_type: welfareType }),
@@ -377,14 +494,18 @@ export class PipService {
     }
 
     rows.sort(compareRows);
-    const start = (page - 1) * perPage;
+    const size = Math.min(perPage, MAX_ESTIMATES_PER_PAGE);
+    const start = (page - 1) * size;
 
     return {
-      rows: rows.slice(start, start + perPage),
+      rows: rows.slice(start, start + size),
       total: rows.length,
       page,
-      pages: Math.max(1, Math.ceil(rows.length / perPage)),
+      pages: Math.max(1, Math.ceil(rows.length / size)),
+      perPage: size,
       gapFilled,
+      pppVersion: resolved.pppVersion,
+      releaseVersion: resolved.releaseVersion,
     };
   }
 }
