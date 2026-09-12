@@ -1,6 +1,6 @@
 # worldbank-mcp-server - Directory Structure
 
-Generated on: 2026-09-12 21:29:35
+Generated on: 2026-09-12 22:55:16
 
 ```text
 worldbank-mcp-server/
@@ -144,16 +144,17 @@ worldbank-mcp-server/
 │   │   │       ├── worldbank-country.resource.ts
 │   │   │       └── worldbank-indicator.resource.ts
 │   │   └── tools/
-│   │       └── definitions/
-│   │           ├── worldbank-get-country.tool.ts
-│   │           ├── worldbank-get-data.tool.ts
-│   │           ├── worldbank-get-indicator.tool.ts
-│   │           ├── worldbank-get-poverty.tool.ts
-│   │           ├── worldbank-list-countries.tool.ts
-│   │           ├── worldbank-list-sources.tool.ts
-│   │           ├── worldbank-list-topics.tool.ts
-│   │           ├── worldbank-search-indicators.tool.ts
-│   │           └── worldbank-search-projects.tool.ts
+│   │       ├── definitions/
+│   │       │   ├── worldbank-get-country.tool.ts
+│   │       │   ├── worldbank-get-data.tool.ts
+│   │       │   ├── worldbank-get-indicator.tool.ts
+│   │       │   ├── worldbank-get-poverty.tool.ts
+│   │       │   ├── worldbank-list-countries.tool.ts
+│   │       │   ├── worldbank-list-sources.tool.ts
+│   │       │   ├── worldbank-list-topics.tool.ts
+│   │       │   ├── worldbank-search-indicators.tool.ts
+│   │       │   └── worldbank-search-projects.tool.ts
+│   │       └── page-past-end-notice.ts
 │   ├── services/
 │   │   ├── pip/
 │   │   │   ├── pip-service.ts
@@ -161,10 +162,11 @@ worldbank-mcp-server/
 │   │   ├── projects/
 │   │   │   ├── projects-service.ts
 │   │   │   └── types.ts
-│   │   └── worldbank/
-│   │       ├── identifiers.ts
-│   │       ├── types.ts
-│   │       └── worldbank-service.ts
+│   │   ├── worldbank/
+│   │   │   ├── identifiers.ts
+│   │   │   ├── types.ts
+│   │   │   └── worldbank-service.ts
+│   │   └── response-budget.ts
 │   └── index.ts
 ├── tests/
 │   ├── prompts/

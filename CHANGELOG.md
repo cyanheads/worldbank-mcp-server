@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.5](changelog/0.3.x/0.3.5.md) — 2026-09-12
+
+worldbank_get_poverty gains a ppp_version selector, response-size caps land on worldbank_search_projects and worldbank_get_poverty, and paginated tools disclose when a request runs past the end.
+
 ## [0.3.4](changelog/0.3.x/0.3.4.md) — 2026-09-12
 
 Single-item lookups reject \"all\" and code lists, worldbank_search_indicators combines topic and source filters and rejects punctuation-only queries, and provider HTML is removed from indicator source notes.
