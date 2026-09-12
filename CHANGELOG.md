@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.3](changelog/0.3.x/0.3.3.md) — 2026-09-12
+
+worldbank_get_data reports archived/retired indicators by name instead of blaming valid country codes, and accepts comma- or semicolon-separated countries strings like the other tools.
+
 ## [0.3.2](changelog/0.3.x/0.3.2.md) — 2026-08-25
 
 Packaging-only patch — the Dockerfile build stage now runs on the native builder platform, so the linux/amd64 image no longer compiles TypeScript under QEMU emulation. No runtime or API change.
