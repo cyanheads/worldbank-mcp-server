@@ -21,11 +21,7 @@ function splitCodes(value: string): string[] {
 export const worldbankGetPoverty = tool('worldbank_get_poverty', {
   title: 'Get World Bank Poverty and Inequality Estimates',
   description:
-    'Queries poverty and inequality estimates from the World Bank Poverty and Inequality Platform (PIP) for one or more countries. ' +
-    'Returns the poverty headcount ratio, poverty gap, and poverty severity at any poverty line, plus mean and median welfare and population. ' +
-    'This is also the tool for inequality and distribution questions — survey-based rows carry the Gini coefficient, mean log deviation, polarization, and the ten decile income/consumption shares, because PIP returns poverty and inequality in the same row. ' +
-    'PIP is a separate dataset from the WDI series worldbank_get_data reads: it measures welfare in PPP dollars per person per day and covers individual economies only, so regional and income-group aggregate codes are not accepted. ' +
-    'Every row reports how it was produced. estimationType "survey" rows carry the full inequality block; "interpolation", "extrapolation", and "CMD estimation" rows are gap-filled estimates for years no survey covers, and their gini, mld, polarization, and decileShares are null — a documented gap in the source data, not an error.',
+    'Query poverty and inequality estimates from the World Bank Poverty and Inequality Platform (PIP) for one or more countries. Returns the poverty headcount ratio, poverty gap, and poverty severity at any poverty line, plus mean and median welfare and population. Use it for inequality and distribution questions too — survey-based rows carry the Gini coefficient, mean log deviation, polarization, and the ten decile income/consumption shares, because PIP returns poverty and inequality in the same row. PIP is a separate dataset from the WDI series worldbank_get_data reads: it measures welfare in PPP dollars per person per day and covers individual economies only, so regional and income-group aggregate codes are not accepted. Every row reports how it was produced. estimationType "survey" rows carry the full inequality block; "interpolation", "extrapolation", and "CMD estimation" rows are gap-filled estimates for years no survey covers, and their gini, mld, polarization, and decileShares are null — a documented gap in the source data, not an error.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     countries: z
@@ -49,9 +45,7 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
           .describe('An array of country codes.'),
       ])
       .describe(
-        'Country codes. PIP identifies economies by ISO3 code (IND, USA, BRA); "all" returns every economy it covers. ' +
-          'Pass a single code, an array, or one string separated by commas or semicolons. ' +
-          'Regional, income-group, and world aggregate codes (WLD, SSF, HIC) are not served by this dataset — query the individual economies instead.',
+        'Country codes. PIP identifies economies by ISO3 code (IND, USA, BRA); "all" returns every economy it covers. Pass a single code, an array, or one string separated by commas or semicolons. Regional, income-group, and world aggregate codes (WLD, SSF, HIC) are not served by this dataset — query the individual economies instead.',
       ),
     year: z
       .string()
@@ -65,8 +59,7 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
       )
       .optional()
       .describe(
-        'Reporting year to return. A four-digit year (2022), "all" for the full history, or "MRV" for the most recent year available. ' +
-          'Omitted behaves as "all". PIP coverage starts in 1963 and runs to the current year.',
+        'Reporting year to return. A four-digit year (2022), "all" for the full history, or "MRV" for the most recent year available. Omitted behaves as "all". PIP coverage starts in 1963 and runs to the current year.',
       ),
     poverty_line: z
       .number()
@@ -74,9 +67,7 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
       .max(2700)
       .optional()
       .describe(
-        'Poverty line in PPP dollars per person per day — any threshold, not only the published ones. ' +
-          'Omitted uses the international poverty line of the PIP release currently served, so the applied value is echoed back on every row as povertyLine rather than assumed here. ' +
-          'The poverty line does not affect the inequality fields, which describe the whole distribution.',
+        'Poverty line in PPP dollars per person per day — any threshold, not only the published ones. Omitted uses the international poverty line of the PIP release currently served, so the applied value is echoed back on every row as povertyLine rather than assumed here. The poverty line does not affect the inequality fields, which describe the whole distribution.',
       ),
     welfare_type: z
       .union([

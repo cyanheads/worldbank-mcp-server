@@ -7,6 +7,11 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { getServerConfig } from '@/config/server-config.js';
+import {
+  INDICATOR_ID,
+  INDICATOR_ID_MESSAGE,
+  isAllSelector,
+} from '@/services/worldbank/identifiers.js';
 import { getWorldBankApiService } from '@/services/worldbank/worldbank-service.js';
 
 /** Split a caller-supplied country string on either separator this server's tools use. */
@@ -33,18 +38,14 @@ const MIXED_ALL_MESSAGE =
 export const worldbankGetData = tool('worldbank_get_data', {
   title: 'Get World Bank Indicator Data',
   description:
-    'Queries World Bank indicator values for one or more countries across a time range. ' +
-    'The primary data-access tool — use worldbank_search_indicators to find indicator_id values. ' +
-    'Returns observations with null values when data is not available for a country×year cell (common for sparse series). ' +
-    'Specify either date_range (historical analysis) or mrv (most recent N values), not both. ' +
-    'For "all" countries, use pagination (per_page up to 1000) — the API returns several hundred entries per indicator.',
+    'Query World Bank indicator values for one or more countries across a time range — the primary data-access tool; find indicator_id values with worldbank_search_indicators. Observations carry a null value where data is not available for a country×year cell, which is common for sparse series. Set either date_range (historical analysis) or mrv (most recent N values), not both. For "all" countries, page through the results (per_page up to 1000), since the API returns several hundred entries per indicator.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     indicator_id: z
       .string()
-      .min(1)
+      .regex(INDICATOR_ID, INDICATOR_ID_MESSAGE)
       .describe(
-        'Indicator code to query (e.g. NY.GDP.PCAP.CD, SP.POP.TOTL). Use worldbank_search_indicators to find valid IDs.',
+        'One indicator code to query (e.g. NY.GDP.PCAP.CD, SP.POP.TOTL) — not "all" or a list of codes. Use worldbank_search_indicators to find valid IDs.',
       ),
     countries: z
       .union([
@@ -66,10 +67,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
           .describe('An array of country codes.'),
       ])
       .describe(
-        'Country codes. Accepts: ISO2 (US, CN), ISO3 (USA, CHN), regional aggregate codes (EAS, LCN, MEA, SAS, SSF, ECS, NAC), ' +
-          'income group codes (HIC, UMC, LMC, LIC), world code (WLD), or "all" on its own for every entry (use pagination). ' +
-          'Pass a single code, an array, or one string separated by commas or semicolons. ' +
-          'At least one code is required — an empty value is rejected rather than treated as "all".',
+        'Country codes. Accepts: ISO2 (US, CN), ISO3 (USA, CHN), regional aggregate codes (EAS, LCN, MEA, SAS, SSF, ECS, NAC), income group codes (HIC, UMC, LMC, LIC), world code (WLD), or "all" on its own for every entry (use pagination). Pass a single code, an array, or one string separated by commas or semicolons. At least one code is required — an empty value is rejected rather than treated as "all".',
       ),
     date_range: z
       .string()
@@ -94,11 +92,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
       }, 'date_range must run earliest period first.')
       .optional()
       .describe(
-        'Time window to filter observations to. Accepts a whole year (`2020`), a quarter (`2020Q1`), or a month (`2020M03`), ' +
-          'or a range of two periods of the same type separated by a colon, earliest first (`2010:2023`, `2020Q1:2021Q4`, `2020M01:2020M06`). ' +
-          'A window and an observation match whenever the periods overlap, so a year window also selects the quarters and months inside it. ' +
-          'A window covering no part of the series returns zero observations rather than the full series. ' +
-          'Mutually exclusive with mrv.',
+        'Time window to filter observations to. Accepts a whole year (`2020`), a quarter (`2020Q1`), or a month (`2020M03`), or a range of two periods of the same type separated by a colon, earliest first (`2010:2023`, `2020Q1:2021Q4`, `2020M01:2020M06`). A window and an observation match whenever the periods overlap, so a year window also selects the quarters and months inside it. A window covering no part of the series returns zero observations rather than the full series. Mutually exclusive with mrv.',
       ),
     mrv: z
       .number()
@@ -107,8 +101,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
       .max(100)
       .optional()
       .describe(
-        'Return the N most recent available values per country (1–100), clamped upstream to the length of the series. ' +
-          'Rows are mrv × countries, so page through them with per_page. Mutually exclusive with date_range.',
+        'Return the N most recent available values per country (1–100), clamped upstream to the length of the series. Rows are mrv × countries, so page through them with per_page. Mutually exclusive with date_range.',
       ),
     page: z.number().int().min(1).default(1).describe('Pagination page number (1-based).'),
     per_page: z
@@ -227,6 +220,13 @@ export const worldbankGetData = tool('worldbank_get_data', {
       recovery: 'Remove date_range to use mrv, or remove mrv to use date_range.',
     },
     {
+      reason: 'multiple_indicators',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The indicator ID is "all", which selects every indicator rather than one.',
+      recovery:
+        'Pass a single indicator ID; use worldbank_search_indicators to find the indicator to query.',
+    },
+    {
       reason: 'indicator_not_found',
       code: JsonRpcErrorCode.NotFound,
       when: 'The indicator ID does not exist.',
@@ -259,6 +259,19 @@ export const worldbankGetData = tool('worldbank_get_data', {
       throw ctx.fail('invalid_params', 'Provide either date_range or mrv, not both.', {
         recovery: { hint: 'Remove date_range to use mrv, or remove mrv to use date_range.' },
       });
+    }
+
+    /**
+     * The data endpoint rejects `all` in place of an indicator with the same
+     * envelope as a bad code, and the catalog lookup that places the rejection
+     * finds rows for `all`, which would blame valid country codes.
+     */
+    if (isAllSelector(input.indicator_id)) {
+      throw ctx.fail(
+        'multiple_indicators',
+        `indicator_id "${input.indicator_id}" selects every indicator; the data endpoint serves one indicator per call.`,
+        { ...ctx.recoveryFor('multiple_indicators'), indicatorId: input.indicator_id },
+      );
     }
 
     const dateRange = input.date_range?.trim() ? input.date_range.trim() : undefined;

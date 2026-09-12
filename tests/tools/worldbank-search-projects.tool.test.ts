@@ -100,7 +100,7 @@ describe('worldbankSearchProjects', () => {
     const tool = await loadTool();
     const result = await tool.handler(
       tool.input.parse({ query: 'climate', countries: 'BR' }),
-      createMockContext(),
+      createMockContext({ errors: tool.errors }),
     );
 
     expect(result.projects).toHaveLength(2);
@@ -133,14 +133,20 @@ describe('worldbankSearchProjects', () => {
     expect(tool.input.safeParse({ countries: 'BR,3A' }).success).toBe(true);
 
     const searchProjects = await stubService({ projects: [project], total: 1 });
-    await tool.handler(tool.input.parse({ countries: '3a' }), createMockContext());
+    await tool.handler(
+      tool.input.parse({ countries: '3a' }),
+      createMockContext({ errors: tool.errors }),
+    );
     expect(searchProjects.mock.calls[0]?.[0]).toMatchObject({ countryCodes: ['3a'] });
   });
 
   it("splits a single string on either separator this server's tools use", async () => {
     const searchProjects = await stubService({ projects: [project], total: 1 });
     const tool = await loadTool();
-    await tool.handler(tool.input.parse({ countries: 'br; in, ZA' }), createMockContext());
+    await tool.handler(
+      tool.input.parse({ countries: 'br; in, ZA' }),
+      createMockContext({ errors: tool.errors }),
+    );
 
     expect(searchProjects.mock.calls[0]?.[0]).toMatchObject({
       countryCodes: ['br', 'in', 'ZA'],
@@ -191,7 +197,7 @@ describe('worldbankSearchProjects', () => {
     const tool = await loadTool();
     await tool.handler(
       tool.input.parse({ query: '   ', approved_from: '', approved_to: '' }),
-      createMockContext(),
+      createMockContext({ errors: tool.errors }),
     );
 
     const sent = searchProjects.mock.calls[0]?.[0] as Record<string, unknown>;
@@ -424,10 +430,9 @@ describe('worldbankSearchProjects', () => {
   it('renders every project field into content[]', async () => {
     const tool = await loadTool();
     const [block] =
-      tool.format?.(
-        { projects: [{ ...project, abstract: 'Rehabilitation of the dam.' }, sparseProject] },
-        createMockContext(),
-      ) ?? [];
+      tool.format?.({
+        projects: [{ ...project, abstract: 'Rehabilitation of the dam.' }, sparseProject],
+      }) ?? [];
     const text = (block as { text: string }).text;
 
     expect(text).toContain('(P513080)');
@@ -451,7 +456,7 @@ describe('worldbankSearchProjects', () => {
 
   it('renders an empty result without throwing', async () => {
     const tool = await loadTool();
-    const [block] = tool.format?.({ projects: [] }, createMockContext()) ?? [];
+    const [block] = tool.format?.({ projects: [] }) ?? [];
     expect((block as { text: string }).text).toContain('No projects returned.');
   });
 });

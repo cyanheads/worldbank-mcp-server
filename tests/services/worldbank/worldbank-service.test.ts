@@ -5,8 +5,12 @@
  * @module tests/services/worldbank/worldbank-service.test
  */
 
-import { JsonRpcErrorCode, type McpError } from '@cyanheads/mcp-ts-core/errors';
-import { createInMemoryStorage, createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
+import {
+  createInMemoryStorage,
+  createMockContext,
+  runToolContract,
+} from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // ─── fetchWithTimeout mock ────────────────────────────────────────────────────
@@ -29,10 +33,8 @@ vi.mock('@/config/server-config.js', () => ({
 
 function makeConfig() {
   // AppConfig shape — only what WorldBankApiService's constructor receives
-  return {} as Parameters<
-    InstanceType<
-      typeof import('@/services/worldbank/worldbank-service.js')['WorldBankApiService']
-    >['constructor']
+  return {} as ConstructorParameters<
+    typeof import('@/services/worldbank/worldbank-service.js')['WorldBankApiService']
   >[0];
 }
 
@@ -96,6 +98,31 @@ function rawDataPoint(
     value,
     obs_status: '',
   };
+}
+
+/** The XHTML page upstream answers a malformed path with, as captured into an HTTP error. */
+const UPSTREAM_404_PAGE =
+  '<?xml version="1.0" encoding="utf-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"><html><body>404 - File or directory not found.</body></html>';
+
+/**
+ * The error the framework's `fetchWithTimeout` throws for a non-OK status: the
+ * status-mapped code, the redacted URL in the message, and the captured body
+ * under both its canonical and legacy field names.
+ */
+function upstreamHttpError(status: number, path: string) {
+  const code = status === 404 ? JsonRpcErrorCode.NotFound : JsonRpcErrorCode.ServiceUnavailable;
+  return new McpError(
+    code,
+    `Fetch failed for https://api.worldbank.org/v2${path}?…. Status: ${status}`,
+    {
+      status,
+      statusText: status === 404 ? 'Not Found' : 'Service Unavailable',
+      body: UPSTREAM_404_PAGE,
+      statusCode: status,
+      responseBody: UPSTREAM_404_PAGE,
+      errorSource: 'FetchHttpError',
+    },
+  );
 }
 
 /** The WB "invalid parameter value" body, returned with HTTP 200. */
@@ -321,6 +348,34 @@ describe('WorldBankApiService', () => {
     expect(result).toMatchObject({ sourceId: '88', sourceName: 'Food Prices for Nutrition' });
   });
 
+  /**
+   * `/indicator/{id}` also takes collection selectors: `all` answers the first
+   * page of the whole catalog. A lookup is single only when every row shares
+   * one ID — row count alone would reject the dual-source IDs above.
+   */
+  it('getIndicator: rejects a selector that resolves to more than one indicator ID', async () => {
+    mockResponse([
+      pagingObj({ total: 29544, pages: 591 }),
+      [
+        rawIndicatorFrom('1.1_YOUTH.LITERACY.RATE', 'Literacy rate, youth', '34', 'GPE'),
+        rawIndicatorFrom('1.0.HCount.1.90usd', 'Poverty Headcount ($1.90 a day)', '37', 'LAC'),
+        rawIndicatorFrom('1.0.HCount.1.90usd', 'Poverty Headcount ($1.90 a day)', '99', 'Archive'),
+      ],
+    ]);
+    const ctx = createMockContext();
+    const err = await service.getIndicator('all', ctx).catch((e: unknown) => e);
+    expect(err).toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: {
+        reason: 'multiple_indicators',
+        indicatorId: 'all',
+        matchedIds: ['1.1_YOUTH.LITERACY.RATE', '1.0.HCount.1.90usd'],
+      },
+    });
+    expect((err as McpError).message).toContain('"all"');
+    expect((err as McpError).message).toContain('worldbank_search_indicators');
+  });
+
   it('getIndicator: throws notFound when WbErrorEnvelope returned (object form)', async () => {
     fetchWithTimeoutMock.mockResolvedValueOnce({
       text: async () =>
@@ -374,6 +429,74 @@ describe('WorldBankApiService', () => {
     expect(result.unit).toBe('');
     expect(result.sourceOrganization).toBe('');
     expect(result.topics).toHaveLength(0);
+  });
+
+  // ─── Provider markup in sourceNote ────────────────────────────────────────
+
+  /** Live `/indicator/SE.PRM.INPT` source note, verbatim — a `</br>` inside a dash list. */
+  const SE_PRM_INPT_NOTE =
+    'School survey.  Total score is the sum of whether a school has:   , Functional blackboard    - Pens, pencils, exercise books </br> - Textbooks   - Fraction of students in class with a desk    - Used ICT in class and have access to ICT in the school.';
+
+  /** Live `/indicator/SE.PRM.TSUP` source note, verbatim — a `<br>` before its last item. */
+  const SE_PRM_TSUP_NOTE =
+    'School survey.  Our teaching support indicator asks teachers about participation and the experience with several types of formal/informal training:      Pre,Service (Induction) Training:   - 0.5 Points. Had a pre-service training   - 0.5 Points.  Teacher reported receiving usable skills from training      Teacher practicum (teach a class with supervision)   - 0.5 Points. Teacher participated in a practicum   - 0.5 Points.  Practicum lasted more than 3 months and teacher spent more than one hour per day teaching to students.     In-Service Training:   - 0.5 Points. Had an in-service training   - 0.25 Points. In-service training lasted more than 2 total days   - 0.125 Points. More than 25% of the in-service training was done in the classroom.   - 0.125 Points. More than 50% of the in-service training was done in the classroom.     Opportunities for teachers to come together to share ways of improving teaching: <br>  - 1 Point if such opportunities exist.';
+
+  function rawWithNote(id: string, sourceNote: string) {
+    return { ...rawIndicatorFrom(id, 'Basic Inputs', '12', 'Education Statistics'), sourceNote };
+  }
+
+  it('getIndicator: turns a provider break tag into a line break, keeping both sides', async () => {
+    mockResponse([pagingObj(), [rawWithNote('SE.PRM.INPT', SE_PRM_INPT_NOTE)]]);
+    const ctx = createMockContext();
+    const result = await service.getIndicator('SE.PRM.INPT', ctx);
+    expect(result.sourceNote).toBe(
+      'School survey.  Total score is the sum of whether a school has:   , Functional blackboard    - Pens, pencils, exercise books\n- Textbooks   - Fraction of students in class with a desk    - Used ICT in class and have access to ICT in the school.',
+    );
+  });
+
+  it('searchIndicators: cleans the same markup on the search path', async () => {
+    mockResponse([
+      pagingObj({ total: 2 }),
+      [rawWithNote('SE.PRM.INPT', SE_PRM_INPT_NOTE), rawWithNote('SE.PRM.TSUP', SE_PRM_TSUP_NOTE)],
+    ]);
+    const ctx = createMockContext();
+    const result = await service.searchIndicators(
+      { query: 'school survey', page: 1, perPage: 50 },
+      ctx,
+    );
+    const notes = result.indicators.map((i) => i.sourceNote);
+    expect(notes.every((note) => !/<\/?br/i.test(note))).toBe(true);
+    expect(notes[0]).toContain('exercise books\n- Textbooks');
+    expect(notes[1]).toMatch(/improving teaching:\n- 1 Point if such opportunities exist\.$/);
+  });
+
+  it('getIndicator: strips other tags without their text and decodes entities', async () => {
+    mockResponse([
+      pagingObj(),
+      [
+        rawWithNote(
+          'X.TEST',
+          '<p>Share of <b>adults</b> &amp; youth<br/>aged &lt;15 &#8211; &#x2014; see &quot;Notes&quot;</p>',
+        ),
+      ],
+    ]);
+    const ctx = createMockContext();
+    const result = await service.getIndicator('X.TEST', ctx);
+    expect(result.sourceNote).toBe('Share of adults & youth\naged <15 – — see "Notes"');
+  });
+
+  /**
+   * 29,542 of the 29,544 catalog entries carry no markup; their prose includes
+   * literal angle brackets (`<$2.15 a day`, `<-2 standard deviations`) and raw
+   * newline runs, all of which must come through byte-identical.
+   */
+  it('getIndicator: leaves a note without markup byte-identical', async () => {
+    const note =
+      'Share below the poverty line (<$2.15 a day).\n\n\nStunting is height <-2 standard deviations from the median; 5 > 3.';
+    mockResponse([pagingObj(), [rawWithNote('SI.POV.TEST', note)]]);
+    const ctx = createMockContext();
+    const result = await service.getIndicator('SI.POV.TEST', ctx);
+    expect(result.sourceNote).toBe(note);
   });
 
   // ─── getCountry ───────────────────────────────────────────────────────────
@@ -437,6 +560,33 @@ describe('WorldBankApiService', () => {
     expect(result.isAggregate).toBe(true);
     expect(result.id).toBe('EAS');
   });
+
+  /**
+   * `/country/{code}` resolves `USA;CAN` to both countries (Canada first) and
+   * `all` to the whole listing (Aruba first). Taking the first row answered a
+   * different entity than the one asked for, with no sign anything was dropped.
+   */
+  it.each([
+    ['USA;CAN', [rawCountry('CAN', 'Canada'), rawCountry('USA', 'United States')], ['CAN', 'USA']],
+    [
+      'all',
+      [rawCountry('ABW', 'Aruba'), rawCountry('AFE', 'Africa Eastern and Southern', true)],
+      ['ABW', 'AFE'],
+    ],
+  ])(
+    'getCountry: rejects %j, which resolves to more than one country',
+    async (countryCode, rows, matchedIds) => {
+      mockResponse([pagingObj({ total: rows.length }), rows]);
+      const ctx = createMockContext();
+      const err = await service.getCountry(countryCode, ctx).catch((e: unknown) => e);
+      expect(err).toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        data: { reason: 'multiple_countries', countryCode, matchedIds },
+      });
+      expect((err as McpError).message).toContain(`"${countryCode}"`);
+      expect((err as McpError).message).toContain('worldbank_list_countries');
+    },
+  );
 
   it('getCountry: throws notFound on WbErrorEnvelope', async () => {
     fetchWithTimeoutMock.mockResolvedValueOnce({
@@ -512,7 +662,7 @@ describe('WorldBankApiService', () => {
       ctx,
     );
     expect(result.countries).toHaveLength(1);
-    expect(result.countries[0].id).toBe('US');
+    expect(result.countries[0]?.id).toBe('US');
     expect(result.total).toBe(1); // re-paginated total reflects filtered count
   });
 
@@ -613,7 +763,7 @@ describe('WorldBankApiService', () => {
       ctx,
     );
     expect(result.countries).toHaveLength(1);
-    expect(result.countries[0].id).toBe('JP');
+    expect(result.countries[0]?.id).toBe('JP');
     expect(result.total).toBe(3);
     expect(result.pages).toBe(2);
   });
@@ -648,7 +798,7 @@ describe('WorldBankApiService', () => {
       { includeAggregates: true, page: 3, perPage: 100 },
       ctx,
     );
-    const url = fetchWithTimeoutMock.mock.calls[0][0] as string;
+    const url = fetchWithTimeoutMock.mock.calls[0]?.[0] as string;
     expect(url).toContain('page=3');
     expect(url).toContain('per_page=100');
     expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(1);
@@ -672,7 +822,7 @@ describe('WorldBankApiService', () => {
     expect(result.indicators.map((i) => i.id)).toEqual(['NY.GDP.PCAP.CD']);
     expect(result.total).toBe(1);
     // The upstream searchterm param doesn't filter, so it must not be relied on.
-    expect(fetchWithTimeoutMock.mock.calls[0][0] as string).not.toContain('searchterm');
+    expect(fetchWithTimeoutMock.mock.calls[0]?.[0] as string).not.toContain('searchterm');
   });
 
   it('searchIndicators: keyword-only path returns empty for a nonsense query', async () => {
@@ -791,7 +941,7 @@ describe('WorldBankApiService', () => {
     );
     expect(result.indicators.map((i) => i.id)).toEqual(['VC.IHR.PSRC.P5']);
     expect(result.total).toBe(1);
-    expect(fetchWithTimeoutMock.mock.calls[0][0] as string).toContain('/topic/4/indicator');
+    expect(fetchWithTimeoutMock.mock.calls[0]?.[0] as string).toContain('/topic/4/indicator');
   });
 
   it('searchIndicators: source+keyword path reaches a match on upstream page 2', async () => {
@@ -809,7 +959,7 @@ describe('WorldBankApiService', () => {
       ctx,
     );
     expect(result.indicators.map((i) => i.id)).toEqual(['VC.IHR.PSRC.P5']);
-    expect(fetchWithTimeoutMock.mock.calls[0][0] as string).toContain('source=2');
+    expect(fetchWithTimeoutMock.mock.calls[0]?.[0] as string).toContain('source=2');
   });
 
   it('searchIndicators: paginates matches beyond the first result page', async () => {
@@ -836,7 +986,7 @@ describe('WorldBankApiService', () => {
     ]);
     const ctx = createMockContext();
     const result = await service.searchIndicators({ sourceId: '2', page: 2, perPage: 50 }, ctx);
-    const url = fetchWithTimeoutMock.mock.calls[0][0] as string;
+    const url = fetchWithTimeoutMock.mock.calls[0]?.[0] as string;
     expect(url).toContain('source=2');
     expect(url).toContain('per_page=50');
     expect(url).toContain('page=2');
@@ -860,6 +1010,144 @@ describe('WorldBankApiService', () => {
       service.searchIndicators({ query: 'gdp', sourceId: '999', page: 1, perPage: 50 }, ctx),
     ).rejects.toMatchObject({ data: { reason: 'invalid_filter' } });
   });
+
+  // ─── searchIndicators: queries with no searchable terms ───────────────────
+
+  /**
+   * Matching ignores every character that isn't a letter or digit, so a query
+   * made only of punctuation has no term to match. Treated as "no filter" it
+   * returned the whole scope while the response echoed the query as applied.
+   */
+  it.each([['!!!'], ['???'], ['...'], ['---'], ['%'], ['()'], ['$ ( ) %']])(
+    'searchIndicators: rejects the punctuation-only query %j before fetching anything',
+    async (query) => {
+      const ctx = createMockContext();
+      await expect(
+        service.searchIndicators({ query, page: 1, perPage: 50 }, ctx),
+      ).rejects.toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        data: { reason: 'empty_query', query },
+      });
+      expect(fetchWithTimeoutMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ['source', { sourceId: '2' }],
+    ['topic', { topicId: '3' }],
+  ])('searchIndicators: rejects a punctuation-only query scoped to a %s', async (_label, scope) => {
+    const ctx = createMockContext();
+    await expect(
+      service.searchIndicators({ query: '!!!', ...scope, page: 1, perPage: 1 }, ctx),
+    ).rejects.toMatchObject({ data: { reason: 'empty_query' } });
+    expect(fetchWithTimeoutMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['GDP (current US$)', ['NY.GDP.MKTP.CD']],
+    ['CO2 emissions', ['EN.GHG.CO2.MT.CE.AR5']],
+    // Terms "n" and "a" are loose substrings; the whole-phrase hit ranks first.
+    ['N/A', ['NA.TEST.IND', 'EN.GHG.CO2.MT.CE.AR5']],
+    ['123', ['TEST.123']],
+  ])('searchIndicators: keeps matching the punctuated query %j', async (query, expected) => {
+    mockResponse([
+      pagingObj({ total: 4 }),
+      [
+        rawIndicator('NY.GDP.MKTP.CD', 'GDP (current US$)'),
+        rawIndicator('EN.GHG.CO2.MT.CE.AR5', 'Carbon dioxide (CO2) emissions'),
+        rawIndicator('NA.TEST.IND', 'Coverage (N/A where unreported)'),
+        rawIndicator('TEST.123', 'Series 123'),
+      ],
+    ]);
+    const ctx = createMockContext();
+    const result = await service.searchIndicators({ query, page: 1, perPage: 50 }, ctx);
+    expect(result.indicators.map((i) => i.id)).toEqual(expected);
+  });
+
+  // ─── searchIndicators: topic and source together ──────────────────────────
+
+  /**
+   * Upstream fake for `/topic/{id}/indicator`, which honors `source` the way
+   * `/indicator` does: it intersects the two scopes and rejects an unknown
+   * source ID with the id-120 envelope. Topic 3 carries rows from sources 37
+   * and 6; only source 6 rows survive `source=6`.
+   */
+  function mockTopicEndpoint() {
+    const topicRows = [
+      rawIndicatorFrom('6.0.GDP_current', 'GDP (current $)', '37', 'LAC Equity Lab'),
+      rawIndicatorFrom('BM.GSR.TOTL.CD', 'Imports of goods and services', '6', 'IDS'),
+    ];
+    fetchWithTimeoutMock.mockImplementationOnce(async (url: string) => {
+      const source = new URL(url).searchParams.get('source');
+      const body =
+        source === '999999'
+          ? WB_ERROR_BODY
+          : (() => {
+              const rows = source ? topicRows.filter((row) => row.source.id === source) : topicRows;
+              return [pagingObj({ total: rows.length }), rows];
+            })();
+      return { text: async () => JSON.stringify(body) };
+    });
+  }
+
+  it('searchIndicators: topic-only path sends no source param', async () => {
+    mockTopicEndpoint();
+    const ctx = createMockContext();
+    const result = await service.searchIndicators({ topicId: '3', page: 1, perPage: 50 }, ctx);
+    const url = new URL(fetchWithTimeoutMock.mock.calls[0]?.[0] as string);
+    expect(url.pathname).toBe('/v2/topic/3/indicator');
+    expect(url.searchParams.has('source')).toBe(false);
+    expect(result.total).toBe(2);
+  });
+
+  it('searchIndicators: topic+source path applies the source on the topic endpoint', async () => {
+    mockTopicEndpoint();
+    const ctx = createMockContext();
+    const result = await service.searchIndicators(
+      { topicId: '3', sourceId: '6', page: 1, perPage: 50 },
+      ctx,
+    );
+    const url = new URL(fetchWithTimeoutMock.mock.calls[0]?.[0] as string);
+    expect(url.pathname).toBe('/v2/topic/3/indicator');
+    expect(url.searchParams.get('source')).toBe('6');
+    expect(result.indicators.map((i) => i.sourceId)).toEqual(['6']);
+    expect(result.total).toBe(1);
+  });
+
+  it('searchIndicators: topic+source+keyword matches only within the intersection', async () => {
+    mockTopicEndpoint();
+    const ctx = createMockContext();
+    const result = await service.searchIndicators(
+      { query: 'GDP', topicId: '3', sourceId: '6', page: 1, perPage: 50 },
+      ctx,
+    );
+    expect(
+      new URL(fetchWithTimeoutMock.mock.calls[0]?.[0] as string).searchParams.get('source'),
+    ).toBe('6');
+    // The GDP row belongs to source 37, outside the requested source.
+    expect(result.indicators).toEqual([]);
+    expect(result.total).toBe(0);
+  });
+
+  it.each([
+    ['without a keyword', undefined],
+    ['with a keyword', 'gdp'],
+  ])(
+    'searchIndicators: throws invalid_filter for an unknown source alongside a valid topic (%s)',
+    async (_label, query) => {
+      mockTopicEndpoint();
+      const ctx = createMockContext();
+      await expect(
+        service.searchIndicators(
+          { ...(query && { query }), topicId: '3', sourceId: '999999', page: 1, perPage: 50 },
+          ctx,
+        ),
+      ).rejects.toMatchObject({
+        code: JsonRpcErrorCode.NotFound,
+        data: { reason: 'invalid_filter', topicId: '3', sourceId: '999999' },
+      });
+    },
+  );
 
   it('searchIndicators: caches the catalog across keyword-only searches', async () => {
     mockResponse([
@@ -933,8 +1221,8 @@ describe('WorldBankApiService', () => {
     });
     const ctx = createMockContext();
     const result = await service.searchIndicators({ query: 'GDP', page: 1, perPage: 50 }, ctx);
-    expect(result.indicators[0].topics).toHaveLength(1);
-    expect(result.indicators[0].topics[0].id).toBe('3');
+    expect(result.indicators[0]?.topics).toHaveLength(1);
+    expect(result.indicators[0]?.topics[0]?.id).toBe('3');
   });
 
   /**
@@ -1142,7 +1430,7 @@ describe('WorldBankApiService', () => {
         { indicatorId: 'SP.POP.TOTL', countries: 'EUU', page: 1, perPage: 50 },
         ctx,
       );
-      expect(second.data[0].isAggregate).toBe(true);
+      expect(second.data[0]?.isAggregate).toBe(true);
       // Two data requests and two country listings — the stale set was not reused.
       expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(4);
     } finally {
@@ -1163,8 +1451,8 @@ describe('WorldBankApiService', () => {
       { indicatorId: 'SP.POP.TOTL', countries: 'EUU', page: 1, perPage: 50 },
       ctx,
     );
-    expect(first.data[0].isAggregate).toBe(true);
-    expect(second.data[0].isAggregate).toBe(true);
+    expect(first.data[0]?.isAggregate).toBe(true);
+    expect(second.data[0]?.isAggregate).toBe(true);
     // Two data requests plus one country listing — the listing is not refetched.
     expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(3);
   });
@@ -1249,7 +1537,7 @@ describe('WorldBankApiService', () => {
       data: { reason: 'country_not_found', countryCodes: 'ZZ' },
     });
     expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(2);
-    expect(fetchWithTimeoutMock.mock.calls[1][0] as string).toMatch(
+    expect(fetchWithTimeoutMock.mock.calls[1]?.[0] as string).toMatch(
       /^https:\/\/api\.worldbank\.org\/v2\/indicator\/SP\.POP\.TOTL\?/,
     );
   });
@@ -1611,7 +1899,7 @@ describe('WorldBankApiService', () => {
       ctx,
     );
     expect(result.data.map((d) => d.countryIso3)).toEqual(['USA', 'DEU']);
-    const url = fetchWithTimeoutMock.mock.calls[0][0] as string;
+    const url = fetchWithTimeoutMock.mock.calls[0]?.[0] as string;
     expect(url).toContain('US%3BDE'); // URL-encoded semicolon
   });
 
@@ -1624,7 +1912,7 @@ describe('WorldBankApiService', () => {
       ctx,
     );
     expect(result.data.map((d) => d.date)).toEqual(['2020']);
-    const url = fetchWithTimeoutMock.mock.calls[0][0] as string;
+    const url = fetchWithTimeoutMock.mock.calls[0]?.[0] as string;
     expect(url).toContain('date=2020%3A2022');
   });
 
@@ -1637,7 +1925,7 @@ describe('WorldBankApiService', () => {
       ctx,
     );
     expect(result.data).toHaveLength(1);
-    const url = fetchWithTimeoutMock.mock.calls[0][0] as string;
+    const url = fetchWithTimeoutMock.mock.calls[0]?.[0] as string;
     expect(url).toContain('mrv=3');
   });
 
@@ -1654,7 +1942,7 @@ describe('WorldBankApiService', () => {
     );
     expect(result.total).toBe(60);
     expect(result.pages).toBe(2);
-    expect(fetchWithTimeoutMock.mock.calls[0][0] as string).toContain('mrv=60');
+    expect(fetchWithTimeoutMock.mock.calls[0]?.[0] as string).toContain('mrv=60');
   });
 
   it('getData: preserves obsStatus in normalized data point', async () => {
@@ -1680,7 +1968,229 @@ describe('WorldBankApiService', () => {
       { indicatorId: 'NY.GDP.PCAP.CD', countries: 'US', page: 1, perPage: 50 },
       ctx,
     );
-    expect(result.data[0].obsStatus).toBe('E');
+    expect(result.data[0]?.obsStatus).toBe('E');
+  });
+
+  // ─── Upstream HTTP errors on paths that carry a caller-supplied ID ────────
+
+  /** What a non-OK status looks like once the framework's `fetchWithTimeout` has thrown it. */
+  function mockHttpError(status: number, path: string) {
+    fetchWithTimeoutMock.mockRejectedValueOnce(upstreamHttpError(status, path));
+  }
+
+  /** Leaves every status other than 404 exactly as the framework classified it. */
+  it.each([
+    [
+      'getIndicator',
+      '/indicator/NY.GDP.PCAP.CD',
+      (ctx: ReturnType<typeof createMockContext>) => service.getIndicator('NY.GDP.PCAP.CD', ctx),
+    ],
+    [
+      'getData',
+      '/country/US/indicator/SP.POP.TOTL',
+      (ctx: ReturnType<typeof createMockContext>) =>
+        service.getData({ indicatorId: 'SP.POP.TOTL', countries: 'US', page: 1, perPage: 50 }, ctx),
+    ],
+    [
+      'searchIndicators (topic)',
+      '/topic/3/indicator',
+      (ctx: ReturnType<typeof createMockContext>) =>
+        service.searchIndicators({ topicId: '3', page: 1, perPage: 50 }, ctx),
+    ],
+  ])('%s: propagates an upstream 503 unchanged', async (_label, path, run) => {
+    const upstream = upstreamHttpError(503, path);
+    fetchWithTimeoutMock.mockRejectedValueOnce(upstream);
+    await expect(run(createMockContext())).rejects.toBe(upstream);
+  });
+
+  it('listTopics: propagates a 404 on its fixed path unchanged', async () => {
+    const upstream = upstreamHttpError(404, '/topic');
+    fetchWithTimeoutMock.mockRejectedValueOnce(upstream);
+    await expect(service.listTopics(createMockContext())).rejects.toBe(upstream);
+  });
+
+  it('getCountry: propagates a 404 unchanged', async () => {
+    const upstream = upstreamHttpError(404, '/country/USA');
+    fetchWithTimeoutMock.mockRejectedValueOnce(upstream);
+    await expect(service.getCountry('USA', createMockContext())).rejects.toBe(upstream);
+  });
+
+  /**
+   * An ID segment that escapes to `/` or `%` makes upstream answer HTTP 404
+   * instead of its HTTP-200 invalid-value envelope. The 404 reports the reason
+   * the envelope would, and the upstream error page never reaches the caller.
+   */
+  it('getIndicator: reports an upstream 404 as indicator_not_found without the upstream body', async () => {
+    mockHttpError(404, '/indicator/a%2Fb');
+    const err = await service.getIndicator('a/b', createMockContext()).catch((e: unknown) => e);
+    expect(err).toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: { reason: 'indicator_not_found', indicatorId: 'a/b' },
+    });
+    expect(JSON.stringify(err)).not.toContain('XHTML');
+    expect((err as McpError).data).not.toHaveProperty('body');
+    // The framework logs an expected status at debug rather than error.
+    expect(fetchWithTimeoutMock.mock.calls[0]?.[3]).toMatchObject({ expectedStatuses: [404] });
+  });
+
+  it('getData: reports an upstream 404 on the indicator segment as indicator_not_found', async () => {
+    mockHttpError(404, '/country/US/indicator/a%2Fb');
+    mockHttpError(404, '/indicator/a%2Fb'); // the disambiguating catalog lookup 404s too
+    const err = await service
+      .getData(
+        { indicatorId: 'a/b', countries: 'US', mrv: 1, page: 1, perPage: 50 },
+        createMockContext(),
+      )
+      .catch((e: unknown) => e);
+    expect(err).toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: { reason: 'indicator_not_found', indicatorId: 'a/b' },
+    });
+    expect(JSON.stringify(err)).not.toContain('XHTML');
+    expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('getData: reports an upstream 404 on the country segment as country_not_found', async () => {
+    mockHttpError(404, '/country/U%2FS/indicator/SP.POP.TOTL');
+    mockResponse([pagingObj(), [rawIndicator('SP.POP.TOTL', 'Population, total')]]);
+    const err = await service
+      .getData(
+        { indicatorId: 'SP.POP.TOTL', countries: 'U/S', page: 1, perPage: 50 },
+        createMockContext(),
+      )
+      .catch((e: unknown) => e);
+    expect(err).toMatchObject({
+      data: { reason: 'country_not_found', countryCodes: 'U/S' },
+    });
+    expect(JSON.stringify(err)).not.toContain('XHTML');
+  });
+
+  it.each([
+    ['without a keyword', undefined],
+    ['with a keyword', 'gdp'],
+  ])(
+    'searchIndicators: reports an upstream 404 on the topic path as invalid_filter (%s)',
+    async (_label, query) => {
+      mockHttpError(404, '/topic/a%2Fb/indicator');
+      const err = await service
+        .searchIndicators(
+          { ...(query && { query }), topicId: 'a/b', page: 1, perPage: 50 },
+          createMockContext(),
+        )
+        .catch((e: unknown) => e);
+      expect(err).toMatchObject({
+        code: JsonRpcErrorCode.NotFound,
+        data: { reason: 'invalid_filter', topicId: 'a/b' },
+      });
+      expect(JSON.stringify(err)).not.toContain('XHTML');
+    },
+  );
+});
+
+// ─── Upstream 404 through the tool and resource contracts ─────────────────────
+
+describe('upstream 404 on a lookup path, end to end', () => {
+  beforeEach(async () => {
+    const { getServerConfig } = await import('@/config/server-config.js');
+    vi.mocked(getServerConfig).mockReturnValue({
+      apiBaseUrl: 'https://api.worldbank.org/v2',
+      defaultPerPage: 50,
+      catalogCacheTtlMs: 60_000,
+    } as never);
+    const { initWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    initWorldBankApiService(makeConfig() as never, createInMemoryStorage());
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  async function rejectNextFetch(status: number, path: string) {
+    const { fetchWithTimeout } = await import('@cyanheads/mcp-ts-core/utils');
+    vi.mocked(fetchWithTimeout).mockRejectedValueOnce(upstreamHttpError(status, path));
+  }
+
+  function textOf(result: { content: Array<{ type: string; text?: string }> }) {
+    return result.content.map((block) => block.text ?? '').join('\n');
+  }
+
+  it('worldbank_get_indicator carries indicator_not_found and its recovery on both surfaces', async () => {
+    await rejectNextFetch(404, '/indicator/NOPE.NOT.SERVED');
+    const { worldbankGetIndicator } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-indicator.tool.js'
+    );
+    const result = await runToolContract(
+      worldbankGetIndicator,
+      { indicator_id: 'NOPE.NOT.SERVED' },
+      { context: { errors: worldbankGetIndicator.errors } },
+    );
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.NotFound,
+        data: {
+          reason: 'indicator_not_found',
+          recovery: { hint: expect.stringContaining('worldbank_search_indicators') },
+        },
+      },
+    });
+    const text = textOf(result);
+    expect(text).toMatch(/Recovery:.*worldbank_search_indicators/);
+    expect(JSON.stringify(result)).not.toMatch(/XHTML|Fetch failed/);
+  });
+
+  it('worldbank_get_data carries indicator_not_found and its recovery on both surfaces', async () => {
+    await rejectNextFetch(404, '/country/US/indicator/NOPE.NOT.SERVED');
+    await rejectNextFetch(404, '/indicator/NOPE.NOT.SERVED');
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const result = await runToolContract(
+      worldbankGetData,
+      { indicator_id: 'NOPE.NOT.SERVED', countries: 'US', mrv: 1 },
+      { context: { errors: worldbankGetData.errors } },
+    );
+    expect(result.structuredContent).toMatchObject({
+      error: { code: JsonRpcErrorCode.NotFound, data: { reason: 'indicator_not_found' } },
+    });
+    expect(textOf(result)).toMatch(/Recovery:.*worldbank_search_indicators/);
+    expect(JSON.stringify(result)).not.toMatch(/XHTML|Fetch failed/);
+  });
+
+  it('worldbank_search_indicators carries invalid_filter and its recovery on both surfaces', async () => {
+    await rejectNextFetch(404, '/topic/99/indicator');
+    const { worldbankSearchIndicators } = await import(
+      '@/mcp-server/tools/definitions/worldbank-search-indicators.tool.js'
+    );
+    const result = await runToolContract(
+      worldbankSearchIndicators,
+      { topic_id: '99' },
+      { context: { errors: worldbankSearchIndicators.errors } },
+    );
+    expect(result.structuredContent).toMatchObject({
+      error: { code: JsonRpcErrorCode.NotFound, data: { reason: 'invalid_filter', topicId: '99' } },
+    });
+    expect(textOf(result)).toMatch(/Recovery:.*worldbank_list_topics/);
+    expect(JSON.stringify(result)).not.toMatch(/XHTML|Fetch failed/);
+  });
+
+  it('the worldbank://indicator resource carries indicator_not_found with its recovery', async () => {
+    await rejectNextFetch(404, '/indicator/NOPE.NOT.SERVED');
+    const { worldbankIndicatorResource } = await import(
+      '@/mcp-server/resources/definitions/worldbank-indicator.resource.js'
+    );
+    const ctx = createMockContext({ errors: worldbankIndicatorResource.errors });
+    const err = await Promise.resolve(
+      worldbankIndicatorResource.handler({ indicatorId: 'NOPE.NOT.SERVED' }, ctx),
+    ).catch((e: unknown) => e);
+    expect(err).toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: {
+        reason: 'indicator_not_found',
+        recovery: { hint: expect.stringContaining('worldbank_search_indicators') },
+      },
+    });
+    expect(JSON.stringify(err)).not.toMatch(/XHTML|Fetch failed/);
   });
 });
 

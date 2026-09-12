@@ -57,7 +57,7 @@ describe('worldbankListSources', () => {
     const input = worldbankListSources.input.parse({ page: 1 });
     const result = await worldbankListSources.handler(input, ctx);
     expect(result.sources).toHaveLength(2);
-    expect(result.sources[0].id).toBe('2');
+    expect(result.sources[0]?.id).toBe('2');
   });
 
   it('populates enrichment with totalCount and pagination', async () => {
@@ -78,7 +78,7 @@ describe('worldbankListSources', () => {
       '@/mcp-server/tools/definitions/worldbank-list-sources.tool.js'
     );
     const blocks = worldbankListSources.format!({ sources: mockSourcesResult.sources });
-    expect(blocks[0].type).toBe('text');
+    expect(blocks[0]?.type).toBe('text');
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('World Development Indicators');
     expect(text).toContain('ID: 2');

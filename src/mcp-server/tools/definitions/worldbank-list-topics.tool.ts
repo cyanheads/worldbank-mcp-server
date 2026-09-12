@@ -10,8 +10,7 @@ import { getWorldBankApiService } from '@/services/worldbank/worldbank-service.j
 export const worldbankListTopics = tool('worldbank_list_topics', {
   title: 'List World Bank Topics',
   description:
-    'Lists all 21 World Bank thematic topics (Economy & Growth, Health, Education, etc.) with descriptions. ' +
-    'Use to browse the indicator space or find a topic_id for worldbank_search_indicators.',
+    'List all 21 World Bank thematic topics (Economy & Growth, Health, Education, and others) with descriptions. Use it to browse the indicator space by theme or to find a topic_id for worldbank_search_indicators.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({}),
   output: z.object({

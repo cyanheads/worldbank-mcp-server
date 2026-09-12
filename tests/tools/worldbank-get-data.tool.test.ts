@@ -17,17 +17,19 @@ vi.mock('@/config/server-config.js', () => ({
   getServerConfig: vi.fn().mockReturnValue({ defaultPerPage: 50 }),
 }));
 
+const usRow = {
+  countryCode: 'US',
+  countryIso3: 'USA',
+  countryName: 'United States',
+  date: '2022',
+  value: 76399.42,
+  obsStatus: '',
+  isAggregate: false,
+};
+
 const mockDataResult = {
   data: [
-    {
-      countryCode: 'US',
-      countryIso3: 'USA',
-      countryName: 'United States',
-      date: '2022',
-      value: 76399.42,
-      obsStatus: '',
-      isAggregate: false,
-    },
+    usRow,
     {
       countryCode: 'CN',
       countryIso3: 'CHN',
@@ -219,7 +221,9 @@ describe('worldbankGetData', () => {
       indicator_id: 'INVALID.ID',
       countries: 'US',
     });
-    const err = await worldbankGetData.handler(input, ctx).catch((e: unknown) => e);
+    const err = await Promise.resolve(worldbankGetData.handler(input, ctx)).catch(
+      (e: unknown) => e,
+    );
     expect(err).toMatchObject({
       data: {
         reason: 'indicator_not_found',
@@ -247,7 +251,9 @@ describe('worldbankGetData', () => {
       indicator_id: 'NY.GDP.PCAP.CD',
       countries: 'ZZ',
     });
-    const err = await worldbankGetData.handler(input, ctx).catch((e: unknown) => e);
+    const err = await Promise.resolve(worldbankGetData.handler(input, ctx)).catch(
+      (e: unknown) => e,
+    );
     expect(err).toMatchObject({
       data: {
         reason: 'country_not_found',
@@ -276,7 +282,9 @@ describe('worldbankGetData', () => {
       indicator_id: 'NOT.A.REAL.CODE',
       countries: 'ZZZ',
     });
-    const err = await worldbankGetData.handler(input, ctx).catch((e: unknown) => e);
+    const err = await Promise.resolve(worldbankGetData.handler(input, ctx)).catch(
+      (e: unknown) => e,
+    );
     expect(err).toMatchObject({
       code: JsonRpcErrorCode.NotFound,
       data: {
@@ -314,7 +322,9 @@ describe('worldbankGetData', () => {
       countries: 'SDN',
       mrv: 3,
     });
-    const err = await worldbankGetData.handler(input, ctx).catch((e: unknown) => e);
+    const err = await Promise.resolve(worldbankGetData.handler(input, ctx)).catch(
+      (e: unknown) => e,
+    );
     expect(err).toMatchObject({
       code: JsonRpcErrorCode.NotFound,
       data: {
@@ -446,7 +456,7 @@ describe('worldbankGetData', () => {
       nullCount: mockDataResult.nullCount,
     };
     const blocks = worldbankGetData.format!(domainResult);
-    expect(blocks[0].type).toBe('text');
+    expect(blocks[0]?.type).toBe('text');
     const text = (blocks[0] as { text: string }).text;
     // Indicator fields
     expect(text).toContain('NY.GDP.PCAP.CD');
@@ -519,6 +529,83 @@ describe('worldbankGetData', () => {
 
   // ─── Zod input validation ─────────────────────────────────────────────────
 
+  /**
+   * `/country/{codes}/indicator/all` answers the invalid-value envelope, and the
+   * catalog lookup that places it finds rows for `all`, which blamed valid country
+   * codes. `/` and `%` reach a path upstream answers with HTTP 404.
+   */
+  it.each([['a/b'], ['NY.GDP.PCAP.CD%3BSP.POP.TOTL'], ['NY.GDP.PCAP.CD;SP.POP.TOTL']])(
+    'rejects indicator_id %j at the schema, pointing at the search tool',
+    async (indicatorId) => {
+      const { worldbankGetData } = await import(
+        '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+      );
+      const parsed = worldbankGetData.input.safeParse({
+        indicator_id: indicatorId,
+        countries: 'US',
+      });
+      expect(parsed.success).toBe(false);
+      expect(parsed.error?.issues[0]?.message).toContain('worldbank_search_indicators');
+    },
+  );
+
+  it.each([['all'], ['ALL']])(
+    'rejects indicator_id %j in the handler as multiple_indicators with its recovery on both surfaces',
+    async (indicatorId) => {
+      const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+      const getData = vi.fn().mockResolvedValue(mockDataResult);
+      vi.mocked(getWorldBankApiService).mockReturnValue({ getData } as never);
+
+      const { worldbankGetData } = await import(
+        '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+      );
+      const result = await runToolContract(
+        worldbankGetData,
+        { indicator_id: indicatorId, countries: 'US', mrv: 1 },
+        { context: { errors: worldbankGetData.errors } },
+      );
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ValidationError,
+          data: {
+            reason: 'multiple_indicators',
+            indicatorId,
+            recovery: { hint: expect.stringContaining('worldbank_search_indicators') },
+          },
+        },
+      });
+      const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+      expect(text).toMatch(/Recovery:.*worldbank_search_indicators/);
+      expect(text).not.toContain('worldbank_list_countries');
+      expect(getData).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([['NY.GDP.PCAP.CD'], ['CoCA_fexp'], ['3.0.Rate75-25'], ['UNEMPSA_']])(
+    'accepts the catalog indicator ID %j',
+    async (indicatorId) => {
+      const { worldbankGetData } = await import(
+        '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+      );
+      expect(
+        worldbankGetData.input.safeParse({ indicator_id: indicatorId, countries: 'US' }).success,
+      ).toBe(true);
+    },
+  );
+
+  it('advertises the indicator ID constraint as a JSON Schema pattern', async () => {
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const property = z.toJSONSchema(worldbankGetData.input).properties?.indicator_id;
+    const pattern = typeof property === 'object' ? property.pattern : undefined;
+    expect(pattern).toBeDefined();
+    const re = new RegExp(pattern ?? '');
+    expect(re.test('NY.GDP.PCAP.CD')).toBe(true);
+    expect(['a/b', 'A%3BB'].some((id) => re.test(id))).toBe(false);
+  });
+
   it('rejects empty indicator_id', async () => {
     const { worldbankGetData } = await import(
       '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
@@ -571,7 +658,7 @@ describe('worldbankGetData', () => {
       mrv: 60,
     });
     await worldbankGetData.handler(input, ctx);
-    expect(getDataMock.mock.calls[0][0].mrv).toBe(60);
+    expect(getDataMock.mock.calls[0]?.[0].mrv).toBe(60);
   });
 
   it.each([
@@ -629,7 +716,7 @@ describe('worldbankGetData', () => {
     await worldbankGetData.handler(input, ctx);
 
     expect(getDataMock).toHaveBeenCalledTimes(1);
-    expect(getDataMock.mock.calls[0][0].countries).toEqual(codes);
+    expect(getDataMock.mock.calls[0]?.[0].countries).toEqual(codes);
     expect(getEnrichment(ctx).appliedFilters).toMatchObject({ countries: echoed });
   });
 
@@ -775,7 +862,7 @@ describe('worldbankGetData', () => {
       date_range: '  2020:2022  ',
     });
     await worldbankGetData.handler(input, ctx);
-    const callArgs = getDataMock.mock.calls[0][0];
+    const callArgs = getDataMock.mock.calls[0]?.[0];
     expect(callArgs.dateRange).toBe('2020:2022');
   });
 
@@ -794,7 +881,7 @@ describe('worldbankGetData', () => {
       date_range: '   ',
     });
     await worldbankGetData.handler(input, ctx);
-    const callArgs = getDataMock.mock.calls[0][0];
+    const callArgs = getDataMock.mock.calls[0]?.[0];
     expect(callArgs.dateRange).toBeUndefined();
   });
 
@@ -821,7 +908,7 @@ describe('worldbankGetData', () => {
       '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
     );
     const withStatus = {
-      data: [{ ...mockDataResult.data[0], obsStatus: 'E', value: 12345.67 }],
+      data: [{ ...usRow, obsStatus: 'E', value: 12345.67 }],
       indicator: mockDataResult.indicator,
       nullCount: 0,
     };

@@ -60,18 +60,18 @@ describe('worldbankListCountries', () => {
     const { worldbankListCountries } = await import(
       '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
     );
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: worldbankListCountries.errors });
     const input = worldbankListCountries.input.parse({});
     const result = await worldbankListCountries.handler(input, ctx);
     expect(result.countries).toHaveLength(2);
-    expect(result.countries[0].id).toBe('US');
+    expect(result.countries[0]?.id).toBe('US');
   });
 
   it('populates enrichment with totalCount and pagination', async () => {
     const { worldbankListCountries } = await import(
       '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
     );
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: worldbankListCountries.errors });
     const input = worldbankListCountries.input.parse({});
     await worldbankListCountries.handler(input, ctx);
     const enrichment = getEnrichment(ctx);
@@ -90,11 +90,11 @@ describe('worldbankListCountries', () => {
     const { worldbankListCountries } = await import(
       '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
     );
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: worldbankListCountries.errors });
     const input = worldbankListCountries.input.parse({ region: '', income_level: '' });
     await worldbankListCountries.handler(input, ctx);
     // Verify no region/incomeLevel keys passed (empty string = absent)
-    const callArgs = listCountriesMock.mock.calls[0][0];
+    const callArgs = listCountriesMock.mock.calls[0]?.[0];
     expect(callArgs.region).toBeUndefined();
     expect(callArgs.incomeLevel).toBeUndefined();
   });
@@ -104,7 +104,7 @@ describe('worldbankListCountries', () => {
       '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
     );
     const blocks = worldbankListCountries.format!({ countries: mockCountriesResult.countries });
-    expect(blocks[0].type).toBe('text');
+    expect(blocks[0]?.type).toBe('text');
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('United States');
     expect(text).toContain('NAC');
@@ -138,7 +138,9 @@ describe('worldbankListCountries', () => {
     );
     const ctx = createMockContext({ errors: worldbankListCountries.errors });
     const input = worldbankListCountries.input.parse({ region: 'BADCODE' });
-    const err = await worldbankListCountries.handler(input, ctx).catch((e: unknown) => e);
+    const err = await Promise.resolve(worldbankListCountries.handler(input, ctx)).catch(
+      (e: unknown) => e,
+    );
     expect(err).toMatchObject({
       data: {
         reason: 'invalid_filter',
@@ -182,10 +184,10 @@ describe('worldbankListCountries', () => {
     const { worldbankListCountries } = await import(
       '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
     );
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: worldbankListCountries.errors });
     const input = worldbankListCountries.input.parse({ include_aggregates: true });
     await worldbankListCountries.handler(input, ctx);
-    const callArgs = listCountriesMock.mock.calls[0][0];
+    const callArgs = listCountriesMock.mock.calls[0]?.[0];
     expect(callArgs.includeAggregates).toBe(true);
   });
 
@@ -199,10 +201,10 @@ describe('worldbankListCountries', () => {
     const { worldbankListCountries } = await import(
       '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
     );
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: worldbankListCountries.errors });
     const input = worldbankListCountries.input.parse({ page: 4, per_page: 100 });
     await worldbankListCountries.handler(input, ctx);
-    expect(listCountriesMock.mock.calls[0][0]).toMatchObject({
+    expect(listCountriesMock.mock.calls[0]?.[0]).toMatchObject({
       includeAggregates: false,
       page: 4,
       perPage: 100,
@@ -232,7 +234,7 @@ describe('worldbankListCountries', () => {
     const { worldbankListCountries } = await import(
       '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
     );
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: worldbankListCountries.errors });
     const input = worldbankListCountries.input.parse({ page: 7, per_page: 50 });
     const result = await worldbankListCountries.handler(input, ctx);
     expect(result.countries.map((c) => c.id)).toEqual(['ZWE']);

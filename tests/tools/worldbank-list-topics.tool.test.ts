@@ -44,7 +44,7 @@ describe('worldbankListTopics', () => {
       '@/mcp-server/tools/definitions/worldbank-list-topics.tool.js'
     );
     const blocks = worldbankListTopics.format!({ topics: mockTopics });
-    expect(blocks[0].type).toBe('text');
+    expect(blocks[0]?.type).toBe('text');
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('Agriculture & Rural Development');
     expect(text).toContain('ID: 1');

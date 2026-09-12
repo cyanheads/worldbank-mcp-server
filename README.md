@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.3.3-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/worldbank-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/worldbank-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.3.4-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/worldbank-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/worldbank-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -74,7 +74,7 @@ List countries and regional aggregates with metadata.
 
 Fetch full metadata for a single country or aggregate entity.
 
-- Accepts ISO2 (US), ISO3 (USA), or World Bank aggregate codes (EAS, HIC, WLD)
+- Accepts one ISO2 (US), ISO3 (USA), or World Bank aggregate code (EAS, HIC, WLD); `all` or a list of codes is rejected with a pointer to `worldbank_list_countries`
 - Returns region, income level, lending type, capital city, and coordinates
 - Structured error with recovery hint when code is not found
 
@@ -84,8 +84,8 @@ Fetch full metadata for a single country or aggregate entity.
 
 Search the 29,500+ World Bank indicator catalog.
 
-- Keyword search, topic filter, source filter — at least one required
-- The upstream `searchterm` parameter does not filter, so keyword matching runs locally over the full catalog (or the full selected topic/source): every term must appear in the indicator ID, name, or description, in any word order, with punctuation ignored
+- Keyword search, topic filter, source filter — at least one required; a topic and a source together narrow to indicators in both. Topic and source IDs are numeric
+- The upstream `searchterm` parameter does not filter, so keyword matching runs locally over the full catalog (or the full selected topic/source): every term must appear in the indicator ID, name, or description, in any word order, with punctuation ignored. A query with no letters or digits is rejected rather than matching everything
 - Exact ID or name matches rank first, then whole-phrase matches, then other ID/name matches, then description-only matches — so pasting an indicator name (`GDP (current US$)`) or ID (`NY.GDP.MKTP.CD`) returns it as the top hit
 - Returns indicator IDs, names, source dataset, and thematic topics
 - One row per indicator ID — the 43 indicators published under both a live source and an archived copy collapse to the live row, and `worldbank_get_indicator` resolves to the same one
@@ -100,6 +100,8 @@ Search the 29,500+ World Bank indicator catalog.
 Fetch complete metadata for a known indicator ID.
 
 - Returns full description, unit of measurement, source dataset, source organization, and thematic topics
+- One ID per call, made of letters, digits, `.`, `_`, or `-` — `all`, a list, or any other character is rejected with a pointer to `worldbank_search_indicators`
+- Descriptions are plain text: HTML line breaks in provider notes become line breaks, and other markup is removed with its text kept
 - Structured error with recovery hint when ID is not found
 
 ---
@@ -117,6 +119,7 @@ Query indicator values for countries across time. The primary data-access tool.
 - Echoes the parameters it sent upstream — indicator, normalized country codes, date range or `mrv`, page and page size
 - Paginated with up to 1000 entries per page
 - An indicator the catalog lists but the data endpoint doesn't serve (archived and retired datasets) is reported as such, not blamed on the country codes
+- `indicator_id` takes one catalog ID under the same rules as `worldbank_get_indicator`
 
 ---
 
@@ -155,7 +158,7 @@ The World Bank [lending portfolio](https://projects.worldbank.org/) — the indi
 | Resource | `worldbank://indicator/{indicatorId}` | Indicator metadata by ID — name, description, source, unit, and topics |
 | Resource | `worldbank://country/{countryCode}` | Country metadata by ISO2, ISO3, or aggregate code — region, income level, capital, coordinates |
 
-Both resources return a structured not-found error with a recovery hint for an unknown ID or code. An upstream outage, timeout, or 5xx keeps its own classification, so a transient failure is distinguishable from a bad identifier.
+Both resources take a single ID or code — `all` or a list is rejected — and return a structured not-found error with a recovery hint for an unknown ID or code. An upstream outage, timeout, or 5xx keeps its own classification, so a transient failure is distinguishable from a bad identifier.
 
 ## Features
 
@@ -172,7 +175,7 @@ World Bank-specific:
 
 - Full World Bank Open Data API v2 coverage — topics, sources, countries, indicators, and observations
 - 60+ years of development data across 29,500+ indicators for 200+ countries and regional aggregates
-- Client-side topic/source + keyword compound filtering (works around upstream API limitation)
+- Client-side keyword filtering over the selected topic/source scope (works around upstream API limitation)
 - Null-value transparency — `null` observations and `nullCount` surfaced rather than silently dropped
 - `isAggregate` flag on every country/data row to distinguish individual countries from aggregate entities
 

@@ -5,20 +5,24 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
+import {
+  COUNTRY_CODE,
+  COUNTRY_CODE_MESSAGE,
+  isAllSelector,
+} from '@/services/worldbank/identifiers.js';
 import { getWorldBankApiService } from '@/services/worldbank/worldbank-service.js';
 
 export const worldbankGetCountry = tool('worldbank_get_country', {
   title: 'Get World Bank Country',
   description:
-    'Fetches full metadata for a specific country or aggregate entity: region, income level, capital, coordinates, and lending type. ' +
-    'Accepts ISO2 codes (US, DE), ISO3 codes (USA, DEU), or World Bank aggregate codes (EAS, HIC, WLD).',
+    'Fetch metadata for one country or aggregate entity: ISO codes, region, income level, lending type, capital, and coordinates. Accepts an ISO2 code (US, DE), an ISO3 code (USA, DEU), or a World Bank aggregate code (EAS, HIC, WLD); "all" and lists of codes are rejected. Use worldbank_list_countries to browse valid codes.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     country_code: z
       .string()
-      .min(1)
+      .regex(COUNTRY_CODE, COUNTRY_CODE_MESSAGE)
       .describe(
-        'Country code. Accepts ISO2 (US), ISO3 (USA), or aggregate code (EAS, HIC, WLD). Use worldbank_list_countries to browse valid codes.',
+        'One country code. Accepts ISO2 (US), ISO3 (USA), or aggregate code (EAS, HIC, WLD) — not "all" or a list of codes. Use worldbank_list_countries to browse valid codes.',
       ),
   }),
   output: z.object({
@@ -53,10 +57,24 @@ export const worldbankGetCountry = tool('worldbank_get_country', {
       when: 'The country code does not exist in the World Bank API.',
       recovery: 'Use worldbank_list_countries to browse valid ISO2, ISO3, and aggregate codes.',
     },
+    {
+      reason: 'multiple_countries',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The code is "all", or another selector the World Bank resolves to more than one country.',
+      recovery:
+        'Pass a single country code, or use worldbank_list_countries to list several countries.',
+    },
   ],
 
   async handler(input, ctx) {
     ctx.log.info('Fetching country', { countryCode: input.country_code });
+    if (isAllSelector(input.country_code)) {
+      throw ctx.fail(
+        'multiple_countries',
+        `Country code "${input.country_code}" selects every country rather than one.`,
+        { ...ctx.recoveryFor('multiple_countries'), countryCode: input.country_code },
+      );
+    }
     try {
       return await getWorldBankApiService().getCountry(input.country_code, ctx);
     } catch (err) {
@@ -64,6 +82,13 @@ export const worldbankGetCountry = tool('worldbank_get_country', {
         throw ctx.fail('country_not_found', err.message, {
           ...ctx.recoveryFor('country_not_found'),
           countryCode: input.country_code,
+        });
+      }
+      if (err instanceof McpError && err.data?.reason === 'multiple_countries') {
+        throw ctx.fail('multiple_countries', err.message, {
+          ...ctx.recoveryFor('multiple_countries'),
+          countryCode: input.country_code,
+          matchedIds: err.data.matchedIds,
         });
       }
       throw err;

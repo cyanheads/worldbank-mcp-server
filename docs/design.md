@@ -164,12 +164,12 @@ Searches the 29,500+ indicator catalog. The critical discovery entry point — w
 
 **Input:**
 - `query: string` — keyword terms, matched locally. Required unless `topic_id` or `source_id` is provided.
-- `topic_id: string | undefined` — numeric topic ID (1–21) to filter by thematic area. Use `worldbank_list_topics` to browse.
-- `source_id: string | undefined` — numeric source ID to filter by dataset origin (e.g., `"2"` for World Development Indicators). Use `worldbank_list_sources` to browse.
+- `topic_id: string | undefined` — numeric topic ID (1–21) to filter by thematic area; the schema pattern admits digits only (blank reads as no filter). Use `worldbank_list_topics` to browse.
+- `source_id: string | undefined` — numeric source ID to filter by dataset origin (e.g., `"2"` for World Development Indicators); digits only, like `topic_id`. Use `worldbank_list_sources` to browse.
 - `page: number` (default: 1) — pagination page
 - `per_page: number` (default: 50, max: 100) — results per page
 
-**Note:** The API's `searchterm` parameter does not filter anything — a nonsense term returns the entire catalog, with or without a topic/source filter present. Keyword matching therefore happens entirely in the service, over the full candidate set for the requested scope: the whole catalog for a keyword-only search, `GET /v2/topic/{id}/indicator` for topic scope, `GET /v2/indicator?source={id}` for source scope. Each scope is fetched exhaustively (loop over the envelope's `pages`) before matching, so a hit on upstream page 2 is reachable. Matching is token-AND over an alphanumeric tokenization: the query is lowercased and split on every run of non-alphanumeric characters, and each resulting term must appear as a substring of the indicator's ID, name, or `sourceNote`. Results are ordered exact ID or name match, then whole-phrase ID/name match, then remaining ID/name matches, then `sourceNote`-only matches.
+**Note:** The API's `searchterm` parameter does not filter anything — a nonsense term returns the entire catalog, with or without a topic/source filter present. Keyword matching therefore happens entirely in the service, over the full candidate set for the requested scope: the whole catalog for a keyword-only search, `GET /v2/topic/{id}/indicator` for topic scope, `GET /v2/indicator?source={id}` for source scope, and `GET /v2/topic/{id}/indicator?source={id}` for both — the topic endpoint honors `source` the way `/indicator` does, intersecting the scopes and rejecting an unknown source ID. Each scope is fetched exhaustively (loop over the envelope's `pages`) before matching, so a hit on upstream page 2 is reachable. Matching is token-AND over an alphanumeric tokenization: the query is lowercased and split on every run of non-alphanumeric characters, and each resulting term must appear as a substring of the indicator's ID, name, or `sourceNote`. Results are ordered exact ID or name match, then whole-phrase ID/name match, then remaining ID/name matches, then `sourceNote`-only matches. A query that tokenizes to nothing — punctuation only — is rejected before any fetch, since it has no term to match.
 
 **Output:**
 - `indicators: Array<{ id, name, sourceId, sourceName, topics[], sourceNote }>` — matching indicators
@@ -178,7 +178,8 @@ Searches the 29,500+ indicator catalog. The critical discovery entry point — w
 
 **Errors:**
 - `missing_filter` (`ValidationError`) — none of `query`, `topic_id`, `source_id` given. Recovery: supply one.
-- `invalid_filter` (`NotFound`) — `topic_id` or `source_id` doesn't exist upstream (HTTP 200 with the error envelope). Recovery: browse valid IDs with `worldbank_list_topics` / `worldbank_list_sources`.
+- `invalid_filter` (`NotFound`) — `topic_id` or `source_id` doesn't exist upstream (HTTP 200 with the error envelope, or HTTP 404 on the topic path), alone or combined. Recovery: browse valid IDs with `worldbank_list_topics` / `worldbank_list_sources`.
+- `empty_query` (`ValidationError`) — `query` is non-blank but has no letters or digits (`!!!`, `()`). Recovery: provide a keyword, or omit `query` to browse by topic/source.
 
 A search that matches nothing is not an error — it returns an empty `indicators` array with an `enrichment.notice` carrying the recovery hint.
 
@@ -187,21 +188,24 @@ A search that matches nothing is not an error — it returns an empty `indicator
 Fetches complete metadata for a single known indicator ID.
 
 **Input:**
-- `indicator_id: string` — the indicator code (e.g., `NY.GDP.PCAP.CD`)
+- `indicator_id: string` — one indicator code (e.g., `NY.GDP.PCAP.CD`); the schema pattern admits letters, digits, `.`, `_`, and `-`. `all` fits that pattern and is refused in the handler as `multiple_indicators`
 
 **Output:**
 - `id, name, unit, sourceId, sourceName, sourceNote, sourceOrganization` — full metadata
 - `topics: Array<{ id, name }>` — thematic categories
 
 **Errors:**
-- `indicator_not_found` (`NotFound`) — the API returns `{"message": [{"id": "120", "key": "Invalid value", "value": "The provided parameter value is not valid"}]}` for unknown indicator IDs (HTTP 200 with a message envelope, not a 404). The service layer must detect this pattern and throw `NotFound`. Recovery: use `worldbank_search_indicators` to find valid indicator IDs.
+- `indicator_not_found` (`NotFound`) — the API returns `{"message": [{"id": "120", "key": "Invalid value", "value": "The provided parameter value is not valid"}]}` for unknown indicator IDs (HTTP 200 with a message envelope). A path upstream can't route answers a real HTTP 404 instead; the service reads that as the same envelope. The service layer must detect both and throw `NotFound`. Recovery: use `worldbank_search_indicators` to find valid indicator IDs.
+- `multiple_indicators` (`ValidationError`) — the ID is `all`, refused in the handler before any request, or upstream resolved it to rows carrying more than one distinct indicator ID. Recovery: pass one ID, or find indicators with `worldbank_search_indicators`.
+
+`sourceNote` is plain text on this tool, `worldbank_search_indicators`, and the indicator resource: the shared normalizer turns `<br>`/`</br>` into a line break, drops other tags with their text kept, and decodes entities.
 
 ### `worldbank_get_data`
 
 The primary data access tool. Queries indicator values for countries across a time range.
 
 **Input:**
-- `indicator_id: string` — indicator code to query (e.g., `NY.GDP.PCAP.CD`). `.describe()` should include a format example and note to use `worldbank_search_indicators` to discover valid IDs.
+- `indicator_id: string` — one indicator code to query (e.g., `NY.GDP.PCAP.CD`), under the same pattern as `worldbank_get_indicator`. `.describe()` should include a format example and note to use `worldbank_search_indicators` to discover valid IDs.
 - `countries: string | string[]` — one or more country codes. Pass a single code, an array, or one string separated by commas or semicolons; the tool splits every string (array elements included) on both separators, drops blank segments, and sends the codes joined with `;` — the only separator the data endpoint accepts (a comma, literal or `%2C`, is rejected as an invalid value). Accepts:
   - ISO2 codes (`US`, `CN`, `DE`)
   - ISO3 codes (`USA`, `CHN`, `DEU`)
@@ -227,6 +231,7 @@ The primary data access tool. Queries indicator values for countries across a ti
 - `indicator_not_queryable` (`NotFound`) — the catalog lists the indicator, or did, but the data endpoint doesn't serve it for any country or date. Recovery: changing countries or dates won't help; use `worldbank_search_indicators` to find a current indicator for the same measure.
 - `country_not_found` (`NotFound`) — one or more country codes are invalid. Recovery: use `worldbank_list_countries` to find valid codes.
 - `indicator_and_country_not_found` (`NotFound`) — both the indicator ID and the country codes are invalid. Recovery: look both up before retrying.
+- `multiple_indicators` (`ValidationError`) — `indicator_id` is `all`, refused in the handler: the data endpoint serves one indicator per call. Recovery: pass one ID found with `worldbank_search_indicators`.
 
 The API answers `indicator_not_found`, `country_not_found`, and `indicator_and_country_not_found` with the same HTTP-200 `{"message": [{"id": "120", ...}]}` envelope and never names the parameter it rejected. It does emit one `message` entry per rejected path segment, so two entries prove both are bad; one entry is placed by a follow-up `/indicator/{id}` lookup, which is unambiguous by construction and costs a request only on a path that has already failed.
 
@@ -254,13 +259,14 @@ Lists countries and aggregates with full metadata. Supports filtering.
 Fetches metadata for a single country or aggregate entity.
 
 **Input:**
-- `country_code: string` — ISO2, ISO3, or aggregate code (e.g., `US`, `USA`, `EAS`)
+- `country_code: string` — one ISO2, ISO3, or aggregate code (e.g., `US`, `USA`, `EAS`); the schema pattern accepts 2–3 letters or digits. `all` fits that pattern and is refused in the handler as `multiple_countries`
 
 **Output:**
 - Full country metadata as in `worldbank_list_countries` output, single object.
 
 **Errors:**
 - `country_not_found` (`NotFound`) — code doesn't exist. Recovery: use `worldbank_list_countries` to browse valid codes.
+- `multiple_countries` (`ValidationError`) — the code is `all`, refused in the handler before any request, or upstream resolved it to more than one country. Recovery: pass one code, or list countries with `worldbank_list_countries`.
 
 ### `worldbank_list_topics`
 
@@ -494,6 +500,12 @@ Every filter is an exact match upstream and an unmatched value is HTTP 200 with 
 | 2026-08-09 | `fill_gaps` defaults to `true`, and survey rows win the merge | Measured against the live API: `fill_gaps=false` answers `country=IND&year=2019` with `[]`, so the upstream default makes an ordinary query look like a missing-data bug. But `fill_gaps=true` nulls `gini`, `mld`, `polarization`, all ten deciles, and `survey_year` on *every* row it returns — `USA&year=2022` gives `gini: 0.417` without the flag and `gini: null` with it — so simply passing the flag through would kill the inequality half of the tool outright. Requesting survey rows first and merging the gap-filled pass around them gets both: real distributions where they exist, labelled estimates where they do not. |
 | 2026-08-09 | The gap-fill merge keys on row grain for a multi-year request and on the country for a single-year one | Keying on the country throughout made `fill_gaps` a silent no-op for the most ordinary query there is. `countries=IND` with no `year` — which PIP reads as the full window — returned the 8 survey years and nothing else, because India was "covered" by having any survey row at all, while `appliedFilters.fillGaps` still reported `true`; the honest answer is 47 rows. `country=all&year=all` lost roughly 5,600 rows the same way. Keying on country × year × reporting level × welfare type fixes it, and is safe because a survey row and its gap-filled twin share that key exactly. A single reporting year keeps the country key: `year=MRV` resolves to the most recent *survey* year in one mode and 2026 in the other, so a grain key there would return one economy twice at two different years. |
 | 2026-08-09 | `poverty_line` has no server-side default | PIP's default line follows its PPP vintage and has already moved from $2.15 (2017 PPPs) to $3.00 (2021 PPPs). A hardcoded default would keep expressing the applied threshold in a retired vintage; letting upstream decide and echoing `povertyLine` on every row stays correct across revisions. |
+| 2026-09-12 | Topic and source filters go upstream together | The service dropped `source` whenever a topic was set, on the belief that `/topic/{id}/indicator` ignores it, and echoed the source as applied anyway. Measured: `/topic/3/indicator` returns 306 rows, 16 with `source=6` (all source 6), 0 with `source=40`, and the id-120 envelope with `source=999999`. Sending both makes upstream compute the intersection and validate the source, so no local post-filter is needed. |
+| 2026-09-12 | A query with no letters or digits is rejected as `empty_query` | Matching tokenizes on letters and digits, so `!!!` tokenized to nothing and the empty phrase matched every indicator in scope — 1,498 rows for `source_id=2` under an echoed `query="!!!"`. The check keys on the normalized phrase, so punctuated queries with a term (`GDP (current US$)`, `N/A`, `123`) are untouched, and it runs before any fetch. |
+| 2026-09-12 | Single-item lookups reject collection selectors, at the schema and on distinct IDs in the response | `/country/{code}` and `/indicator/{id}` take `all` and `;`-joined lists in the same segment; the service took the first row (or folded every row through the source tie-break), so `USA;CAN` answered Canada and `all` answered Aruba. The schema patterns reject separators and malformed codes with a message naming the list tool. `all` fits both patterns and is refused in the handlers instead, because a schema rejection arrives as `InvalidParams` with no `reason` or recovery hint, and a schema check would leave `multiple_countries`/`multiple_indicators` unreachable for the selector callers try most. The service rejects any response whose rows carry more than one distinct ID, which covers selectors the pattern doesn't anticipate; row count would be wrong, since 43 IDs published under a live and an archived source (`CoCA_fexp`) return two rows for one ID. Country codes are pinned to 2–3 letters or digits, the shape of all 295 `/country` entities. |
+| 2026-09-12 | Identifier inputs admit only the shapes real IDs take, and an upstream 404 on an ID path reports the invalid-ID reason | An ID that escapes into a path upstream can't route (`a/b` → `a%2Fb`, `%3B` → `%253B`) gets a real HTTP 404 page rather than the HTTP-200 envelope, and it surfaced as the framework's raw fetch error, carrying no `reason` and passing along the upstream page. Two layers close it. The schemas pin what the live data shows: all 29,544 indicator IDs use letters, digits, `.`, `_`, and `-`, and all 21 topic and 71 source IDs are numeric. `all` is refused on `indicator_id` in the handler as `multiple_indicators`, including on `worldbank_get_data`, where `/country/{codes}/indicator/all` answers the envelope and the catalog lookup behind it blamed valid country codes. The numeric topic and source shape stays on the schema: a well-formed but unknown ID still reaches `invalid_filter`, so no contract entry is shadowed. Behind the schemas, `fetchLookup` turns a 404 on a path carrying a caller ID into the envelope, so `indicator_not_found`, `country_not_found`, and `invalid_filter` apply unchanged. It covers 404 only, and only on those paths; 5xx and fixed-path requests keep the framework's classification. |
+| 2026-09-12 | `sourceNote` is reduced to plain text in the shared indicator normalizer | Two of 29,544 catalog notes carry markup (`SE.PRM.INPT` `</br>`, `SE.PRM.TSUP` `<br>`) and none carry entities, so the normalizer stays small: breaks become line breaks, other tags are dropped with their text, entities are decoded. A tag must start with a letter, so prose brackets (`<$2.15 a day`) survive, and `format()` renders the cleaned text without escaping so both surfaces carry the same string. |
+| 2026-09-12 | `tests/` is type-checked; `tsconfig.build.json` is the standalone emit config | `tsconfig.json` covered `src/` only, so 87 type errors across 12 test files never reached `devcheck`. It now includes `tests/` with `noEmit`, and the build config extends the framework base directly rather than the widened typecheck config, so `dist/` still holds `src/` alone. |
 | 2026-09-12 | `worldbank_get_data` splits `countries` strings on commas and semicolons, and rejects `"all"` mixed with codes | `worldbank_get_poverty` and `worldbank_search_projects` already accept a comma-separated string, and a caller carrying that convention over sent `US,JP,KR` verbatim, which the data endpoint rejects and the tool reported as `country_not_found`. ISO and aggregate codes never contain either separator, so splitting is lossless. Splitting opens a new route to the empty path segment the API reads as every country (`","`, `[","]`), so the non-empty check runs on the split result. `all;US` gets the generic invalid-value envelope upstream, which would blame valid codes, so the schema rejects the mix up front. |
 | 2026-08-09 | `mrv` ceiling raised from 10 to 100 | The cap was the server's; upstream accepts any count and clamps to the series length (`mrv=200` on a 66-year series returns 66). Ten values is a decade against series running 60+ years, and "most recent N" is the only way to read the tail of a sparse series without guessing a `date_range`. 100 spans every World Bank series with headroom while bounding the `mrv` × countries fan-out; `page`/`per_page` handle the rest (`mrv=60` at the default 50-row page returns 60 across two pages). |
 | 2026-08-09 | Full catalog cached in-process, 1 h TTL, single-flight | The catalog is 14.9 MB / 29,544 rows, ~39 MB retained as a normalized projection, and a measured RSS step of roughly 140 MB on the first cold search. Fetching it per search is untenable; caching it on the service instance with a shared in-flight promise makes a warm keyword-only search a local scan in tens of milliseconds. TTL is configurable via `WORLDBANK_CATALOG_CACHE_TTL_MS`; `0` trades the memory back for a refetch per search. |

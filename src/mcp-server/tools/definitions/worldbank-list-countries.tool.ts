@@ -12,19 +12,14 @@ import { getWorldBankApiService } from '@/services/worldbank/worldbank-service.j
 export const worldbankListCountries = tool('worldbank_list_countries', {
   title: 'List World Bank Countries',
   description:
-    'Lists countries and regional aggregates with metadata: ISO codes, region, income level, capital, and coordinates. ' +
-    'Filterable by region code (e.g. EAS, SSF, NAC) and income level (LIC, LMC, UMC, HIC). ' +
-    'By default, excludes regional/income-group aggregate entries and returns individual countries only. ' +
-    'Set include_aggregates=true to also see region, income group, and world aggregate entities.',
+    'List countries and regional aggregates with metadata: ISO codes, region, income level, capital, and coordinates. Filter by region code (e.g. EAS, SSF, NAC) and income level (LIC, LMC, UMC, HIC). Aggregate entries are excluded by default, leaving individual countries only; set include_aggregates=true to also return region, income group, and world aggregate entities.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     region: z
       .string()
       .optional()
       .describe(
-        'Filter by World Bank region code. Valid codes: EAS (East Asia & Pacific), ' +
-          'ECS (Europe & Central Asia), LCN (Latin America & Caribbean), ' +
-          'MEA (Middle East & North Africa), NAC (North America), SAS (South Asia), SSF (Sub-Saharan Africa).',
+        'Filter by World Bank region code. Valid codes: EAS (East Asia & Pacific), ECS (Europe & Central Asia), LCN (Latin America & Caribbean), MEA (Middle East & North Africa), NAC (North America), SAS (South Asia), SSF (Sub-Saharan Africa).',
       ),
     income_level: z
       .string()
@@ -36,8 +31,7 @@ export const worldbankListCountries = tool('worldbank_list_countries', {
       .boolean()
       .default(false)
       .describe(
-        'When true, includes regional, income-group, and world aggregate entries alongside individual countries. ' +
-          'Default false (individual countries only).',
+        'When true, includes regional, income-group, and world aggregate entries alongside individual countries. Default false (individual countries only).',
       ),
     page: z.number().int().min(1).default(1).describe('Pagination page number (1-based).'),
     per_page: z

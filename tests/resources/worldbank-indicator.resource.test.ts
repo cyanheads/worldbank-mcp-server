@@ -8,6 +8,7 @@ import {
   notFound,
   serviceUnavailable,
   timeout,
+  validationError,
 } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -31,6 +32,12 @@ const mockIndicator = {
   ],
 };
 
+/** A resource's params schema — optional on the definition type, declared by this resource. */
+function paramsOf<T extends { params?: unknown }>(definition: T): NonNullable<T['params']> {
+  if (!definition.params) throw new Error('Resource declares no params schema');
+  return definition.params;
+}
+
 /** The rejection WorldBankApiService.getIndicator throws for an ID upstream rejects. */
 function unknownIndicator(indicatorId: string) {
   return notFound(
@@ -52,7 +59,7 @@ describe('worldbankIndicatorResource', () => {
       '@/mcp-server/resources/definitions/worldbank-indicator.resource.js'
     );
     const ctx = createMockContext({ errors: worldbankIndicatorResource.errors });
-    const params = worldbankIndicatorResource.params.parse({ indicatorId: 'NY.GDP.PCAP.CD' });
+    const params = paramsOf(worldbankIndicatorResource).parse({ indicatorId: 'NY.GDP.PCAP.CD' });
     const result = await worldbankIndicatorResource.handler(params, ctx);
     expect(result).toMatchObject({
       id: 'NY.GDP.PCAP.CD',
@@ -73,8 +80,10 @@ describe('worldbankIndicatorResource', () => {
       '@/mcp-server/resources/definitions/worldbank-indicator.resource.js'
     );
     const ctx = createMockContext({ errors: worldbankIndicatorResource.errors });
-    const params = worldbankIndicatorResource.params.parse({ indicatorId: 'INVALID.ID' });
-    const err = await worldbankIndicatorResource.handler(params, ctx).catch((e: unknown) => e);
+    const params = paramsOf(worldbankIndicatorResource).parse({ indicatorId: 'INVALID.ID' });
+    const err = await Promise.resolve(worldbankIndicatorResource.handler(params, ctx)).catch(
+      (e: unknown) => e,
+    );
     expect(err).toMatchObject({
       code: JsonRpcErrorCode.NotFound,
       data: { reason: 'indicator_not_found', indicatorId: 'INVALID.ID' },
@@ -102,8 +111,10 @@ describe('worldbankIndicatorResource', () => {
       '@/mcp-server/resources/definitions/worldbank-indicator.resource.js'
     );
     const ctx = createMockContext({ errors: worldbankIndicatorResource.errors });
-    const params = worldbankIndicatorResource.params.parse({ indicatorId: 'NY.GDP.PCAP.CD' });
-    const err = await worldbankIndicatorResource.handler(params, ctx).catch((e: unknown) => e);
+    const params = paramsOf(worldbankIndicatorResource).parse({ indicatorId: 'NY.GDP.PCAP.CD' });
+    const err = await Promise.resolve(worldbankIndicatorResource.handler(params, ctx)).catch(
+      (e: unknown) => e,
+    );
     expect(err).toBe(upstreamError);
     expect((err as { code: number }).code).toBe(expectedCode);
   });
@@ -127,7 +138,7 @@ describe('worldbankIndicatorResource', () => {
       '@/mcp-server/resources/definitions/worldbank-indicator.resource.js'
     );
     const ctx = createMockContext({ errors: worldbankIndicatorResource.errors });
-    const params = worldbankIndicatorResource.params.parse({ indicatorId: 'SH.XPD.CHEX.GD.ZS' });
+    const params = paramsOf(worldbankIndicatorResource).parse({ indicatorId: 'SH.XPD.CHEX.GD.ZS' });
     const result = await worldbankIndicatorResource.handler(params, ctx);
     expect(result.topics).toHaveLength(0);
     expect(result.unit).toBe('');
@@ -140,7 +151,84 @@ describe('worldbankIndicatorResource', () => {
     const { worldbankIndicatorResource } = await import(
       '@/mcp-server/resources/definitions/worldbank-indicator.resource.js'
     );
-    expect(() => worldbankIndicatorResource.params.parse({})).toThrow();
+    expect(() => paramsOf(worldbankIndicatorResource).parse({})).toThrow();
+  });
+
+  it.each([
+    ['NY.GDP.PCAP.CD;SP.POP.TOTL'],
+    ['NY.GDP.PCAP.CD,SP.POP.TOTL'],
+    ['NY.GDP.PCAP.CD%3BSP.POP.TOTL'],
+    ['a/b'],
+  ])('rejects the multi-ID selector or out-of-charset ID %j in the URI', async (indicatorId) => {
+    const { worldbankIndicatorResource } = await import(
+      '@/mcp-server/resources/definitions/worldbank-indicator.resource.js'
+    );
+    const parsed = paramsOf(worldbankIndicatorResource).safeParse({ indicatorId });
+    expect(parsed.success).toBe(false);
+    expect(parsed.error?.issues[0]?.message).toContain('worldbank_search_indicators');
+  });
+
+  it.each([['NY.GDP.PCAP.CD'], ['CoCA_fexp'], ['1.1_YOUTH.LITERACY.RATE']])(
+    'accepts the single indicator ID %j',
+    async (indicatorId) => {
+      const { worldbankIndicatorResource } = await import(
+        '@/mcp-server/resources/definitions/worldbank-indicator.resource.js'
+      );
+      expect(paramsOf(worldbankIndicatorResource).safeParse({ indicatorId }).success).toBe(true);
+    },
+  );
+
+  it.each([['all'], ['All']])(
+    'rejects %j through its error path as multiple_indicators with the search-tool recovery',
+    async (indicatorId) => {
+      const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+      const getIndicator = vi.fn().mockResolvedValue(mockIndicator);
+      vi.mocked(getWorldBankApiService).mockReturnValue({ getIndicator } as never);
+
+      const { worldbankIndicatorResource } = await import(
+        '@/mcp-server/resources/definitions/worldbank-indicator.resource.js'
+      );
+      const ctx = createMockContext({ errors: worldbankIndicatorResource.errors });
+      const params = paramsOf(worldbankIndicatorResource).parse({ indicatorId });
+      await expect(worldbankIndicatorResource.handler(params, ctx)).rejects.toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        message: expect.stringContaining(`"${indicatorId}"`),
+        data: {
+          reason: 'multiple_indicators',
+          indicatorId,
+          recovery: { hint: expect.stringContaining('worldbank_search_indicators') },
+        },
+      });
+      expect(getIndicator).not.toHaveBeenCalled();
+    },
+  );
+
+  it('maps an ID the service resolves to several indicators to multiple_indicators', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      getIndicator: vi.fn().mockRejectedValue(
+        validationError('Indicator ID "XYZ" selects more than one indicator (A.B, C.D).', {
+          reason: 'multiple_indicators',
+          indicatorId: 'XYZ',
+          matchedIds: ['A.B', 'C.D'],
+        }),
+      ),
+    } as never);
+
+    const { worldbankIndicatorResource } = await import(
+      '@/mcp-server/resources/definitions/worldbank-indicator.resource.js'
+    );
+    const ctx = createMockContext({ errors: worldbankIndicatorResource.errors });
+    const params = paramsOf(worldbankIndicatorResource).parse({ indicatorId: 'XYZ' });
+    await expect(worldbankIndicatorResource.handler(params, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: {
+        reason: 'multiple_indicators',
+        indicatorId: 'XYZ',
+        matchedIds: ['A.B', 'C.D'],
+        recovery: { hint: expect.stringContaining('worldbank_search_indicators') },
+      },
+    });
   });
 
   // ─── Security ─────────────────────────────────────────────────────────────
@@ -155,8 +243,10 @@ describe('worldbankIndicatorResource', () => {
       '@/mcp-server/resources/definitions/worldbank-indicator.resource.js'
     );
     const ctx = createMockContext({ errors: worldbankIndicatorResource.errors });
-    const params = worldbankIndicatorResource.params.parse({ indicatorId: 'INVALID.XYZ' });
-    const err = await worldbankIndicatorResource.handler(params, ctx).catch((e: unknown) => e);
+    const params = paramsOf(worldbankIndicatorResource).parse({ indicatorId: 'INVALID.XYZ' });
+    const err = await Promise.resolve(worldbankIndicatorResource.handler(params, ctx)).catch(
+      (e: unknown) => e,
+    );
     const errStr = JSON.stringify(err);
     expect(errStr).not.toMatch(/WORLDBANK_API/);
     expect(errStr).not.toMatch(/Authorization/i);

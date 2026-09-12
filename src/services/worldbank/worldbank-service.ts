@@ -11,7 +11,12 @@
 
 import type { Context } from '@cyanheads/mcp-ts-core';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
-import { type McpError, notFound, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
+import {
+  McpError,
+  notFound,
+  serviceUnavailable,
+  validationError,
+} from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
@@ -65,6 +70,27 @@ const REQUEST_TIMEOUT_MS = 15_000;
  */
 const BULK_TIMEOUT_MS = 60_000;
 
+/**
+ * Stand-in for the invalid-value envelope when upstream answers a lookup with a
+ * real HTTP 404. A well-formed but unknown ID gets the HTTP-200 envelope; an ID
+ * that escapes into a path the router can't match (`a%2Fb`, `%253B`) gets a 404
+ * page instead, and the two mean the same thing to the caller.
+ */
+const PATH_NOT_FOUND_ENVELOPE: WbErrorEnvelope = {
+  message: [
+    { id: '404', key: 'Not Found', value: 'No World Bank API resource exists at this path' },
+  ],
+};
+
+/** True for the error `fetchWithTimeout` throws when upstream answers HTTP 404. */
+function isUpstreamNotFound(error: unknown): boolean {
+  return (
+    error instanceof McpError &&
+    error.data?.errorSource === 'FetchHttpError' &&
+    error.data.status === 404
+  );
+}
+
 function isWbErrorEnvelope(data: unknown): data is WbErrorEnvelope {
   // Direct object: { message: [...] }
   if (
@@ -81,13 +107,44 @@ function isWbErrorEnvelope(data: unknown): data is WbErrorEnvelope {
 
 // ─── Normalization helpers ────────────────────────────────────────────────────
 
+const NAMED_ENTITIES: Record<string, string> = {
+  amp: '&',
+  apos: "'",
+  gt: '>',
+  lt: '<',
+  nbsp: ' ',
+  quot: '"',
+};
+
+/**
+ * Reduce provider-authored prose to plain text. A few source notes carry HTML
+ * (`SE.PRM.INPT` breaks a dash list with `</br>`), which reached both response
+ * surfaces as literal tags. Breaks become line breaks, other tags are dropped
+ * with their text kept, and entities are decoded after the tags are gone, so an
+ * encoded `&lt;b&gt;` survives as text. Only a `<` followed by a letter reads as
+ * a tag: literal brackets in prose (`<$2.15 a day`, `<-2 standard deviations`)
+ * pass through, and a note without markup comes back unchanged.
+ */
+function plainProse(value: string): string {
+  return value
+    .replace(/[ \t]*<\/?br\s*\/?>[ \t]*/gi, '\n')
+    .replace(/<\/?[A-Za-z][A-Za-z0-9-]*(?:\s[^<>]*)?\/?>/g, '')
+    .replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (entity, body: string) => {
+      if (!body.startsWith('#')) return NAMED_ENTITIES[body.toLowerCase()] ?? entity;
+      const codePoint = /^#x/i.test(body)
+        ? Number.parseInt(body.slice(2), 16)
+        : Number(body.slice(1));
+      return codePoint <= 0x10ffff ? String.fromCodePoint(codePoint) : entity;
+    });
+}
+
 function normalizeIndicator(raw: RawIndicator): Indicator {
   return {
     id: raw.id ?? '',
     name: raw.name ?? '',
     sourceId: raw.source?.id ?? '',
     sourceName: raw.source?.value ?? '',
-    sourceNote: raw.sourceNote ?? '',
+    sourceNote: plainProse(raw.sourceNote ?? ''),
     topics: (raw.topics ?? [])
       .filter((t): t is typeof t & { id: string } => typeof t.id === 'string' && t.id.length > 0)
       .map((t) => ({ id: t.id, name: t.value ?? '' })),
@@ -235,6 +292,28 @@ function dedupeIndicators(indicators: readonly Indicator[]): Indicator[] {
   return [...byId.values()];
 }
 
+// ─── Single-item lookups ─────────────────────────────────────────────────────
+
+/** How many of a rejected selector's matched IDs a lookup error names. */
+const ID_SAMPLE_SIZE = 5;
+
+/**
+ * The distinct IDs across a lookup's rows, in upstream order. `/country/{code}`
+ * and `/indicator/{id}` accept collection selectors (`all`, `USA;CAN`) as well
+ * as single codes, so a lookup is single only when every row shares one ID. The
+ * row count is no test: an indicator published under a live and an archived
+ * source answers two rows for one ID.
+ */
+function distinctIds(rows: ReadonlyArray<{ id?: string }>): string[] {
+  return [...new Set(rows.map((row) => row.id ?? ''))];
+}
+
+/** Render the first matched IDs for an error message, marking any remainder. */
+function sampleIds(ids: readonly string[]): string {
+  const shown = ids.slice(0, ID_SAMPLE_SIZE).join(', ');
+  return ids.length > ID_SAMPLE_SIZE ? `${shown}, …` : shown;
+}
+
 // ─── Keyword matching ────────────────────────────────────────────────────────
 
 /**
@@ -283,7 +362,6 @@ function rankIdOrNameHits(hits: readonly Indicator[], phrase: string): Indicator
  */
 function matchIndicators(indicators: readonly Indicator[], query: string): Indicator[] {
   const phrase = normalizeForMatch(query);
-  if (!phrase) return [...indicators];
   const tokens = phrase.split(' ');
 
   const byIdOrName: Indicator[] = [];
@@ -344,9 +422,17 @@ export class WorldBankApiService {
   }
 
   /** Fetch a URL, detect HTML error pages, and return the parsed JSON. */
-  private async fetchJson<T>(url: string, ctx: Context, timeoutMs: number): Promise<T> {
+  private async fetchJson<T>(
+    url: string,
+    ctx: Context,
+    timeoutMs: number,
+    expectedStatuses?: number[],
+  ): Promise<T> {
     const reqCtx = ctx as ReqCtx;
-    const response = await fetchWithTimeout(url, timeoutMs, reqCtx, { signal: ctx.signal });
+    const response = await fetchWithTimeout(url, timeoutMs, reqCtx, {
+      signal: ctx.signal,
+      ...(expectedStatuses && { expectedStatuses }),
+    });
     const text = await response.text();
 
     // Detect HTML error pages (upstream returns HTML on some gateway errors)
@@ -359,18 +445,44 @@ export class WorldBankApiService {
     return JSON.parse(text) as T;
   }
 
-  /** Fetch JSON with retry wrapping the full pipeline. */
+  /**
+   * Fetch JSON with retry wrapping the full pipeline.
+   *
+   * @param expectedStatuses - Non-OK statuses the caller handles itself, which
+   *   the framework then logs at debug rather than error. Still thrown.
+   */
   private fetchWithRetry<T>(
     url: string,
     ctx: Context,
     timeoutMs: number = REQUEST_TIMEOUT_MS,
+    expectedStatuses?: number[],
   ): Promise<T> {
-    return withRetry(() => this.fetchJson<T>(url, ctx, timeoutMs), {
+    return withRetry(() => this.fetchJson<T>(url, ctx, timeoutMs, expectedStatuses), {
       operation: 'WorldBankApiService.fetch',
       context: ctx as ReqCtx,
       baseDelayMs: 1000,
       signal: ctx.signal,
     });
+  }
+
+  /**
+   * Fetch a request whose path carries a caller-supplied ID. An upstream 404 comes
+   * back as {@link PATH_NOT_FOUND_ENVELOPE}, so the caller's existing invalid-ID
+   * handling reports it with its own contract reason, and the upstream error page
+   * the framework captured is dropped. Every other status keeps the framework's
+   * classification.
+   */
+  private async fetchLookup<T>(
+    url: string,
+    ctx: Context,
+    timeoutMs: number = REQUEST_TIMEOUT_MS,
+  ): Promise<WbEnvelope<T> | WbErrorEnvelope> {
+    try {
+      return await this.fetchWithRetry<WbEnvelope<T> | WbErrorEnvelope>(url, ctx, timeoutMs, [404]);
+    } catch (err) {
+      if (isUpstreamNotFound(err)) return PATH_NOT_FOUND_ENVELOPE;
+      throw err;
+    }
   }
 
   /**
@@ -383,21 +495,22 @@ export class WorldBankApiService {
    *
    * @param onErrorEnvelope - Throws the caller's domain error when the World
    *   Bank returns its HTTP-200 error envelope for an invalid filter value.
+   * @param idInPath - The path carries a caller-supplied ID, so an upstream 404
+   *   reaches `onErrorEnvelope` too (see {@link fetchLookup}).
    */
   private async fetchAllPages<T>(
     path: string,
     params: Record<string, string | number | undefined>,
     ctx: Context,
     onErrorEnvelope: () => never,
+    idInPath = false,
   ): Promise<T[]> {
     const requestPage = async (page: number) => {
       const url = this.buildUrl(path, { ...params, page, per_page: BULK_PAGE_SIZE });
       ctx.log.debug('Fetching upstream page', { url });
-      const data = await this.fetchWithRetry<WbEnvelope<T> | WbErrorEnvelope>(
-        url,
-        ctx,
-        BULK_TIMEOUT_MS,
-      );
+      const data = idInPath
+        ? await this.fetchLookup<T>(url, ctx, BULK_TIMEOUT_MS)
+        : await this.fetchWithRetry<WbEnvelope<T> | WbErrorEnvelope>(url, ctx, BULK_TIMEOUT_MS);
       if (isWbErrorEnvelope(data)) onErrorEnvelope();
       const [paging, items] = data as WbEnvelope<T>;
       return { paging, items: items ?? [] };
@@ -487,10 +600,21 @@ export class WorldBankApiService {
   ): Promise<{ indicators: Indicator[]; total: number; page: number; pages: number }> {
     const { query, topicId, sourceId, page, perPage } = opts;
 
-    // Topic wins when both are given — /topic/{id}/indicator takes no source param.
+    // Matching ignores everything but letters and digits, so a query made only
+    // of punctuation has no term to match — rejected rather than read as "no
+    // filter", which would return the whole scope under an echoed query.
+    if (query !== undefined && !normalizeForMatch(query)) {
+      throw validationError(
+        `Query "${query}" has no letters or digits to search for; punctuation is ignored when matching.`,
+        { reason: 'empty_query', query },
+      );
+    }
+
+    // /topic/{id}/indicator honors `source` exactly as /indicator does — it
+    // intersects the two scopes and rejects an unknown source ID — so both
+    // filters go upstream together.
     const path = topicId ? `/topic/${encodeURIComponent(topicId)}/indicator` : '/indicator';
-    const scopeParams: Record<string, string | number | undefined> =
-      !topicId && sourceId ? { source: sourceId } : {};
+    const scopeParams: Record<string, string | number | undefined> = { source: sourceId };
 
     const invalidScope: () => never = () => {
       throw notFound(
@@ -503,7 +627,7 @@ export class WorldBankApiService {
       // No keyword: upstream pagination is authoritative, one request per page.
       const url = this.buildUrl(path, { ...scopeParams, page, per_page: perPage });
       ctx.log.debug('Listing indicators', { url });
-      const data = await this.fetchWithRetry<WbEnvelope<RawIndicator> | WbErrorEnvelope>(url, ctx);
+      const data = await this.fetchLookup<RawIndicator>(url, ctx);
       if (isWbErrorEnvelope(data)) invalidScope();
 
       const [paging, items] = data as WbEnvelope<RawIndicator>;
@@ -520,9 +644,9 @@ export class WorldBankApiService {
     // page are unreachable through any tool input.
     const pool =
       topicId || sourceId
-        ? (await this.fetchAllPages<RawIndicator>(path, scopeParams, ctx, invalidScope)).map(
-            normalizeIndicator,
-          )
+        ? (
+            await this.fetchAllPages<RawIndicator>(path, scopeParams, ctx, invalidScope, !!topicId)
+          ).map(normalizeIndicator)
         : await this.loadIndicatorCatalog(ctx);
 
     const matches = matchIndicators(dedupeIndicators(pool), query);
@@ -539,7 +663,7 @@ export class WorldBankApiService {
     const url = this.buildUrl(`/indicator/${encodeURIComponent(indicatorId)}`);
     ctx.log.debug('Fetching indicator', { indicatorId, url });
 
-    const data = await this.fetchWithRetry<WbEnvelope<RawIndicator> | WbErrorEnvelope>(url, ctx);
+    const data = await this.fetchLookup<RawIndicator>(url, ctx);
 
     if (isWbErrorEnvelope(data)) {
       throw notFound(
@@ -553,6 +677,15 @@ export class WorldBankApiService {
       throw notFound(
         `Indicator "${indicatorId}" not found. Use worldbank_search_indicators to find valid IDs.`,
         { reason: 'indicator_not_found', indicatorId },
+      );
+    }
+
+    const ids = distinctIds(items);
+    if (ids.length > 1) {
+      throw validationError(
+        `Indicator ID "${indicatorId}" selects more than one indicator (${sampleIds(ids)}). ` +
+          'Pass a single indicator ID, or use worldbank_search_indicators to list indicators.',
+        { reason: 'multiple_indicators', indicatorId, matchedIds: ids.slice(0, ID_SAMPLE_SIZE) },
       );
     }
 
@@ -572,7 +705,7 @@ export class WorldBankApiService {
     const url = this.buildUrl(`/indicator/${encodeURIComponent(indicatorId)}`);
     ctx.log.debug('Looking up the catalog record behind a data rejection', { indicatorId, url });
 
-    const data = await this.fetchWithRetry<WbEnvelope<RawIndicator> | WbErrorEnvelope>(url, ctx);
+    const data = await this.fetchLookup<RawIndicator>(url, ctx);
     if (isWbErrorEnvelope(data)) return [];
 
     const [, items] = data as WbEnvelope<RawIndicator>;
@@ -706,6 +839,15 @@ export class WorldBankApiService {
       );
     }
 
+    const ids = distinctIds(items);
+    if (ids.length > 1) {
+      throw validationError(
+        `Country code "${countryCode}" selects more than one country (${sampleIds(ids)}). ` +
+          'Pass a single ISO2, ISO3, or aggregate code, or use worldbank_list_countries to list countries.',
+        { reason: 'multiple_countries', countryCode, matchedIds: ids.slice(0, ID_SAMPLE_SIZE) },
+      );
+    }
+
     return normalizeCountry(items[0] as RawCountry);
   }
 
@@ -781,7 +923,7 @@ export class WorldBankApiService {
     const url = this.buildUrl(path, { ...scope, page, per_page: perPage });
     ctx.log.debug('Fetching data', { indicatorId, countryCodes, url });
 
-    const data = await this.fetchWithRetry<WbEnvelope<RawDataPoint> | WbErrorEnvelope>(url, ctx);
+    const data = await this.fetchLookup<RawDataPoint>(url, ctx);
 
     if (isWbErrorEnvelope(data)) {
       // The /country/{codes}/indicator/{id} endpoint wraps errors in an array:

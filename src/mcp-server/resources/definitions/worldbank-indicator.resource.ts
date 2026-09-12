@@ -6,17 +6,24 @@
 
 import { resource, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
+import {
+  INDICATOR_ID,
+  INDICATOR_ID_MESSAGE,
+  isAllSelector,
+} from '@/services/worldbank/identifiers.js';
 import { getWorldBankApiService } from '@/services/worldbank/worldbank-service.js';
 
 export const worldbankIndicatorResource = resource('worldbank://indicator/{indicatorId}', {
   name: 'worldbank-indicator',
   title: 'World Bank Indicator',
   description:
-    'Indicator metadata for a known World Bank indicator ID: name, description, source, and thematic topics. ' +
-    'Stable reference URI — use worldbank_search_indicators to discover indicator IDs.',
+    'Read metadata for one World Bank indicator by ID: name, description, unit, source, and thematic topics. A stable reference URI; use worldbank_search_indicators to discover indicator IDs.',
   mimeType: 'application/json',
   params: z.object({
-    indicatorId: z.string().describe('Indicator ID (e.g. NY.GDP.PCAP.CD).'),
+    indicatorId: z
+      .string()
+      .regex(INDICATOR_ID, INDICATOR_ID_MESSAGE)
+      .describe('One indicator ID (e.g. NY.GDP.PCAP.CD) — not "all" or a list of IDs.'),
   }),
   output: z.object({
     id: z.string().describe('Indicator ID.'),
@@ -45,10 +52,24 @@ export const worldbankIndicatorResource = resource('worldbank://indicator/{indic
       when: 'The indicator ID does not exist in the World Bank API.',
       recovery: 'Use worldbank_search_indicators to find valid indicator IDs by keyword or topic.',
     },
+    {
+      reason: 'multiple_indicators',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The ID is "all", or another selector the World Bank resolves to more than one indicator.',
+      recovery:
+        'Pass a single indicator ID, or use worldbank_search_indicators to list several indicators.',
+    },
   ],
 
   async handler(params, ctx) {
     ctx.log.debug('Reading indicator resource', { indicatorId: params.indicatorId });
+    if (isAllSelector(params.indicatorId)) {
+      throw ctx.fail(
+        'multiple_indicators',
+        `Indicator ID "${params.indicatorId}" selects the whole catalog rather than one indicator.`,
+        { ...ctx.recoveryFor('multiple_indicators'), indicatorId: params.indicatorId },
+      );
+    }
     try {
       return await getWorldBankApiService().getIndicator(params.indicatorId, ctx);
     } catch (err) {
@@ -59,6 +80,13 @@ export const worldbankIndicatorResource = resource('worldbank://indicator/{indic
         throw ctx.fail('indicator_not_found', err.message, {
           ...ctx.recoveryFor('indicator_not_found'),
           indicatorId: params.indicatorId,
+        });
+      }
+      if (err instanceof McpError && err.data?.reason === 'multiple_indicators') {
+        throw ctx.fail('multiple_indicators', err.message, {
+          ...ctx.recoveryFor('multiple_indicators'),
+          indicatorId: params.indicatorId,
+          matchedIds: err.data.matchedIds,
         });
       }
       throw err;

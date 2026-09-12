@@ -106,7 +106,7 @@ describe('worldbankGetPoverty', () => {
   it('returns the inequality block for a survey year', async () => {
     await stubService({ rows: [surveyRow], total: 1 });
     const tool = await loadTool();
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: tool.errors });
     const input = tool.input.parse({ countries: 'USA', year: '2022', poverty_line: 3 });
     const result = await tool.handler(input, ctx);
 
@@ -128,7 +128,7 @@ describe('worldbankGetPoverty', () => {
     const input = tool.input.parse({ countries: 'USA', year: '2022' });
 
     expect(input.fill_gaps).toBe(true);
-    await tool.handler(input, createMockContext());
+    await tool.handler(input, createMockContext({ errors: tool.errors }));
     expect(getPoverty.mock.calls[0]?.[0]).toMatchObject({ fillGaps: true });
   });
 
@@ -222,7 +222,7 @@ describe('worldbankGetPoverty', () => {
     const tool = await loadTool();
     await tool.handler(
       tool.input.parse({ countries: 'IND;USA, BRA', year: '2019' }),
-      createMockContext(),
+      createMockContext({ errors: tool.errors }),
     );
     expect(getPoverty.mock.calls[0]?.[0]).toMatchObject({ countries: ['IND', 'USA', 'BRA'] });
   });
@@ -279,7 +279,7 @@ describe('worldbankGetPoverty', () => {
       welfare_type: '',
       reporting_level: '',
     });
-    await tool.handler(input, createMockContext());
+    await tool.handler(input, createMockContext({ errors: tool.errors }));
 
     const sent = getPoverty.mock.calls[0]?.[0] as Record<string, unknown>;
     expect(sent).not.toHaveProperty('year');
@@ -347,8 +347,7 @@ describe('worldbankGetPoverty', () => {
 
   it('renders the poverty and inequality fields into content[]', async () => {
     const tool = await loadTool();
-    const [block] =
-      tool.format?.({ estimates: [surveyRow, gapFilledRow] }, createMockContext()) ?? [];
+    const [block] = tool.format?.({ estimates: [surveyRow, gapFilledRow] }) ?? [];
     const text = (block as { text: string }).text;
 
     expect(text).toContain('United States (USA) — 2022, national');
@@ -362,7 +361,7 @@ describe('worldbankGetPoverty', () => {
 
   it('renders an empty result without throwing', async () => {
     const tool = await loadTool();
-    const [block] = tool.format?.({ estimates: [] }, createMockContext()) ?? [];
+    const [block] = tool.format?.({ estimates: [] }) ?? [];
     expect((block as { text: string }).text).toContain('No estimates returned.');
   });
 });

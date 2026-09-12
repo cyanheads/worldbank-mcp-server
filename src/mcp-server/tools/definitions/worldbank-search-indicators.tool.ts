@@ -7,35 +7,35 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { getServerConfig } from '@/config/server-config.js';
+import {
+  CATALOG_FILTER_ID,
+  SOURCE_ID_MESSAGE,
+  TOPIC_ID_MESSAGE,
+} from '@/services/worldbank/identifiers.js';
 import { getWorldBankApiService } from '@/services/worldbank/worldbank-service.js';
 
 export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
   title: 'Search World Bank Indicators',
   description:
-    'Searches the 29,500+ World Bank indicator catalog by keyword, topic, or source. ' +
-    'Returns indicator IDs and metadata for chaining into worldbank_get_data. ' +
-    'At least one of query, topic_id, or source_id must be provided. ' +
-    'A keyword query matches every term against indicator ID, name, and description, in any word order, ' +
-    'across the whole catalog or the whole selected topic or source; punctuation in the query is ignored. ' +
-    'Exact ID or name matches rank first, then whole-phrase matches, then ID/name matches, then description-only matches. ' +
-    'Each indicator ID appears once, even where the catalog publishes it under two sources. ' +
-    'Use worldbank_list_topics for topic IDs, worldbank_list_sources for source IDs.',
+    'Search the 29,500+ World Bank indicator catalog by keyword, topic, or source, returning indicator IDs and metadata for worldbank_get_data. Provide at least one of query, topic_id, or source_id; a topic and a source together narrow to indicators in both. A keyword query matches every term against indicator ID, name, and description, in any word order, across the whole catalog or the whole selected topic or source; punctuation is ignored, so the query needs at least one letter or digit. Exact ID or name matches rank first, then whole-phrase matches, then other ID/name matches, then description-only matches. Each indicator ID appears once, even where the catalog publishes it under two sources. Find topic IDs with worldbank_list_topics and source IDs with worldbank_list_sources.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     query: z
       .string()
       .optional()
       .describe(
-        'Keyword search terms — an indicator name, ID, or any words from either (e.g. "GDP per capita", "NY.GDP.MKTP.CD", "CO2 emissions"). Every term must match; punctuation is ignored. At least one of query, topic_id, or source_id must be provided.',
+        'Keyword search terms — an indicator name, ID, or any words from either (e.g. "GDP per capita", "NY.GDP.MKTP.CD", "CO2 emissions"). Every term must match; punctuation is ignored, so the query needs at least one letter or digit. At least one of query, topic_id, or source_id must be provided.',
       ),
     topic_id: z
       .string()
+      .regex(CATALOG_FILTER_ID, TOPIC_ID_MESSAGE)
       .optional()
       .describe(
         'Filter by topic ID (e.g. "1" for Agriculture, "3" for Economy & Growth). Use worldbank_list_topics to browse valid IDs.',
       ),
     source_id: z
       .string()
+      .regex(CATALOG_FILTER_ID, SOURCE_ID_MESSAGE)
       .optional()
       .describe(
         'Filter by data source ID (e.g. "2" for World Development Indicators). Use worldbank_list_sources to browse valid IDs.',
@@ -145,6 +145,13 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
       recovery:
         'Browse valid IDs with worldbank_list_topics or worldbank_list_sources, then retry with one of those.',
     },
+    {
+      reason: 'empty_query',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The query contains no letters or digits once punctuation is ignored.',
+      recovery:
+        'Provide a keyword with letters or digits, or omit query to browse by topic_id or source_id.',
+    },
   ],
 
   async handler(input, ctx) {
@@ -186,6 +193,12 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
           ...ctx.recoveryFor('invalid_filter'),
           topicId: input.topic_id,
           sourceId: input.source_id,
+        });
+      }
+      if (err instanceof McpError && err.data?.reason === 'empty_query') {
+        throw ctx.fail('empty_query', err.message, {
+          ...ctx.recoveryFor('empty_query'),
+          query,
         });
       }
       throw err;

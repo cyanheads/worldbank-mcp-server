@@ -1,6 +1,6 @@
 # worldbank-mcp-server - Directory Structure
 
-Generated on: 2026-09-12 20:53:40
+Generated on: 2026-09-12 21:29:35
 
 ```text
 worldbank-mcp-server/
@@ -162,6 +162,7 @@ worldbank-mcp-server/
 │   │   │   ├── projects-service.ts
 │   │   │   └── types.ts
 │   │   └── worldbank/
+│   │       ├── identifiers.ts
 │   │       ├── types.ts
 │   │       └── worldbank-service.ts
 │   └── index.ts

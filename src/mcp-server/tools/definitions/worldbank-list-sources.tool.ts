@@ -11,8 +11,7 @@ import { getWorldBankApiService } from '@/services/worldbank/worldbank-service.j
 export const worldbankListSources = tool('worldbank_list_sources', {
   title: 'List World Bank Data Sources',
   description:
-    'Lists the 70+ World Bank data sources (datasets) such as World Development Indicators, IDS, and Doing Business. ' +
-    'Returns source IDs and names for use as source_id in worldbank_search_indicators. Supports pagination.',
+    'List the 70+ World Bank data sources (datasets), such as World Development Indicators, International Debt Statistics, and Doing Business. Returns source IDs and names for use as source_id in worldbank_search_indicators, one page at a time.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     page: z.number().int().min(1).default(1).describe('Pagination page number (1-based).'),
