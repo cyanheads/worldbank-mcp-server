@@ -1,8 +1,8 @@
 # Developer Protocol
 
 **Server:** @cyanheads/worldbank-mcp-server
-**Version:** 0.3.3
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.12.8`
+**Version:** 0.3.4
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.12.9`
 **Engines:** Bun ≥1.4.0, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/server` ^2.0.0
 **Zod:** ^4.6.0
