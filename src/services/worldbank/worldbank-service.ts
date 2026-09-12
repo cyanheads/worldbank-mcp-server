@@ -11,7 +11,7 @@
 
 import type { Context } from '@cyanheads/mcp-ts-core';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
-import { notFound, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
+import { type McpError, notFound, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
@@ -37,6 +37,16 @@ type ReqCtx = Context & Record<string, unknown>;
 
 /** Shape returned by the WB API for invalid IDs (HTTP 200, not 404). */
 type WbErrorEnvelope = { message: Array<{ id: string; key: string; value: string }> };
+
+/**
+ * Message id the data endpoint returns for an indicator the catalog lists but
+ * the endpoint will not serve for any country, date, or `source` parameter:
+ * "The indicator was not found. It may have been deleted or archived." It covers
+ * every WDI Database Archives indicator and whole non-archive sources too (PEFA,
+ * ICP, Food Prices for Nutrition), so a source name can't stand in for it. A
+ * bad country code on the same indicator produces the generic id 120 instead.
+ */
+const NOT_SERVED_MESSAGE_ID = '175';
 
 /**
  * Per-request page size for exhaustive fetches. Not a result ceiling — the
@@ -553,19 +563,65 @@ export class WorldBankApiService {
   }
 
   /**
-   * Resolve whether an indicator ID exists. Called only from the data endpoint's
-   * error path: its envelope proves a path segment was rejected but never names
-   * which one, and `/indicator/{id}` is unambiguous by construction.
+   * Fetch every catalog row for an indicator ID — empty when the catalog doesn't
+   * list it. Called only from the data endpoint's error path: its envelope never
+   * names the rejected path segment, and `/indicator/{id}` is unambiguous by
+   * construction.
    */
-  private async indicatorExists(indicatorId: string, ctx: Context): Promise<boolean> {
+  private async lookupCatalogRows(indicatorId: string, ctx: Context): Promise<Indicator[]> {
     const url = this.buildUrl(`/indicator/${encodeURIComponent(indicatorId)}`);
-    ctx.log.debug('Resolving which parameter upstream rejected', { indicatorId, url });
+    ctx.log.debug('Looking up the catalog record behind a data rejection', { indicatorId, url });
 
     const data = await this.fetchWithRetry<WbEnvelope<RawIndicator> | WbErrorEnvelope>(url, ctx);
-    if (isWbErrorEnvelope(data)) return false;
+    if (isWbErrorEnvelope(data)) return [];
 
     const [, items] = data as WbEnvelope<RawIndicator>;
-    return Boolean(items?.length);
+    return (items ?? []).map(normalizeIndicator);
+  }
+
+  /**
+   * Build the error for an indicator the data endpoint refuses to serve. The
+   * upstream rejection alone settles the classification; the catalog lookup only
+   * adds the indicator's name and source to the message, so a failed lookup
+   * still yields the same reason rather than an unrelated upstream error.
+   */
+  private async indicatorNotQueryable(
+    indicatorId: string,
+    detail: string,
+    ctx: Context,
+  ): Promise<McpError> {
+    let rows: Indicator[] = [];
+    try {
+      rows = await this.lookupCatalogRows(indicatorId, ctx);
+    } catch (err) {
+      if (ctx.signal.aborted) throw err;
+      ctx.log.warning(
+        'Catalog lookup failed; reporting the unserved indicator without its source',
+        {
+          indicatorId,
+          error: err instanceof Error ? err.message : String(err),
+        },
+      );
+    }
+
+    const sourceNames = [...new Set(rows.map((row) => row.sourceName).filter(Boolean))];
+    const name = rows[0]?.name;
+    const label = name ? `"${indicatorId}" (${name})` : `"${indicatorId}"`;
+    const catalogued =
+      sourceNames.length > 0
+        ? ` is catalogued under ${new Intl.ListFormat('en', { type: 'conjunction' }).format(sourceNames)}, but`
+        : '';
+
+    return notFound(
+      `Indicator ${label}${catalogued} is not served by the World Bank data endpoint for any country or date. ` +
+        `Detail: ${detail.replace(/\.$/, '')}. Use worldbank_search_indicators to find a current indicator for the same measure.`,
+      {
+        reason: 'indicator_not_queryable',
+        indicatorId,
+        detail,
+        ...(sourceNames.length > 0 && { sourceNames }),
+      },
+    );
   }
 
   // ─── Countries ───────────────────────────────────────────────────────────
@@ -736,14 +792,19 @@ export class WorldBankApiService {
 
       // Upstream emits one message per rejected path segment and never names
       // which, so two entries prove both segments are bad; one entry needs a
-      // second lookup to place. The envelope text is identical in every case.
+      // second lookup to place. The id-120 envelope text is identical in every
+      // case. Id 175 is the exception: upstream reaches it only once the country
+      // codes have passed, and it means the indicator itself is not served.
       if (envelope.message.length > 1) {
         throw notFound(
           `Neither indicator "${indicatorId}" nor country code(s) "${countryCodes}" are valid. Detail: ${detail}. Use worldbank_search_indicators and worldbank_list_countries.`,
           { reason: 'indicator_and_country_not_found', indicatorId, countryCodes, detail },
         );
       }
-      if (!(await this.indicatorExists(indicatorId, ctx))) {
+      if (envelope.message[0]?.id === NOT_SERVED_MESSAGE_ID) {
+        throw await this.indicatorNotQueryable(indicatorId, detail, ctx);
+      }
+      if ((await this.lookupCatalogRows(indicatorId, ctx)).length === 0) {
         throw notFound(
           `Indicator "${indicatorId}" not found. Use worldbank_search_indicators to find valid IDs.`,
           { reason: 'indicator_not_found', indicatorId, detail },

@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.3.2-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/worldbank-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/worldbank-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.3.3-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/worldbank-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/worldbank-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -108,7 +108,7 @@ Fetch complete metadata for a known indicator ID.
 
 Query indicator values for countries across time. The primary data-access tool.
 
-- Single country, array of countries, regional codes (EAS, LCN, …), income codes (HIC, LMC, …), world code (WLD), or `"all"` for every entry. At least one code is required — an empty value is rejected rather than read as `"all"`
+- Single country, array of countries, or one comma- or semicolon-separated string; regional codes (EAS, LCN, …), income codes (HIC, LMC, …), world code (WLD), or `"all"` on its own for every entry. At least one code is required — an empty value is rejected rather than read as `"all"`
 - Time filtering: `date_range` for a period or range — annual (`2020`, `2010:2023`), quarterly (`2020Q1:2021Q4`), or monthly (`2020M01:2020M06`) — or `mrv` for the N most recent available values (1–100). Mutually exclusive.
 - A `date_range` the API can't apply is enforced locally over the whole series, so observations outside the requested window are never returned as matches
 - Returns observations with `null` values when data is not available for a country×year cell — common for sparse series
@@ -116,6 +116,7 @@ Query indicator values for countries across time. The primary data-access tool.
 - Output grouped by country for readability; `isAggregate` flag distinguishes all 78 regional, income-group, and lending-group aggregates from individual countries
 - Echoes the parameters it sent upstream — indicator, normalized country codes, date range or `mrv`, page and page size
 - Paginated with up to 1000 entries per page
+- An indicator the catalog lists but the data endpoint doesn't serve (archived and retired datasets) is reported as such, not blamed on the country codes
 
 ---
 
@@ -230,7 +231,7 @@ MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=3010 bun run start:http
 
 ### Prerequisites
 
-- [Bun v1.3.0](https://bun.sh/) or higher (or Node.js ≥24.0.0).
+- [Bun v1.4.0](https://bun.sh/) or higher (or Node.js ≥24.0.0).
 - No API key required — the World Bank Open Data API is public and unauthenticated.
 
 ### Installation

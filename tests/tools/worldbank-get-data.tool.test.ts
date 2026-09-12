@@ -3,8 +3,9 @@
  * @module tests/tools/worldbank-get-data.tool.test
  */
 
+import { z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@/services/worldbank/worldbank-service.js', () => ({
@@ -288,6 +289,94 @@ describe('worldbankGetData', () => {
     });
   });
 
+  it('rethrows indicator_not_queryable via ctx.fail, pointing at search, not the country list', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      getData: vi.fn().mockRejectedValue(
+        new McpError(
+          JsonRpcErrorCode.NotFound,
+          'Indicator "SM.POP.REFG.OR" is catalogued under WDI Database Archives, but the data endpoint does not serve it.',
+          {
+            reason: 'indicator_not_queryable',
+            indicatorId: 'SM.POP.REFG.OR',
+            sourceNames: ['WDI Database Archives'],
+          },
+        ),
+      ),
+    } as never);
+
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const ctx = createMockContext({ errors: worldbankGetData.errors });
+    const input = worldbankGetData.input.parse({
+      indicator_id: 'SM.POP.REFG.OR',
+      countries: 'SDN',
+      mrv: 3,
+    });
+    const err = await worldbankGetData.handler(input, ctx).catch((e: unknown) => e);
+    expect(err).toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: {
+        reason: 'indicator_not_queryable',
+        indicatorId: 'SM.POP.REFG.OR',
+        sourceNames: ['WDI Database Archives'],
+        recovery: { hint: expect.stringContaining('worldbank_search_indicators') },
+      },
+    });
+    const data = (err as McpError).data ?? {};
+    expect(data).not.toHaveProperty('countries');
+    expect(JSON.stringify(data.recovery)).not.toContain('worldbank_list_countries');
+  });
+
+  it('delivers indicator_not_queryable on both error surfaces through the tool contract', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      getData: vi
+        .fn()
+        .mockRejectedValue(
+          new McpError(
+            JsonRpcErrorCode.NotFound,
+            'Indicator "SM.POP.REFG.OR" is not served by the data endpoint for any country or date.',
+            { reason: 'indicator_not_queryable', indicatorId: 'SM.POP.REFG.OR' },
+          ),
+        ),
+    } as never);
+
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const result = await runToolContract(
+      worldbankGetData,
+      { indicator_id: 'SM.POP.REFG.OR', countries: 'SDN' },
+      { context: { errors: worldbankGetData.errors } },
+    );
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.NotFound,
+        data: {
+          reason: 'indicator_not_queryable',
+          recovery: { hint: expect.stringContaining('worldbank_search_indicators') },
+        },
+      },
+    });
+    const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+    expect(text).toContain('SM.POP.REFG.OR');
+    expect(text).toMatch(/Recovery:.*worldbank_search_indicators/);
+    expect(text).not.toContain('SDN');
+  });
+
+  it('declares indicator_not_queryable in the error contract with a search recovery', async () => {
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const entry = worldbankGetData.errors?.find((e) => e.reason === 'indicator_not_queryable');
+    expect(entry).toMatchObject({ code: JsonRpcErrorCode.NotFound });
+    expect(entry?.recovery).toContain('worldbank_search_indicators');
+    expect(entry?.recovery).not.toContain('worldbank_list_countries');
+  });
+
   it('notices that a dropped date_range matched nothing', async () => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
     vi.mocked(getWorldBankApiService).mockReturnValue({
@@ -485,27 +574,115 @@ describe('worldbankGetData', () => {
     expect(getDataMock.mock.calls[0][0].mrv).toBe(60);
   });
 
-  it.each([[[]], [['']], [['  ']], [''], ['   '], [' ; ']])(
-    'rejects an empty countries value: %j',
-    async (countries) => {
-      const { worldbankGetData } = await import(
-        '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
-      );
-      expect(() =>
-        worldbankGetData.input.parse({ indicator_id: 'SP.POP.TOTL', countries }),
-      ).toThrow();
-    },
-  );
+  it.each([
+    [[]],
+    [['']],
+    [['  ']],
+    [''],
+    ['   '],
+    [' ; '],
+    [','],
+    [' , ; , '],
+    [[',']],
+    [[';']],
+    [[',', ' ; ', '']],
+  ])('rejects an empty countries value: %j', async (countries) => {
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    expect(() => worldbankGetData.input.parse({ indicator_id: 'SP.POP.TOTL', countries })).toThrow(
+      'Provide at least one country code',
+    );
+  });
 
   it('still accepts a populated countries value', async () => {
     const { worldbankGetData } = await import(
       '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
     );
-    for (const countries of ['US', 'all', ['US', 'DE']]) {
+    for (const countries of ['US', 'all', 'ALL', ['all'], ['US', 'DE']]) {
       expect(() =>
         worldbankGetData.input.parse({ indicator_id: 'SP.POP.TOTL', countries }),
       ).not.toThrow();
     }
+  });
+
+  it.each([
+    ['US,JP,KR', ['US', 'JP', 'KR'], 'US;JP;KR'],
+    [' US , JP ', ['US', 'JP'], 'US;JP'],
+    ['US,', ['US'], 'US'],
+    ['US;JP', ['US', 'JP'], 'US;JP'],
+    ['USA, CHN; DEU', ['USA', 'CHN', 'DEU'], 'USA;CHN;DEU'],
+    [['US,', ''], ['US'], 'US'],
+    [['US,JP', 'KR'], ['US', 'JP', 'KR'], 'US;JP;KR'],
+    [['US', 'CN', 'ZW'], ['US', 'CN', 'ZW'], 'US;CN;ZW'],
+    ['all', ['all'], 'all'],
+  ])('splits countries %j into the codes sent upstream', async (countries, codes, echoed) => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    const getDataMock = vi.fn().mockResolvedValue(mockDataResult);
+    vi.mocked(getWorldBankApiService).mockReturnValue({ getData: getDataMock } as never);
+
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const ctx = createMockContext({ errors: worldbankGetData.errors });
+    const input = worldbankGetData.input.parse({ indicator_id: 'NY.GDP.PCAP.CD', countries });
+    await worldbankGetData.handler(input, ctx);
+
+    expect(getDataMock).toHaveBeenCalledTimes(1);
+    expect(getDataMock.mock.calls[0][0].countries).toEqual(codes);
+    expect(getEnrichment(ctx).appliedFilters).toMatchObject({ countries: echoed });
+  });
+
+  it('echoes split countries on both surfaces through the tool contract', async () => {
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const result = await runToolContract(
+      worldbankGetData,
+      { indicator_id: 'NY.GDP.PCAP.CD', countries: 'US,JP,KR', mrv: 1 },
+      { context: { errors: worldbankGetData.errors } },
+    );
+    expect(result.isError).toBeFalsy();
+    const parsed = worldbankGetData.output
+      .extend({ appliedFilters: z.object({ countries: z.string() }).passthrough() })
+      .parse(result.structuredContent);
+    expect(parsed.appliedFilters.countries).toBe('US;JP;KR');
+    const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+    expect(text).toContain('countries=US;JP;KR');
+    expect(text).not.toContain('US,JP,KR');
+  });
+
+  it.each([['all,US'], ['US;all'], [' ALL , us '], [['all', 'US']], [['US', 'all,JP']]])(
+    'rejects "all" mixed with other codes: %j',
+    async (countries) => {
+      const { worldbankGetData } = await import(
+        '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+      );
+      expect(() =>
+        worldbankGetData.input.parse({ indicator_id: 'NY.GDP.PCAP.CD', countries }),
+      ).toThrow('cannot be combined with other country codes');
+    },
+  );
+
+  it('rejects "all" mixed with a code through the tool contract before any upstream call', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    const getDataMock = vi.fn().mockResolvedValue(mockDataResult);
+    vi.mocked(getWorldBankApiService).mockReturnValue({ getData: getDataMock } as never);
+
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const result = await runToolContract(
+      worldbankGetData,
+      { indicator_id: 'NY.GDP.PCAP.CD', countries: 'all,US' },
+      { context: { errors: worldbankGetData.errors } },
+    );
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({ error: { code: expect.any(Number) } });
+    const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+    expect(text).toContain('cannot be combined with other country codes');
+    expect(text).not.toMatch(/"US" .*not valid|Country code\(s\)/);
+    expect(getDataMock).not.toHaveBeenCalled();
   });
 
   it.each([

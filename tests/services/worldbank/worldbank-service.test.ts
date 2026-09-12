@@ -5,6 +5,7 @@
  * @module tests/services/worldbank/worldbank-service.test
  */
 
+import { JsonRpcErrorCode, type McpError } from '@cyanheads/mcp-ts-core/errors';
 import { createInMemoryStorage, createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -1235,6 +1236,218 @@ describe('WorldBankApiService', () => {
     ).rejects.toMatchObject({ data: { reason: 'indicator_and_country_not_found' } });
     // Two bad segments are self-evident — no disambiguating lookup is spent.
     expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('getData: spends exactly one catalog lookup to place a single id-120 rejection', async () => {
+    mockResponse(WB_ERROR_BODY);
+    mockResponse([pagingObj(), [rawIndicator('SP.POP.TOTL', 'Population, total')]]);
+    const ctx = createMockContext();
+    await expect(
+      service.getData({ indicatorId: 'SP.POP.TOTL', countries: 'ZZ', page: 1, perPage: 50 }, ctx),
+    ).rejects.toMatchObject({
+      message: expect.stringContaining('"ZZ"'),
+      data: { reason: 'country_not_found', countryCodes: 'ZZ' },
+    });
+    expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(2);
+    expect(fetchWithTimeoutMock.mock.calls[1][0] as string).toMatch(
+      /^https:\/\/api\.worldbank\.org\/v2\/indicator\/SP\.POP\.TOTL\?/,
+    );
+  });
+
+  it('getData: never consults the catalog on a successful data response', async () => {
+    mockResponse([pagingObj({ total: 1 }), [rawDataPoint('US', 'USA', 'United States', '2022')]]);
+    mockAggregateLookup();
+    const ctx = createMockContext();
+    await service.getData(
+      { indicatorId: 'SP.POP.TOTL', countries: 'US', page: 1, perPage: 50 },
+      ctx,
+    );
+    const urls = fetchWithTimeoutMock.mock.calls.map((c) => c[0] as string);
+    expect(urls).toHaveLength(2);
+    expect(urls.some((url) => url.startsWith('https://api.worldbank.org/v2/indicator/'))).toBe(
+      false,
+    );
+  });
+
+  /**
+   * A bad country code is validated before the indicator's servability: live,
+   * `/country/ZZZ/indicator/SM.POP.REFG.OR` answers the generic id-120 message,
+   * not the id-175 one, so a catalog record under an archived source says
+   * nothing about which segment was rejected.
+   */
+  it.each([
+    [
+      'catalogued only under an archived source',
+      [rawIndicatorFrom('SM.POP.REFG.OR', 'Refugee population', '57', 'WDI Database Archives')],
+    ],
+    [
+      'catalogued under both a live and an archived source',
+      [
+        rawIndicatorFrom('CoCA_fexp', 'Affordability', '93', 'FPN Datahub Archive'),
+        rawIndicatorFrom('CoCA_fexp', 'Affordability', '88', 'Food Prices for Nutrition'),
+      ],
+    ],
+  ])(
+    'getData: blames the country code on an id-120 rejection of an indicator %s',
+    async (_label, rows) => {
+      mockResponse(WB_ERROR_BODY);
+      mockResponse([pagingObj({ total: rows.length }), rows]);
+      const ctx = createMockContext();
+      await expect(
+        service.getData(
+          { indicatorId: rows[0]?.id ?? '', countries: 'ZZZ', page: 1, perPage: 50 },
+          ctx,
+        ),
+      ).rejects.toMatchObject({ data: { reason: 'country_not_found', countryCodes: 'ZZZ' } });
+    },
+  );
+
+  it('getData: surfaces a failed catalog lookup on an id-120 rejection as unavailable', async () => {
+    mockResponse(WB_ERROR_BODY);
+    fetchWithTimeoutMock.mockResolvedValueOnce({
+      text: async () => '<!DOCTYPE html><html><body>503 Service Unavailable</body></html>',
+    });
+    const ctx = createMockContext();
+    const err = await service
+      .getData({ indicatorId: 'SP.POP.TOTL', countries: 'ZZ', page: 1, perPage: 50 }, ctx)
+      .catch((e: unknown) => e);
+    // Without the lookup the one-message envelope cannot be placed, so no reason is guessed.
+    expect(err).toMatchObject({ code: JsonRpcErrorCode.ServiceUnavailable });
+    expect((err as McpError).data?.reason).toBeUndefined();
+  });
+
+  // ─── getData: indicators the data endpoint does not serve ─────────────────
+
+  /**
+   * The data endpoint answers id 175 ("The indicator was not found. It may have
+   * been deleted or archived.") for an indicator the catalog still lists but the
+   * endpoint will not serve for any country or date — every WDI Database
+   * Archives ID, and several non-archive sources (PEFA, ICP, Food Prices for
+   * Nutrition). The country codes are never the cause.
+   */
+  const WB_NOT_SERVED_BODY = [
+    {
+      message: [
+        {
+          id: '175',
+          key: 'Invalid format',
+          value: 'The indicator was not found. It may have been deleted or archived.',
+        },
+      ],
+    },
+  ];
+
+  it('getData: reports indicator_not_queryable on id 175, naming the catalog source', async () => {
+    mockResponse(WB_NOT_SERVED_BODY);
+    mockResponse([
+      pagingObj(),
+      [
+        rawIndicatorFrom(
+          'SM.POP.REFG.OR',
+          'Refugee population by country or territory of origin',
+          '57',
+          'WDI Database Archives',
+        ),
+      ],
+    ]);
+    const ctx = createMockContext();
+    const err = await service
+      .getData(
+        { indicatorId: 'SM.POP.REFG.OR', countries: 'SDN', mrv: 3, page: 1, perPage: 50 },
+        ctx,
+      )
+      .catch((e: unknown) => e);
+
+    expect(err).toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: {
+        reason: 'indicator_not_queryable',
+        indicatorId: 'SM.POP.REFG.OR',
+        sourceNames: ['WDI Database Archives'],
+      },
+    });
+    const { message } = err as McpError;
+    expect(message).toContain('SM.POP.REFG.OR');
+    expect(message).toContain('WDI Database Archives');
+    expect(message).toContain('Refugee population by country or territory of origin');
+    expect(message).toContain('worldbank_search_indicators');
+    expect(message).not.toContain('SDN');
+    expect(message).not.toContain('worldbank_list_countries');
+    expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('getData: reports indicator_not_queryable on id 175 for an ID under a live and an archived source', async () => {
+    mockResponse(WB_NOT_SERVED_BODY);
+    mockResponse([
+      pagingObj({ total: 2 }),
+      [
+        rawIndicatorFrom('CoCA_fexp', 'Affordability', '93', 'FPN Datahub Archive'),
+        rawIndicatorFrom('CoCA_fexp', 'Affordability', '88', 'Food Prices for Nutrition'),
+      ],
+    ]);
+    const ctx = createMockContext();
+    const err = await service
+      .getData({ indicatorId: 'CoCA_fexp', countries: ['US', 'JP'], page: 1, perPage: 50 }, ctx)
+      .catch((e: unknown) => e);
+
+    expect(err).toMatchObject({
+      data: {
+        reason: 'indicator_not_queryable',
+        sourceNames: ['FPN Datahub Archive', 'Food Prices for Nutrition'],
+      },
+    });
+    expect((err as McpError).message).not.toMatch(/US;JP|"US"|"JP"/);
+  });
+
+  it('getData: still reports indicator_not_queryable on id 175 when the catalog lookup fails', async () => {
+    mockResponse(WB_NOT_SERVED_BODY);
+    fetchWithTimeoutMock.mockResolvedValueOnce({
+      text: async () => '<!DOCTYPE html><html><body>503 Service Unavailable</body></html>',
+    });
+    const ctx = createMockContext();
+    const err = await service
+      .getData({ indicatorId: 'SM.POP.REFG.OR', countries: 'SDN', page: 1, perPage: 50 }, ctx)
+      .catch((e: unknown) => e);
+
+    expect(err).toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: { reason: 'indicator_not_queryable', indicatorId: 'SM.POP.REFG.OR' },
+    });
+    expect((err as McpError).data?.sourceNames).toBeUndefined();
+    expect((err as McpError).message).not.toContain('SDN');
+    expect((err as McpError).message).toContain('worldbank_search_indicators');
+  });
+
+  it('getData: reports indicator_not_queryable on id 175 when the catalog no longer lists the ID', async () => {
+    mockResponse(WB_NOT_SERVED_BODY);
+    mockResponse(WB_ERROR_BODY);
+    const ctx = createMockContext();
+    const err = await service
+      .getData({ indicatorId: 'GONE.IND', countries: 'US', page: 1, perPage: 50 }, ctx)
+      .catch((e: unknown) => e);
+
+    expect(err).toMatchObject({
+      data: { reason: 'indicator_not_queryable', indicatorId: 'GONE.IND' },
+    });
+    expect((err as McpError).data?.sourceNames).toBeUndefined();
+    expect((err as McpError).message).not.toContain('"US"');
+  });
+
+  it('getData: lets a cancellation during the id-175 catalog lookup propagate', async () => {
+    const controller = new AbortController();
+    mockResponse(WB_NOT_SERVED_BODY);
+    const abort = new Error('The operation was aborted');
+    fetchWithTimeoutMock.mockImplementationOnce(async () => {
+      controller.abort();
+      throw abort;
+    });
+    const ctx = createMockContext({ signal: controller.signal });
+    await expect(
+      service.getData(
+        { indicatorId: 'SM.POP.REFG.OR', countries: 'SDN', page: 1, perPage: 50 },
+        ctx,
+      ),
+    ).rejects.toBe(abort);
   });
 
   // ─── getData: requested date window ───────────────────────────────────────

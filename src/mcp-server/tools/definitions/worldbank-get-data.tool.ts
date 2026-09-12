@@ -9,6 +9,27 @@ import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { getServerConfig } from '@/config/server-config.js';
 import { getWorldBankApiService } from '@/services/worldbank/worldbank-service.js';
 
+/** Split a caller-supplied country string on either separator this server's tools use. */
+function splitCodes(value: string): string[] {
+  return value
+    .split(/[;,]/)
+    .map((code) => code.trim())
+    .filter((code) => code.length > 0);
+}
+
+/**
+ * `"all"` is a keyword for the whole set, not a code. Inside a list upstream
+ * rejects it with the same envelope as an invalid code, which would surface as
+ * `country_not_found` blaming codes that are valid.
+ */
+function mixesAll(codes: string[]): boolean {
+  return codes.length > 1 && codes.some((code) => code.toLowerCase() === 'all');
+}
+
+const EMPTY_COUNTRIES_MESSAGE = 'Provide at least one country code, or "all" for every entry.';
+const MIXED_ALL_MESSAGE =
+  '"all" cannot be combined with other country codes — pass "all" alone, or list the codes.';
+
 export const worldbankGetData = tool('worldbank_get_data', {
   title: 'Get World Bank Indicator Data',
   description:
@@ -29,21 +50,25 @@ export const worldbankGetData = tool('worldbank_get_data', {
       .union([
         z
           .string()
-          .regex(/[^\s;]/, 'Provide at least one country code, or "all" for every entry.')
-          .describe('A single country code or "all".'),
+          .regex(/[^\s;,]/, EMPTY_COUNTRIES_MESSAGE)
+          .refine((value) => !mixesAll(splitCodes(value)), MIXED_ALL_MESSAGE)
+          .describe('A single country code, a comma- or semicolon-separated list, or "all".'),
         z
           .array(z.string().describe('A country code.'))
           .min(1)
-          .refine(
-            (codes) => codes.some((code) => code.trim().length > 0),
-            'Provide at least one country code, or "all" for every entry.',
-          )
+          /**
+           * Checked against what the split actually yields, not against raw
+           * element length: the API reads an empty country segment as every
+           * entry, so an array holding nothing but separators must not reach it.
+           */
+          .refine((codes) => codes.flatMap(splitCodes).length > 0, EMPTY_COUNTRIES_MESSAGE)
+          .refine((codes) => !mixesAll(codes.flatMap(splitCodes)), MIXED_ALL_MESSAGE)
           .describe('An array of country codes.'),
       ])
       .describe(
         'Country codes. Accepts: ISO2 (US, CN), ISO3 (USA, CHN), regional aggregate codes (EAS, LCN, MEA, SAS, SSF, ECS, NAC), ' +
-          'income group codes (HIC, UMC, LMC, LIC), world code (WLD), or "all" for every entry (use pagination). ' +
-          'Pass a single string or an array of codes for multi-country queries. ' +
+          'income group codes (HIC, UMC, LMC, LIC), world code (WLD), or "all" on its own for every entry (use pagination). ' +
+          'Pass a single code, an array, or one string separated by commas or semicolons. ' +
           'At least one code is required — an empty value is rejected rather than treated as "all".',
       ),
     date_range: z
@@ -147,7 +172,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
         countries: z
           .string()
           .describe(
-            'Country codes as sent to the API — an array input is joined with semicolons, so this shows the normalized value.',
+            'Country codes as sent to the API — array elements and comma- or semicolon-separated strings are split and rejoined with semicolons, so this shows the normalized value.',
           ),
         dateRange: z
           .string()
@@ -208,6 +233,13 @@ export const worldbankGetData = tool('worldbank_get_data', {
       recovery: 'Use worldbank_search_indicators to find valid indicator IDs by keyword or topic.',
     },
     {
+      reason: 'indicator_not_queryable',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'The indicator is listed in the catalog, or was, but the data endpoint does not serve it for any country or date — archived and retired datasets.',
+      recovery:
+        'Changing the countries or dates will not help. Use worldbank_search_indicators to find a current indicator for the same measure.',
+    },
+    {
       reason: 'country_not_found',
       code: JsonRpcErrorCode.NotFound,
       when: 'One or more country codes are invalid.',
@@ -231,9 +263,10 @@ export const worldbankGetData = tool('worldbank_get_data', {
 
     const dateRange = input.date_range?.trim() ? input.date_range.trim() : undefined;
     const perPage = input.per_page ?? getServerConfig().defaultPerPage;
-    const countryCodes = Array.isArray(input.countries)
-      ? input.countries.join(';')
-      : input.countries;
+    const codes = Array.isArray(input.countries)
+      ? input.countries.flatMap(splitCodes)
+      : splitCodes(input.countries);
+    const countryCodes = codes.join(';');
 
     ctx.log.info('Fetching indicator data', {
       indicatorId: input.indicator_id,
@@ -248,7 +281,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
       result = await getWorldBankApiService().getData(
         {
           indicatorId: input.indicator_id,
-          countries: input.countries,
+          countries: codes,
           ...(dateRange !== undefined && { dateRange }),
           ...(input.mrv !== undefined && { mrv: input.mrv }),
           page: input.page,
@@ -265,17 +298,24 @@ export const worldbankGetData = tool('worldbank_get_data', {
             indicatorId: input.indicator_id,
           });
         }
+        if (reason === 'indicator_not_queryable') {
+          throw ctx.fail('indicator_not_queryable', err.message, {
+            ...ctx.recoveryFor('indicator_not_queryable'),
+            indicatorId: input.indicator_id,
+            ...(err.data?.sourceNames !== undefined && { sourceNames: err.data.sourceNames }),
+          });
+        }
         if (reason === 'country_not_found') {
           throw ctx.fail('country_not_found', err.message, {
             ...ctx.recoveryFor('country_not_found'),
-            countries: input.countries,
+            countries: countryCodes,
           });
         }
         if (reason === 'indicator_and_country_not_found') {
           throw ctx.fail('indicator_and_country_not_found', err.message, {
             ...ctx.recoveryFor('indicator_and_country_not_found'),
             indicatorId: input.indicator_id,
-            countries: input.countries,
+            countries: countryCodes,
           });
         }
       }
