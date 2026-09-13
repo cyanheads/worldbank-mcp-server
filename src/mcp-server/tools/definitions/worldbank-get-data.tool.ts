@@ -13,7 +13,8 @@ import {
   INDICATOR_ID_MESSAGE,
   isAllSelector,
 } from '@/services/worldbank/identifiers.js';
-import { getWorldBankApiService } from '@/services/worldbank/worldbank-service.js';
+import type { SourceScopedDisclosure } from '@/services/worldbank/types.js';
+import { type DataResult, getWorldBankApiService } from '@/services/worldbank/worldbank-service.js';
 
 /** Split a caller-supplied country string on either separator this server's tools use. */
 function splitCodes(value: string): string[] {
@@ -32,6 +33,24 @@ function mixesAll(codes: string[]): boolean {
   return codes.length > 1 && codes.some((code) => code.toLowerCase() === 'all');
 }
 
+/** What each way of choosing a dimension value means, for the rendered disclosure. */
+const SELECTION_MEANING = {
+  requested: 'as requested by dimension_value',
+  only_value: 'the only value the dataset lists',
+  world_total: 'the World total across all counterpart areas',
+  newest_with_data: 'the newest release holding a value for the requested countries and periods',
+  newest: 'the newest release; no release holds a value for the requested countries and periods',
+  every_value: 'no single value — each row shows its own',
+} as const;
+
+/** Render the dimension line of a source-scoped disclosure. */
+function renderDimension(dimension: SourceScopedDisclosure['dimension']): string {
+  if (!dimension) return '**Dimension:** none beyond country, series, and time';
+  const applied =
+    dimension.id === null ? 'every value' : `${dimension.label ?? ''} (\`${dimension.id}\`)`;
+  return `**${dimension.concept}:** ${applied} — selection: ${dimension.selection} (${SELECTION_MEANING[dimension.selection]})`;
+}
+
 /**
  * An empty value is a missing required input, so the schema rejects it. A mixed
  * `"all"` and a reversed `date_range` are well-shaped mistakes a caller corrects
@@ -42,7 +61,7 @@ const EMPTY_COUNTRIES_MESSAGE = 'Provide at least one country code, or "all" for
 export const worldbankGetData = tool('worldbank_get_data', {
   title: 'Get World Bank Indicator Data',
   description:
-    'Query World Bank indicator values for one or more countries across a time range — the primary data-access tool; find indicator_id values with worldbank_search_indicators. Observations carry a null value where data is not available for a country×year cell, which is common for sparse series. Set either date_range (historical analysis) or mrv (most recent N values), not both. For "all" countries, page through the results (per_page up to 1000), since the API returns several hundred entries per indicator.',
+    'Query World Bank indicator values for one or more countries across a time range — the primary data-access tool; find indicator_id values with worldbank_search_indicators. Observations carry a null value where data is not available for a country×year cell, which is common for sparse series. Set either date_range (historical analysis) or mrv (most recent N values), not both. For "all" countries, page through the results (per_page up to 1000), since the API returns several hundred entries per indicator. Indicators the standard data endpoint does not serve — WDI Database Archives, PEFA, ICP, GDLD, International Debt Statistics: DSSI, Food Prices for Nutrition — are answered from their own dataset instead; the response then carries sourceScoped, naming that dataset and the release, classification, sector, or counterpart area applied (see dimension_value), because those values can be archived or superseded figures rather than current ones.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     indicator_id: z
@@ -94,7 +113,13 @@ export const worldbankGetData = tool('worldbank_get_data', {
       .max(100)
       .optional()
       .describe(
-        'Return the N most recent available values per country (1–100), clamped upstream to the length of the series. Rows are mrv × countries, so page through them with per_page. Mutually exclusive with date_range.',
+        'Return the N most recent periods (1–100) holding a value for any requested country, clamped to the length of the series. Every requested country comes back at those periods, null where it has no value there rather than with its own older values. Rows are mrv × countries, so page through them with per_page. Mutually exclusive with date_range.',
+      ),
+    dimension_value: z
+      .string()
+      .optional()
+      .describe(
+        'For indicators answered from their own dataset (the response carries sourceScoped), the id of the value of that dataset\'s extra dimension to query, matched case-insensitively: a WDI Database Archives release ("202503"), an ICP or Food Prices for Nutrition classification ("PPPGlob", "FPN 5.0"), a GDLD sector ("WHT"), or an International Debt Statistics counterpart area ("265"). Omit it for the default, which sourceScoped.dimension reports: the only value when the dataset has one, "WLD" (World) for counterpart areas, the newest WDI Database Archives release holding data for the requested countries and periods (the newest release when none does), or otherwise every value with each row labelled. A value the dataset does not list is rejected with the valid ids, and a value for an indicator the standard data endpoint serves is rejected too.',
       ),
     page: z.number().int().min(1).default(1).describe('Pagination page number (1-based).'),
     per_page: z
@@ -115,7 +140,11 @@ export const worldbankGetData = tool('worldbank_get_data', {
             countryCode: z.string().describe('ISO2 country code (or aggregate code).'),
             countryIso3: z.string().describe('ISO3 country code (empty for some aggregates).'),
             countryName: z.string().describe('Country or aggregate name.'),
-            date: z.string().describe('Year of observation (YYYY format).'),
+            date: z
+              .string()
+              .describe(
+                'Period of observation: a year (2020), quarter (2020Q1), or month (2020M03).',
+              ),
             value: z
               .number()
               .nullable()
@@ -132,10 +161,57 @@ export const worldbankGetData = tool('worldbank_get_data', {
               .describe(
                 'True when this row is a regional or income-group aggregate rather than an individual country.',
               ),
+            dimension: z
+              .object({
+                id: z.string().describe('Dimension value id, e.g. "202503".'),
+                label: z.string().describe('Dimension value label, e.g. "2025 Mar".'),
+              })
+              .optional()
+              .describe(
+                "The value of the dataset's extra dimension (sourceScoped.dimension.concept) this row belongs to. Present on source-scoped rows from a dataset that has one.",
+              ),
           })
-          .describe('A single country×year observation.'),
+          .describe('A single country×period observation.'),
       )
       .describe('Indicator observations for this page. Null values are common for sparse series.'),
+    sourceScoped: z
+      .object({
+        sourceId: z.string().describe('ID of the World Bank data source that served the values.'),
+        sourceName: z.string().describe('Name of that data source, e.g. "WDI Database Archives".'),
+        dimension: z
+          .object({
+            concept: z
+              .string()
+              .describe(
+                'The extra dimension: Version, Classification, Sector, or Counterpart-Area.',
+              ),
+            selection: z
+              .enum([
+                'requested',
+                'only_value',
+                'world_total',
+                'newest_with_data',
+                'newest',
+                'every_value',
+              ])
+              .describe(
+                'How the value was chosen: requested (dimension_value), only_value (the only one the dataset lists), world_total (WLD, all counterpart areas), newest_with_data (newest release holding a value for the requested countries and periods), newest (newest release; none holds a value in that scope), or every_value (no single value; each row carries its own).',
+              ),
+            id: z.string().nullable().describe('Applied value id; null for every_value.'),
+            label: z.string().nullable().describe('Applied value label; null for every_value.'),
+          })
+          .nullable()
+          .describe('The dimension value applied; null when the dataset has no extra dimension.'),
+        note: z
+          .string()
+          .describe(
+            'States that the values came from the source-scoped data API rather than the standard World Bank data endpoint, and may be archived or superseded figures.',
+          ),
+      })
+      .optional()
+      .describe(
+        'Present only when the standard data endpoint does not serve the indicator and its catalog source served the values instead. Absent for indicators the standard endpoint serves.',
+      ),
     indicator: z
       .object({
         id: z.string().describe('Indicator ID echoed for chaining context.'),
@@ -168,6 +244,10 @@ export const worldbankGetData = tool('worldbank_get_data', {
           .number()
           .optional()
           .describe('Most-recent-values count applied, omitted when none was requested.'),
+        dimensionValue: z
+          .string()
+          .optional()
+          .describe('dimension_value as requested, omitted when none was given.'),
         page: z.number().describe('Page number requested.'),
         perPage: z.number().describe('Results per page used, including the server default.'),
       })
@@ -183,7 +263,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
       .string()
       .optional()
       .describe(
-        'Recovery hint for an empty result set — how to broaden the query when nothing matched, or the page range that exists when the requested page is past the end.',
+        'Recovery hint for an empty result set — how to broaden the query when nothing matched, or the page range that exists when the requested page is past the end — and, for source-scoped data, the requested country codes the serving dataset publishes nothing for.',
       ),
   },
 
@@ -201,6 +281,9 @@ export const worldbankGetData = tool('worldbank_get_data', {
           `countries=${filters.countries}`,
           ...(filters.dateRange === undefined ? [] : [`date_range=${filters.dateRange}`]),
           ...(filters.mrv === undefined ? [] : [`mrv=${filters.mrv}`]),
+          ...(filters.dimensionValue === undefined
+            ? []
+            : [`dimension_value=${filters.dimensionValue}`]),
           `page=${filters.page}`,
           `per_page=${filters.perPage}`,
         ].join(', ')}`,
@@ -244,9 +327,29 @@ export const worldbankGetData = tool('worldbank_get_data', {
     {
       reason: 'indicator_not_queryable',
       code: JsonRpcErrorCode.NotFound,
-      when: 'The indicator is listed in the catalog, or was, but the data endpoint does not serve it for any country or date — archived and retired datasets.',
+      when: 'The standard data endpoint does not serve the indicator, and no catalog source can serve it through the source-scoped data API instead — the catalog no longer lists the ID, the catalog lookup failed, or the source is not organized by country, series, and time plus at most one further dimension.',
       recovery:
-        'Changing the countries or dates will not help. Use worldbank_search_indicators to find a current indicator for the same measure.',
+        'Changing the countries, dates, or dimension_value will not help. Use worldbank_search_indicators to find another indicator for the same measure.',
+    },
+    {
+      reason: 'unknown_dimension_value',
+      code: JsonRpcErrorCode.ValidationError,
+      when: "dimension_value is not a value the indicator's dataset lists for its extra dimension.",
+      recovery:
+        'Pass one of the dimension ids the error message lists for this indicator, or omit dimension_value to use the default the response reports.',
+    },
+    {
+      reason: 'dimension_not_applicable',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'dimension_value is given for an indicator the standard data endpoint serves, or whose dataset has no dimension beyond country, series, and time.',
+      recovery: 'Remove dimension_value; this indicator has no extra dimension to select.',
+    },
+    {
+      reason: 'source_scope_too_large',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A source-scoped query would read more rows (countries × periods × unpinned dimension values) than one request allows.',
+      recovery:
+        'Narrow countries or date_range, or pin dimension_value; a narrower call reports the default value it applied in sourceScoped.dimension, which can then be pinned.',
     },
     {
       reason: 'country_not_found',
@@ -284,6 +387,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
     }
 
     const dateRange = input.date_range?.trim() ? input.date_range.trim() : undefined;
+    const dimensionValue = input.dimension_value?.trim() ? input.dimension_value.trim() : undefined;
     const perPage = input.per_page ?? getServerConfig().defaultPerPage;
     const codes = Array.isArray(input.countries)
       ? input.countries.flatMap(splitCodes)
@@ -319,10 +423,11 @@ export const worldbankGetData = tool('worldbank_get_data', {
       countries: countryCodes,
       dateRange,
       mrv: input.mrv,
+      dimensionValue,
       page: input.page,
     });
 
-    let result: Awaited<ReturnType<ReturnType<typeof getWorldBankApiService>['getData']>>;
+    let result: DataResult;
     try {
       result = await getWorldBankApiService().getData(
         {
@@ -330,6 +435,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
           countries: codes,
           ...(dateRange !== undefined && { dateRange }),
           ...(input.mrv !== undefined && { mrv: input.mrv }),
+          ...(dimensionValue !== undefined && { dimensionValue }),
           page: input.page,
           perPage,
         },
@@ -364,6 +470,29 @@ export const worldbankGetData = tool('worldbank_get_data', {
             countries: countryCodes,
           });
         }
+        if (reason === 'unknown_dimension_value') {
+          throw ctx.fail('unknown_dimension_value', err.message, {
+            ...ctx.recoveryFor('unknown_dimension_value'),
+            indicatorId: input.indicator_id,
+            dimensionValue,
+            validValues: err.data?.validValues,
+          });
+        }
+        if (reason === 'dimension_not_applicable') {
+          throw ctx.fail('dimension_not_applicable', err.message, {
+            ...ctx.recoveryFor('dimension_not_applicable'),
+            indicatorId: input.indicator_id,
+            dimensionValue,
+          });
+        }
+        if (reason === 'source_scope_too_large') {
+          throw ctx.fail('source_scope_too_large', err.message, {
+            ...ctx.recoveryFor('source_scope_too_large'),
+            indicatorId: input.indicator_id,
+            sourceId: err.data?.sourceId,
+            estimatedRows: err.data?.estimatedRows,
+          });
+        }
       }
       throw err;
     }
@@ -374,14 +503,16 @@ export const worldbankGetData = tool('worldbank_get_data', {
         countries: countryCodes,
         ...(dateRange !== undefined && { dateRange }),
         ...(input.mrv !== undefined && { mrv: input.mrv }),
+        ...(dimensionValue !== undefined && { dimensionValue }),
         page: input.page,
         perPage,
       },
     });
     ctx.enrich({ totalCount: result.total, currentPage: result.page, totalPages: result.pages });
 
+    const notices: string[] = [];
     if (result.total === 0) {
-      ctx.enrich.notice(
+      notices.push(
         result.dateFilterDropped
           ? `No observations fall inside date_range "${dateRange}", though the series does carry data outside it. ` +
               'Broaden date_range or use mrv to fetch the most recent available values.'
@@ -389,7 +520,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
               'Try broadening the date range, removing date filters, or using mrv=5 to fetch the most recent available values.',
       );
     } else if (result.data.length === 0) {
-      ctx.enrich.notice(
+      notices.push(
         pagePastEndNotice({
           noun: ['observation', 'observations'],
           page: result.page,
@@ -399,11 +530,21 @@ export const worldbankGetData = tool('worldbank_get_data', {
         }),
       );
     }
+    const uncovered = result.uncoveredCountries ?? [];
+    if (result.sourceScoped && uncovered.length > 0) {
+      const { sourceName, sourceId } = result.sourceScoped;
+      notices.push(
+        `${sourceName} (source ${sourceId}) publishes no data for ${uncovered.join(', ')}, so ` +
+          `${uncovered.length === 1 ? 'that code was' : 'those codes were'} left out of the query.`,
+      );
+    }
+    if (notices.length > 0) ctx.enrich.notice(notices.join(' '));
 
     return {
       data: result.data,
       indicator: result.indicator,
       nullCount: result.nullCount,
+      ...(result.sourceScoped && { sourceScoped: result.sourceScoped }),
     };
   },
 
@@ -412,6 +553,15 @@ export const worldbankGetData = tool('worldbank_get_data', {
       `# ${result.indicator.name || result.indicator.id}`,
       `**ID:** \`${result.indicator.id}\` | **Null values this page:** ${result.nullCount}\n`,
     ];
+
+    const scoped = result.sourceScoped;
+    if (scoped) {
+      lines.push(
+        `> **Source-scoped data:** ${scoped.sourceName} (source ${scoped.sourceId}). ${scoped.note}`,
+        `> ${renderDimension(scoped.dimension)}\n`,
+      );
+    }
+    const pinnedId = scoped?.dimension?.id;
 
     // Group by country for readability
     const byCountry = new Map<string, typeof result.data>();
@@ -434,7 +584,11 @@ export const worldbankGetData = tool('worldbank_get_data', {
       for (const row of rows) {
         const valStr = row.value !== null ? String(row.value) : 'No data';
         const statusStr = row.obsStatus ? ` [obs_status: ${row.obsStatus}]` : '';
-        lines.push(`- **${row.date}:** ${valStr}${statusStr}`);
+        const dimensionStr =
+          row.dimension && row.dimension.id !== pinnedId
+            ? ` [${row.dimension.id}: ${row.dimension.label}]`
+            : '';
+        lines.push(`- **${row.date}:** ${valStr}${dimensionStr}${statusStr}`);
       }
     }
 

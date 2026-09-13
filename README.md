@@ -116,9 +116,11 @@ Query indicator values for countries across time. The primary data-access tool.
 - Returns observations with `null` values when data is not available for a country×year cell — common for sparse series
 - Includes `nullCount` per page to surface data sparsity
 - Output grouped by country for readability; `isAggregate` flag distinguishes all 78 regional, income-group, and lending-group aggregates from individual countries
-- Echoes the parameters it sent upstream — indicator, normalized country codes, date range or `mrv`, page and page size
+- Echoes the parameters it sent upstream — indicator, normalized country codes, date range or `mrv`, `dimension_value`, page and page size
 - Paginated with up to 1000 entries per page
-- An indicator the catalog lists but the data endpoint doesn't serve (archived and retired datasets) is reported as such, not blamed on the country codes
+- Indicators the standard data endpoint doesn't serve — WDI Database Archives, PEFA, ICP, GDLD, International Debt Statistics: DSSI, Food Prices for Nutrition — are answered from their catalog source's own dataset through the source-scoped data API. The response then carries `sourceScoped`, naming the source and the value of its extra dimension that applied (a WDI release such as `2025 Mar`, a classification, a sector, or a counterpart area) and stating that the figures are not from the standard data endpoint and may be archived or superseded. Each row carries its own dimension value too
+- For those indicators, `dimension_value` picks the release, classification, sector, or counterpart area by id; an id the dataset doesn't list is rejected with the valid ones. Without it, the default is the only value a dataset lists, `WLD` (World) for counterpart areas, or the newest WDI Database Archives release holding a value for the requested countries and periods, because a series the archive retired carries only nulls in later releases. Multi-valued classifications and sectors come back with every value, each row labelled. `date_range` and `mrv` work the same as on the standard endpoint, and a request too large to read in one go (for example every country across all years of every archive release) is rejected with a hint to narrow it or pin `dimension_value`
+- An indicator that neither endpoint can serve is reported as such, not blamed on the country codes
 - `indicator_id` takes one catalog ID under the same rules as `worldbank_get_indicator`
 
 ---
@@ -281,7 +283,7 @@ All configuration is validated at startup via Zod schemas in `src/config/server-
 | `WORLDBANK_PIP_BASE_URL` | Poverty and Inequality Platform API base URL override | `https://api.worldbank.org/pip/v1` |
 | `WORLDBANK_PROJECTS_BASE_URL` | Projects API base URL override | `https://search.worldbank.org/api/v3` |
 | `WORLDBANK_DEFAULT_PER_PAGE` | Default page size for list/search/data operations; `worldbank_search_projects` and `worldbank_get_poverty` still cap it at their per-page limits | `50` |
-| `WORLDBANK_CATALOG_CACHE_TTL_MS` | Lifetime of the in-process reference caches — the indicator catalog behind keyword-only search, the aggregate-code set behind `isAggregate`, and the PIP versions listing behind `ppp_version`; `0` disables all three | `3600000` |
+| `WORLDBANK_CATALOG_CACHE_TTL_MS` | Lifetime of the in-process reference caches — the indicator catalog behind keyword-only search, the country index behind `isAggregate` and source-scoped country codes, each source-scoped dataset's concept, country, period, and dimension listings, and the PIP versions listing behind `ppp_version`; `0` disables them all | `3600000` |
 
 ## Running the server
 

@@ -5,7 +5,9 @@
  * collapse of indicators the catalog publishes twice, aggregate-free country
  * listing, aggregate classification of data rows, and verification of the
  * requested date window are computed locally over exhaustively fetched
- * candidate sets, since the API offers none of them server-side.
+ * candidate sets, since the API offers none of them server-side. Indicators the
+ * standard data endpoint won't serve (message id 175) are answered from their
+ * catalog source's source-scoped data API instead.
  * @module services/worldbank/worldbank-service
  */
 
@@ -20,17 +22,35 @@ import {
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
+import { isWithinWindow, monthSpan, parseDateWindow, periodFromToken } from './periods.js';
+import {
+  defaultSelection,
+  keepMostRecentPeriods,
+  layoutFromConcepts,
+  newestVersionWithData,
+  readRow,
+  type ScopedRow,
+  type SourceLayout,
+  sortRows,
+  valuesFromListing,
+} from './source-scoped.js';
 import type {
   Country,
   DataPoint,
+  DimensionSelection,
+  DimensionValue,
   Indicator,
   IndicatorDetail,
   RawCountry,
   RawDataPoint,
   RawIndicator,
   RawSource,
+  RawSourceData,
+  RawSourceListing,
+  RawSourceObservation,
   RawTopic,
   Source,
+  SourceScopedDisclosure,
   Topic,
   WbEnvelope,
 } from './types.js';
@@ -81,6 +101,33 @@ const PATH_NOT_FOUND_ENVELOPE: WbErrorEnvelope = {
     { id: '404', key: 'Not Found', value: 'No World Bank API resource exists at this path' },
   ],
 };
+
+/**
+ * Most rows one source-scoped request may read: the requested countries × periods
+ * × unpinned dimension values, counted against the source's full listings. The
+ * largest pinned scope any source serves today, PEFA 2011 for every country and
+ * period, is 58,941 rows (~17 MB); an unpinned WDI Database Archives query for
+ * every country across all years would be 2.7 million.
+ */
+const SOURCE_SCOPE_ROW_LIMIT = 60_000;
+
+/**
+ * The source-scoped data API ignores `format=json` on failure and answers
+ * HTTP 200 with an XML body — `<wb:error><wb:message id="160" key="Data not
+ * found.">…</wb:message></wb:error>` — whichever path segment it rejected. Read
+ * into the JSON error envelope so one check covers both APIs.
+ */
+function parseXmlErrorEnvelope(text: string): WbErrorEnvelope | undefined {
+  if (!/<wb:error\b/.test(text)) return;
+  const message = [...text.matchAll(/<wb:message\b([^>]*)>([^<]*)<\/wb:message>/g)].map(
+    ([, attributes = '', value = '']) => ({
+      id: /\bid="([^"]*)"/.exec(attributes)?.[1] ?? '',
+      key: /\bkey="([^"]*)"/.exec(attributes)?.[1] ?? '',
+      value: value.trim(),
+    }),
+  );
+  return { message };
+}
 
 /** True for the error `fetchWithTimeout` throws when upstream answers HTTP 404. */
 function isUpstreamNotFound(error: unknown): boolean {
@@ -192,50 +239,6 @@ function normalizeDataPoint(raw: RawDataPoint, aggregateCodes: Set<string>): Dat
     // aggregateCodes holds both identifiers for every aggregate.
     isAggregate: aggregateCodes.has(raw.countryiso3code ?? '') || aggregateCodes.has(countryCode),
   };
-}
-
-// ─── Date-range verification ─────────────────────────────────────────────────
-
-/** An inclusive span of calendar months, each numbered `year * 12 + monthIndex`. */
-type MonthSpan = { start: number; end: number };
-
-/**
- * Expand one World Bank period token into the months it covers: `2020` is the
- * whole year, `2020Q2` is April–June, `2020M03` is March alone. Anything else
- * yields `undefined` — the tool's schema is the validator for the input's shape,
- * and an observation whose date can't be placed is kept rather than discarded.
- */
-function monthSpan(token: string): MonthSpan | undefined {
-  const match = /^(\d{4})(?:([QMqm])(\d{1,2}))?$/.exec(token.trim());
-  if (!match) return;
-  const firstMonth = Number(match[1]) * 12;
-  if (!match[2]) return { start: firstMonth, end: firstMonth + 11 };
-
-  const ordinal = Number(match[3]);
-  if (match[2].toUpperCase() === 'Q') {
-    if (ordinal < 1 || ordinal > 4) return;
-    return { start: firstMonth + (ordinal - 1) * 3, end: firstMonth + ordinal * 3 - 1 };
-  }
-  if (ordinal < 1 || ordinal > 12) return;
-  return { start: firstMonth + ordinal - 1, end: firstMonth + ordinal - 1 };
-}
-
-/** Parse the requested `date` filter into the span of months it asks for. */
-function parseDateWindow(dateRange: string | undefined): MonthSpan | undefined {
-  if (!dateRange) return;
-  const [startToken, endToken, ...rest] = dateRange.trim().split(':');
-  if (rest.length > 0 || startToken === undefined) return;
-  const start = monthSpan(startToken);
-  const end = endToken === undefined ? start : monthSpan(endToken);
-  if (!start || !end || start.start > end.end) return;
-  return { start: start.start, end: end.end };
-}
-
-/** True when an observation's own period overlaps the requested window. */
-function isWithinWindow(date: string, window: MonthSpan): boolean {
-  const span = monthSpan(date);
-  if (!span) return true;
-  return span.start <= window.end && span.end >= window.start;
 }
 
 function normalizeTopic(raw: RawTopic): Topic {
@@ -382,33 +385,81 @@ function matchIndicators(indicators: readonly Indicator[], query: string): Indic
 
 // ─── Service ─────────────────────────────────────────────────────────────────
 
+/** Every entity in the country listing, by either identifier, plus the aggregate codes. */
+type CountryIndex = {
+  aggregateCodes: Set<string>;
+  entities: Map<string, { id: string; iso2: string }>;
+};
+
+/** Options for {@link WorldBankApiService.getData}. */
+type GetDataOptions = {
+  indicatorId: string;
+  countries: string | string[];
+  dateRange?: string;
+  mrv?: number;
+  /** A value of the serving source's extra dimension; applies to source-scoped data only. */
+  dimensionValue?: string;
+  page: number;
+  perPage: number;
+};
+
+/** One page of observations from either data path. */
+export type DataResult = {
+  data: DataPoint[];
+  indicator: { id: string; name: string };
+  total: number;
+  page: number;
+  pages: number;
+  nullCount: number;
+  dateFilterDropped: boolean;
+  /** Present when the source-scoped data API served the result instead of the standard endpoint. */
+  sourceScoped?: SourceScopedDisclosure;
+  /** Valid codes the serving source publishes no data for, left out of the request. */
+  uncoveredCountries?: string[];
+};
+
 export class WorldBankApiService {
   private readonly baseUrl: string;
   private readonly catalogCacheTtlMs: number;
 
   /**
-   * Cached projection of the full indicator catalog, used by keyword-only
-   * search. Held on the instance rather than in module scope so tests (and
-   * multiple service instances) can't leak state into each other.
+   * TTL'd reference data — the indicator catalog, the country index, and each
+   * source's concepts and value listings — keyed by what was fetched. Held on the
+   * instance rather than in module scope so tests (and multiple service
+   * instances) can't leak state into each other.
    */
-  private catalogCache: { indicators: Indicator[]; expiresAt: number } | undefined;
+  private readonly referenceCache = new Map<string, { value: unknown; expiresAt: number }>();
 
-  /** In-flight catalog fetch, shared so concurrent searches trigger one request. */
-  private catalogInFlight: Promise<Indicator[]> | undefined;
-
-  /**
-   * Cached identifiers of every World Bank aggregate entity, used to classify
-   * data rows. Same instance-scoped, TTL'd shape as {@link catalogCache}.
-   */
-  private aggregateCodesCache: { codes: Set<string>; expiresAt: number } | undefined;
-
-  /** In-flight aggregate-code fetch, shared so concurrent queries trigger one request. */
-  private aggregateCodesInFlight: Promise<Set<string>> | undefined;
+  /** In-flight reference fetches, shared so concurrent callers trigger one request per key. */
+  private readonly referenceInFlight = new Map<string, Promise<unknown>>();
 
   constructor(_config: AppConfig, _storage: StorageService) {
     const serverConfig = getServerConfig();
     this.baseUrl = serverConfig.apiBaseUrl.replace(/\/$/, '');
     this.catalogCacheTtlMs = serverConfig.catalogCacheTtlMs;
+  }
+
+  /**
+   * Serve `key` from the reference cache, loading it once per TTL window. A TTL
+   * of 0 disables retention, though concurrent callers still share one load.
+   */
+  private cachedReference<T>(key: string, load: () => Promise<T>): Promise<T> {
+    const cached = this.referenceCache.get(key);
+    if (cached && cached.expiresAt > Date.now()) return Promise.resolve(cached.value as T);
+
+    let pending = this.referenceInFlight.get(key) as Promise<T> | undefined;
+    if (!pending) {
+      pending = load()
+        .then((value) => {
+          if (this.catalogCacheTtlMs > 0) {
+            this.referenceCache.set(key, { value, expiresAt: Date.now() + this.catalogCacheTtlMs });
+          }
+          return value;
+        })
+        .finally(() => this.referenceInFlight.delete(key));
+      this.referenceInFlight.set(key, pending);
+    }
+    return pending;
   }
 
   /** Build a fully-qualified URL with format=json always appended. */
@@ -442,7 +493,7 @@ export class WorldBankApiService {
       );
     }
 
-    return JSON.parse(text) as T;
+    return (parseXmlErrorEnvelope(text) ?? JSON.parse(text)) as T;
   }
 
   /**
@@ -565,27 +616,16 @@ export class WorldBankApiService {
    * Concurrent callers share one in-flight fetch instead of each pulling ~15 MB.
    */
   private loadIndicatorCatalog(ctx: Context): Promise<Indicator[]> {
-    const cached = this.catalogCache;
-    if (cached && cached.expiresAt > Date.now()) return Promise.resolve(cached.indicators);
-
-    this.catalogInFlight ??= this.fetchAllPages<RawIndicator>('/indicator', {}, ctx, () => {
-      throw serviceUnavailable(
-        'World Bank returned an error response for the indicator catalog listing.',
-      );
-    })
-      .then((raw) => {
-        const indicators = raw.map(normalizeIndicator);
-        if (this.catalogCacheTtlMs > 0) {
-          this.catalogCache = { indicators, expiresAt: Date.now() + this.catalogCacheTtlMs };
-        }
-        ctx.log.debug('Indicator catalog loaded', { count: indicators.length });
-        return indicators;
-      })
-      .finally(() => {
-        this.catalogInFlight = undefined;
+    return this.cachedReference('indicator-catalog', async () => {
+      const raw = await this.fetchAllPages<RawIndicator>('/indicator', {}, ctx, () => {
+        throw serviceUnavailable(
+          'World Bank returned an error response for the indicator catalog listing.',
+        );
       });
-
-    return this.catalogInFlight;
+      const indicators = raw.map(normalizeIndicator);
+      ctx.log.debug('Indicator catalog loaded', { count: indicators.length });
+      return indicators;
+    });
   }
 
   async searchIndicators(
@@ -713,41 +753,41 @@ export class WorldBankApiService {
   }
 
   /**
-   * Build the error for an indicator the data endpoint refuses to serve. The
-   * upstream rejection alone settles the classification; the catalog lookup only
-   * adds the indicator's name and source to the message, so a failed lookup
-   * still yields the same reason rather than an unrelated upstream error.
+   * The catalog rows behind an id-175 rejection, which name the source(s) whose
+   * source-scoped data API can serve the indicator instead. A failed lookup yields
+   * no rows rather than an unrelated upstream error: the rejection alone already
+   * settles that the standard endpoint won't serve the indicator.
    */
-  private async indicatorNotQueryable(
-    indicatorId: string,
-    detail: string,
-    ctx: Context,
-  ): Promise<McpError> {
-    let rows: Indicator[] = [];
+  private async catalogRowsForUnserved(indicatorId: string, ctx: Context): Promise<Indicator[]> {
     try {
-      rows = await this.lookupCatalogRows(indicatorId, ctx);
+      return await this.lookupCatalogRows(indicatorId, ctx);
     } catch (err) {
       if (ctx.signal.aborted) throw err;
-      ctx.log.warning(
-        'Catalog lookup failed; reporting the unserved indicator without its source',
-        {
-          indicatorId,
-          error: err instanceof Error ? err.message : String(err),
-        },
-      );
+      ctx.log.warning('Catalog lookup failed; no source to route the unserved indicator to', {
+        indicatorId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return [];
     }
+  }
 
-    const sourceNames = [...new Set(rows.map((row) => row.sourceName).filter(Boolean))];
+  /**
+   * The error for an indicator neither data path can serve: the standard endpoint
+   * rejected it with id 175, and no catalog source resolved to a source-scoped
+   * layout the tool can address.
+   */
+  private indicatorNotQueryable(indicatorId: string, rows: Indicator[], detail: string): McpError {
+    const sourceNames = [...new Set(rows.map((row) => row.sourceName.trim()).filter(Boolean))];
     const name = rows[0]?.name;
     const label = name ? `"${indicatorId}" (${name})` : `"${indicatorId}"`;
-    const catalogued =
+    const cause =
       sourceNames.length > 0
-        ? ` is catalogued under ${new Intl.ListFormat('en', { type: 'conjunction' }).format(sourceNames)}, but`
-        : '';
+        ? ` is catalogued under ${new Intl.ListFormat('en', { type: 'conjunction' }).format(sourceNames)}, but neither the World Bank data endpoint nor the source-scoped data API can serve it`
+        : ' is not served by the World Bank data endpoint for any country or date, and no catalog source could be resolved to query its source-scoped data API instead';
 
     return notFound(
-      `Indicator ${label}${catalogued} is not served by the World Bank data endpoint for any country or date. ` +
-        `Detail: ${detail.replace(/\.$/, '')}. Use worldbank_search_indicators to find a current indicator for the same measure.`,
+      `Indicator ${label}${cause}. Detail: ${detail.replace(/\.$/, '')}. ` +
+        'Use worldbank_search_indicators to find another indicator for the same measure.',
       {
         reason: 'indicator_not_queryable',
         indicatorId,
@@ -755,6 +795,276 @@ export class WorldBankApiService {
         ...(sourceNames.length > 0 && { sourceNames }),
       },
     );
+  }
+
+  // ─── Source-scoped data API ──────────────────────────────────────────────
+
+  /**
+   * Fetch every page of a `/sources/...` request and return the items `pick`
+   * selects from each. The id-160 envelope names no segment — callers validate the
+   * segments first — so it reads as no items.
+   */
+  private async fetchSourcePages<TBody, TItem>(
+    path: string,
+    ctx: Context,
+    pick: (body: TBody) => TItem[] | undefined,
+  ): Promise<TItem[]> {
+    const requestPage = (page: number) => {
+      const url = this.buildUrl(path, { page, per_page: BULK_PAGE_SIZE });
+      ctx.log.debug('Fetching source-scoped page', { url });
+      return this.fetchWithRetry<(TBody & { pages?: number | string }) | WbErrorEnvelope>(
+        url,
+        ctx,
+        BULK_TIMEOUT_MS,
+      );
+    };
+
+    const first = await requestPage(1);
+    if (isWbErrorEnvelope(first)) return [];
+    const pages = Number(first.pages ?? 1);
+    const rest = await Promise.all(Array.from({ length: pages - 1 }, (_, i) => requestPage(i + 2)));
+    return [first, ...rest].flatMap((body) => (isWbErrorEnvelope(body) ? [] : (pick(body) ?? [])));
+  }
+
+  /** A source's concept layout, or `undefined` when the tool can't address its data. */
+  private sourceLayout(sourceId: string, ctx: Context): Promise<SourceLayout | undefined> {
+    return this.cachedReference(`source/${sourceId}/concepts`, async () => {
+      const url = this.buildUrl(`/sources/${encodeURIComponent(sourceId)}/concepts`);
+      const listing = await this.fetchWithRetry<RawSourceListing | WbErrorEnvelope>(url, ctx);
+      return isWbErrorEnvelope(listing) ? undefined : layoutFromConcepts(sourceId, listing);
+    });
+  }
+
+  /** One of a source's value listings: `country`, `time`, or its extra dimension. */
+  private sourceValues(sourceId: string, concept: string, ctx: Context): Promise<DimensionValue[]> {
+    const path = `/sources/${encodeURIComponent(sourceId)}/${encodeURIComponent(concept.toLowerCase())}`;
+    return this.cachedReference(`source/${sourceId}/${concept.toLowerCase()}`, () =>
+      this.fetchSourcePages<RawSourceListing, DimensionValue>(path, ctx, valuesFromListing),
+    );
+  }
+
+  /**
+   * Choose the catalog source to query and the dimension value the caller named.
+   * Candidates run live source first, the order `preferredRow` ranks them in. A
+   * named value routes to the first candidate whose listing carries it, which is
+   * how an ID published under a live and an archived source reaches the archive
+   * (`FPN 4.1` is listed only by FPN Datahub Archive). With no value named, the
+   * first addressable candidate is used.
+   */
+  private async routeSource(
+    indicatorId: string,
+    rows: Indicator[],
+    dimensionValue: string | undefined,
+    detail: string,
+    ctx: Context,
+  ): Promise<{
+    row: Indicator;
+    layout: SourceLayout;
+    values: DimensionValue[];
+    requested?: DimensionValue;
+  }> {
+    // `/indicator/{id}` answers one row per catalog source.
+    const preferred = rows.reduce(preferredRow);
+    const candidates = [preferred, ...rows.filter((row) => row.sourceId !== preferred.sourceId)];
+
+    const addressable: Array<{ row: Indicator; layout: SourceLayout; values: DimensionValue[] }> =
+      [];
+    for (const row of candidates) {
+      const layout = await this.sourceLayout(row.sourceId, ctx);
+      if (!layout) continue;
+      const values = layout.dimension
+        ? await this.sourceValues(row.sourceId, layout.dimension, ctx)
+        : [];
+      if (dimensionValue === undefined) return { row, layout, values };
+      const requested = values.find((v) => v.id.toLowerCase() === dimensionValue.toLowerCase());
+      if (requested) return { row, layout, values, requested };
+      addressable.push({ row, layout, values });
+    }
+
+    if (addressable.length === 0) throw this.indicatorNotQueryable(indicatorId, rows, detail);
+
+    const withDimension = addressable.filter((a) => a.layout.dimension);
+    if (withDimension.length === 0) {
+      throw validationError(
+        `dimension_value "${dimensionValue}" does not apply: ${addressable[0]?.layout.sourceName} (source ${addressable[0]?.layout.sourceId}), which serves "${indicatorId}", has no dimension beyond country, series, and time.`,
+        { reason: 'dimension_not_applicable', indicatorId, dimensionValue },
+      );
+    }
+
+    const listings = withDimension.map(
+      ({ layout, values }) =>
+        `${layout.sourceName} (source ${layout.sourceId}) ${layout.dimension}: ${values.map((v) => v.id).join(', ')}`,
+    );
+    throw validationError(
+      `dimension_value "${dimensionValue}" is not a value "${indicatorId}" can be queried at. Valid values — ${listings.join('; ')}.`,
+      {
+        reason: 'unknown_dimension_value',
+        indicatorId,
+        dimensionValue,
+        validValues: withDimension.map(({ layout, values }) => ({
+          sourceId: layout.sourceId,
+          concept: layout.dimension,
+          ids: values.map((v) => v.id),
+        })),
+      },
+    );
+  }
+
+  /**
+   * Serve an indicator the standard endpoint rejected with id 175 from its catalog
+   * source's source-scoped data API. Every path segment is validated before the
+   * request — upstream silently drops an unknown member of a `;` list and answers
+   * any other bad segment with an id-160 envelope that names none — so a response
+   * with no rows is reported as an empty result. The full scope is read
+   * and paginated locally: `mrv` and the default version are computed from it, and
+   * upstream's row order changes with the shape of the request.
+   */
+  private async serveFromSource(
+    opts: GetDataOptions,
+    detail: string,
+    ctx: Context,
+  ): Promise<DataResult> {
+    const { indicatorId, countries, dateRange, mrv, dimensionValue, page, perPage } = opts;
+    const catalogRows = await this.catalogRowsForUnserved(indicatorId, ctx);
+    if (catalogRows.length === 0)
+      throw this.indicatorNotQueryable(indicatorId, catalogRows, detail);
+
+    const { row, layout, values, requested } = await this.routeSource(
+      indicatorId,
+      catalogRows,
+      dimensionValue,
+      detail,
+      ctx,
+    );
+    const { sourceId } = layout;
+
+    const [index, sourceCountries, timeTokens] = await Promise.all([
+      this.loadCountryIndex(ctx),
+      this.sourceValues(sourceId, 'country', ctx),
+      this.sourceValues(sourceId, 'time', ctx),
+    ]);
+
+    // ── Countries: the source takes its own three-character codes only ──
+    const codes = Array.isArray(countries) ? countries : countries.split(';');
+    const isAll = codes.length === 1 && codes[0]?.toLowerCase() === 'all';
+    const listed = new Set(sourceCountries.map((c) => c.id.toUpperCase()));
+    const countryIds: string[] = [];
+    const uncovered: string[] = [];
+    const invalid: string[] = [];
+    if (!isAll) {
+      for (const code of codes) {
+        const upper = code.toUpperCase();
+        const entityId = listed.has(upper) ? upper : index.entities.get(upper)?.id.toUpperCase();
+        if (entityId && listed.has(entityId)) {
+          if (!countryIds.includes(entityId)) countryIds.push(entityId);
+        } else if (entityId) uncovered.push(code);
+        else invalid.push(code);
+      }
+    }
+    if (invalid.length > 0) {
+      throw notFound(
+        `Country code(s) "${invalid.join(';')}" not valid. Use worldbank_list_countries to browse valid codes.`,
+        { reason: 'country_not_found', countryCodes: invalid.join(';'), indicatorId },
+      );
+    }
+
+    // ── Dimension value ──
+    const concept = layout.dimension;
+    let selection: DimensionSelection | 'resolve_version' | undefined;
+    let pinned: DimensionValue | undefined;
+    if (concept && requested) {
+      selection = 'requested';
+      pinned = requested;
+    } else if (concept) {
+      const choice = defaultSelection(concept, values);
+      selection = choice.selection;
+      if ('value' in choice) pinned = choice.value;
+    }
+
+    // ── Periods: explicit tokens, since the API has no range syntax ──
+    const window = parseDateWindow(dateRange);
+    const periodTokens = window
+      ? timeTokens.filter((token) => {
+          const period = periodFromToken(token.id);
+          return monthSpan(period) !== undefined && isWithinWindow(period, window);
+        })
+      : timeTokens;
+
+    const countryCount = isAll ? sourceCountries.length : countryIds.length;
+    const valueCount = concept && !pinned ? Math.max(values.length, 1) : 1;
+    const estimatedRows = countryCount * periodTokens.length * valueCount;
+    if (estimatedRows > SOURCE_SCOPE_ROW_LIMIT) {
+      throw validationError(
+        `Querying "${row.id}" from ${layout.sourceName} for ${countryCount} countries × ${periodTokens.length} periods` +
+          `${valueCount > 1 ? ` × ${valueCount} ${concept} values` : ''} would read ${estimatedRows.toLocaleString('en')} rows, ` +
+          `over the ${SOURCE_SCOPE_ROW_LIMIT.toLocaleString('en')}-row limit for one source-scoped request.`,
+        { reason: 'source_scope_too_large', indicatorId, sourceId, estimatedRows },
+      );
+    }
+
+    // A scope that selects no country or no period has no rows to request.
+    let rows: ScopedRow[] = [];
+    if ((isAll || countryIds.length > 0) && periodTokens.length > 0) {
+      let path = `/sources/${encodeURIComponent(sourceId)}/country/${encodeURIComponent(isAll ? 'all' : countryIds.join(';'))}/series/${encodeURIComponent(row.id)}`;
+      if (periodTokens.length < timeTokens.length) {
+        path += `/time/${encodeURIComponent(periodTokens.map((t) => t.id).join(';'))}`;
+      }
+      if (concept && pinned) {
+        path += `/${encodeURIComponent(concept.toLowerCase())}/${encodeURIComponent(pinned.id)}`;
+      }
+      const raw = await this.fetchSourcePages<RawSourceData, RawSourceObservation>(
+        path,
+        ctx,
+        (body) => body.source?.data,
+      );
+      rows = raw.flatMap((item) => readRow(item, concept) ?? []);
+    }
+
+    if (selection === 'resolve_version') {
+      const newest = newestVersionWithData(rows, values);
+      selection = newest ? 'newest_with_data' : 'newest';
+      pinned = newest ?? values.at(-1);
+      rows = rows.filter((r) => r.dimension?.id.toLowerCase() === pinned?.id.toLowerCase());
+    }
+    if (mrv !== undefined) rows = keepMostRecentPeriods(rows, mrv);
+    rows = sortRows(rows, values);
+
+    const start = (page - 1) * perPage;
+    const data = rows.slice(start, start + perPage).map((r): DataPoint => {
+      const entity = index.entities.get(r.countryId.toUpperCase());
+      return {
+        countryCode: entity?.iso2 || r.countryId,
+        countryIso3: r.countryId,
+        countryName: r.countryName,
+        date: r.period,
+        value: r.value,
+        obsStatus: '',
+        isAggregate: index.aggregateCodes.has(r.countryId),
+        ...(r.dimension && { dimension: r.dimension }),
+      };
+    });
+
+    return {
+      data,
+      indicator: { id: row.id, name: row.name },
+      total: rows.length,
+      page,
+      pages: Math.max(1, Math.ceil(rows.length / perPage)),
+      nullCount: data.filter((d) => d.value === null).length,
+      dateFilterDropped: false,
+      sourceScoped: {
+        sourceId,
+        sourceName: layout.sourceName,
+        dimension:
+          concept && selection
+            ? { concept, selection, id: pinned?.id ?? null, label: pinned?.label ?? null }
+            : null,
+        note:
+          `Not from the standard World Bank data endpoint, which does not serve "${row.id}": these values come from this ` +
+          "source's own dataset through the source-scoped data API, and may be archived or superseded figures.",
+      },
+      uncoveredCountries: uncovered,
+    };
   }
 
   // ─── Countries ───────────────────────────────────────────────────────────
@@ -852,66 +1162,42 @@ export class WorldBankApiService {
   }
 
   /**
-   * Load and cache the identifiers of every aggregate entity. The data endpoint's
-   * rows carry no `region`/`incomeLevel` field, so an observation can only be
-   * classified by looking its code up in the country listing — the same
-   * `region.id === "NA"` rule {@link normalizeCountry} applies, which keeps the
-   * data tool in agreement with the country tools by construction.
+   * Load and cache an index of every entity in the country listing. The data
+   * endpoint's rows carry no `region`/`incomeLevel` field, so an observation can
+   * only be classified by looking its code up here — the same `region.id === "NA"`
+   * rule {@link normalizeCountry} applies, which keeps the data tool in agreement
+   * with the country tools by construction.
    *
-   * Both identifiers go in the set: a data row names an aggregate by ISO2 in
-   * `country.id` (`ZH`) and by its aggregate code in `countryiso3code` (`AFE`).
+   * Both identifiers go in `aggregateCodes`: a data row names an aggregate by ISO2
+   * in `country.id` (`ZH`) and by its aggregate code in `countryiso3code` (`AFE`).
+   * `entities` maps either identifier, uppercased, to both — the source-scoped
+   * API takes only the three-character code, where callers may pass ISO2.
    */
-  private loadAggregateCodes(ctx: Context): Promise<Set<string>> {
-    const cached = this.aggregateCodesCache;
-    if (cached && cached.expiresAt > Date.now()) return Promise.resolve(cached.codes);
-
-    this.aggregateCodesInFlight ??= this.fetchAllPages<RawCountry>('/country', {}, ctx, () => {
-      throw serviceUnavailable(
-        'World Bank returned an error response for the country listing used to classify aggregates.',
-      );
-    })
-      .then((raw) => {
-        const codes = new Set<string>();
-        for (const country of raw) {
-          if (!normalizeCountry(country).isAggregate) continue;
-          if (country.id) codes.add(country.id);
-          if (country.iso2Code) codes.add(country.iso2Code);
-        }
-        if (this.catalogCacheTtlMs > 0) {
-          this.aggregateCodesCache = { codes, expiresAt: Date.now() + this.catalogCacheTtlMs };
-        }
-        ctx.log.debug('Aggregate code set loaded', { count: codes.size });
-        return codes;
-      })
-      .finally(() => {
-        this.aggregateCodesInFlight = undefined;
+  private loadCountryIndex(ctx: Context): Promise<CountryIndex> {
+    return this.cachedReference('country-index', async () => {
+      const raw = await this.fetchAllPages<RawCountry>('/country', {}, ctx, () => {
+        throw serviceUnavailable(
+          'World Bank returned an error response for the country listing used to classify aggregates.',
+        );
       });
-
-    return this.aggregateCodesInFlight;
+      const index: CountryIndex = { aggregateCodes: new Set(), entities: new Map() };
+      for (const country of raw) {
+        const entity = { id: country.id ?? '', iso2: country.iso2Code ?? '' };
+        if (entity.id) index.entities.set(entity.id.toUpperCase(), entity);
+        if (entity.iso2) index.entities.set(entity.iso2.toUpperCase(), entity);
+        if (!normalizeCountry(country).isAggregate) continue;
+        if (entity.id) index.aggregateCodes.add(entity.id);
+        if (entity.iso2) index.aggregateCodes.add(entity.iso2);
+      }
+      ctx.log.debug('Country index loaded', { aggregates: index.aggregateCodes.size });
+      return index;
+    });
   }
 
   // ─── Data ─────────────────────────────────────────────────────────────────
 
-  async getData(
-    opts: {
-      indicatorId: string;
-      countries: string | string[];
-      dateRange?: string;
-      mrv?: number;
-      page: number;
-      perPage: number;
-    },
-    ctx: Context,
-  ): Promise<{
-    data: DataPoint[];
-    indicator: { id: string; name: string };
-    total: number;
-    page: number;
-    pages: number;
-    nullCount: number;
-    dateFilterDropped: boolean;
-  }> {
-    const { indicatorId, countries, dateRange, mrv, page, perPage } = opts;
+  async getData(opts: GetDataOptions, ctx: Context): Promise<DataResult> {
+    const { indicatorId, countries, dateRange, mrv, dimensionValue, page, perPage } = opts;
 
     const countryCodes = Array.isArray(countries) ? countries.join(';') : countries;
 
@@ -936,7 +1222,8 @@ export class WorldBankApiService {
       // which, so two entries prove both segments are bad; one entry needs a
       // second lookup to place. The id-120 envelope text is identical in every
       // case. Id 175 is the exception: upstream reaches it only once the country
-      // codes have passed, and it means the indicator itself is not served.
+      // codes have passed, and it means this endpoint does not serve the
+      // indicator — its catalog source's source-scoped API is tried instead.
       if (envelope.message.length > 1) {
         throw notFound(
           `Neither indicator "${indicatorId}" nor country code(s) "${countryCodes}" are valid. Detail: ${detail}. Use worldbank_search_indicators and worldbank_list_countries.`,
@@ -944,7 +1231,7 @@ export class WorldBankApiService {
         );
       }
       if (envelope.message[0]?.id === NOT_SERVED_MESSAGE_ID) {
-        throw await this.indicatorNotQueryable(indicatorId, detail, ctx);
+        return this.serveFromSource(opts, detail, ctx);
       }
       if ((await this.lookupCatalogRows(indicatorId, ctx)).length === 0) {
         throw notFound(
@@ -955,6 +1242,15 @@ export class WorldBankApiService {
       throw notFound(
         `Country code(s) "${countryCodes}" not valid. Detail: ${detail}. Use worldbank_list_countries to browse valid codes.`,
         { reason: 'country_not_found', countryCodes, indicatorId, detail },
+      );
+    }
+
+    // The standard endpoint has no dimension beyond country, indicator, and date,
+    // so a dimension value can't have been applied — reported, not ignored.
+    if (dimensionValue !== undefined) {
+      throw validationError(
+        `dimension_value "${dimensionValue}" does not apply: "${indicatorId}" is served by the standard World Bank data endpoint, which has no dimension beyond country, indicator, and date.`,
+        { reason: 'dimension_not_applicable', indicatorId, dimensionValue },
       );
     }
 
@@ -1032,7 +1328,7 @@ export class WorldBankApiService {
       };
     }
 
-    const aggregateCodes = await this.loadAggregateCodes(ctx);
+    const { aggregateCodes } = await this.loadCountryIndex(ctx);
     const dataPoints = matched.map((raw) => normalizeDataPoint(raw, aggregateCodes));
 
     return {

@@ -1625,67 +1625,9 @@ describe('WorldBankApiService', () => {
     },
   ];
 
-  it('getData: reports indicator_not_queryable on id 175, naming the catalog source', async () => {
-    mockResponse(WB_NOT_SERVED_BODY);
-    mockResponse([
-      pagingObj(),
-      [
-        rawIndicatorFrom(
-          'SM.POP.REFG.OR',
-          'Refugee population by country or territory of origin',
-          '57',
-          'WDI Database Archives',
-        ),
-      ],
-    ]);
-    const ctx = createMockContext();
-    const err = await service
-      .getData(
-        { indicatorId: 'SM.POP.REFG.OR', countries: 'SDN', mrv: 3, page: 1, perPage: 50 },
-        ctx,
-      )
-      .catch((e: unknown) => e);
-
-    expect(err).toMatchObject({
-      code: JsonRpcErrorCode.NotFound,
-      data: {
-        reason: 'indicator_not_queryable',
-        indicatorId: 'SM.POP.REFG.OR',
-        sourceNames: ['WDI Database Archives'],
-      },
-    });
-    const { message } = err as McpError;
-    expect(message).toContain('SM.POP.REFG.OR');
-    expect(message).toContain('WDI Database Archives');
-    expect(message).toContain('Refugee population by country or territory of origin');
-    expect(message).toContain('worldbank_search_indicators');
-    expect(message).not.toContain('SDN');
-    expect(message).not.toContain('worldbank_list_countries');
-    expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(2);
-  });
-
-  it('getData: reports indicator_not_queryable on id 175 for an ID under a live and an archived source', async () => {
-    mockResponse(WB_NOT_SERVED_BODY);
-    mockResponse([
-      pagingObj({ total: 2 }),
-      [
-        rawIndicatorFrom('CoCA_fexp', 'Affordability', '93', 'FPN Datahub Archive'),
-        rawIndicatorFrom('CoCA_fexp', 'Affordability', '88', 'Food Prices for Nutrition'),
-      ],
-    ]);
-    const ctx = createMockContext();
-    const err = await service
-      .getData({ indicatorId: 'CoCA_fexp', countries: ['US', 'JP'], page: 1, perPage: 50 }, ctx)
-      .catch((e: unknown) => e);
-
-    expect(err).toMatchObject({
-      data: {
-        reason: 'indicator_not_queryable',
-        sourceNames: ['FPN Datahub Archive', 'Food Prices for Nutrition'],
-      },
-    });
-    expect((err as McpError).message).not.toMatch(/US;JP|"US"|"JP"/);
-  });
+  // A catalogued id-175 indicator is served from its catalog source rather than
+  // reported; tests/services/worldbank/source-scoped-data.test.ts covers that path.
+  // What stays here is the rejection when no catalog source can be resolved.
 
   it('getData: still reports indicator_not_queryable on id 175 when the catalog lookup fails', async () => {
     mockResponse(WB_NOT_SERVED_BODY);

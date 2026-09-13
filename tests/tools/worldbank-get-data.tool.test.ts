@@ -1074,4 +1074,281 @@ describe('worldbankGetData', () => {
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('obs_status: E');
   });
+
+  // ─── Source-scoped data ───────────────────────────────────────────────────
+
+  const archiveNote =
+    'Not from the standard World Bank data endpoint, which does not serve "SM.POP.REFG.OR": these values come from this source\'s own dataset through the source-scoped data API, and may be archived or superseded figures.';
+
+  const sudanRow = (
+    date: string,
+    value: number | null,
+    dimension = { id: '202503', label: '2025 Mar' },
+  ) => ({
+    countryCode: 'SD',
+    countryIso3: 'SDN',
+    countryName: 'Sudan',
+    date,
+    value,
+    obsStatus: '',
+    isAggregate: false,
+    dimension,
+  });
+
+  const archiveResult = {
+    data: [sudanRow('2023', 1496923), sudanRow('2022', null)],
+    indicator: {
+      id: 'SM.POP.REFG.OR',
+      name: 'Refugee population by country or territory of origin',
+    },
+    total: 2,
+    page: 1,
+    pages: 1,
+    nullCount: 1,
+    dateFilterDropped: false,
+    sourceScoped: {
+      sourceId: '57',
+      sourceName: 'WDI Database Archives',
+      dimension: {
+        concept: 'Version',
+        selection: 'newest_with_data',
+        id: '202503',
+        label: '2025 Mar',
+      },
+      note: archiveNote,
+    },
+    uncoveredCountries: [],
+  };
+
+  it('discloses the serving source, release, and path on both surfaces', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    const getData = vi.fn().mockResolvedValue(archiveResult);
+    vi.mocked(getWorldBankApiService).mockReturnValue({ getData } as never);
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+
+    const result = await runToolContract(
+      worldbankGetData,
+      { indicator_id: 'SM.POP.REFG.OR', countries: 'SD', mrv: 2 },
+      { context: { errors: worldbankGetData.errors } },
+    );
+
+    expect(result.isError).toBeFalsy();
+    const structured = result.structuredContent as Record<string, unknown>;
+    expect(structured.sourceScoped).toEqual(archiveResult.sourceScoped);
+    expect((structured.data as Array<Record<string, unknown>>)[0]?.dimension).toEqual({
+      id: '202503',
+      label: '2025 Mar',
+    });
+
+    const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+    expect(text).toContain('**Source-scoped data:** WDI Database Archives (source 57).');
+    expect(text).toContain(archiveNote);
+    expect(text).toContain(
+      '**Version:** 2025 Mar (`202503`) — selection: newest_with_data (the newest release holding a value for the requested countries and periods)',
+    );
+    // One release applies to every row, so rows don't repeat it.
+    expect(text).toContain('- **2023:** 1496923\n');
+    expect(text).not.toContain('[202503: 2025 Mar]');
+  });
+
+  it('labels each row with its own value when no single dimension value applies', async () => {
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const blocks = worldbankGetData.format!({
+      data: [
+        {
+          ...usRow,
+          date: '2017',
+          value: 19519.4,
+          dimension: { id: 'CD', label: 'Expenditure (US$, billions)' },
+        },
+        {
+          ...usRow,
+          date: '2017',
+          value: 1,
+          dimension: { id: 'PPPGlob', label: 'Purchasing power parity (PPP)' },
+        },
+      ],
+      indicator: { id: '1000000', name: 'GDP' },
+      nullCount: 0,
+      sourceScoped: {
+        sourceId: '78',
+        sourceName: 'ICP 2017',
+        dimension: { concept: 'Classification', selection: 'every_value', id: null, label: null },
+        note: 'Not from the live WDI data endpoint.',
+      },
+    });
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).toContain(
+      '**Classification:** every value — selection: every_value (no single value — each row shows its own)',
+    );
+    expect(text).toContain('- **2017:** 19519.4 [CD: Expenditure (US$, billions)]');
+    expect(text).toContain('- **2017:** 1 [PPPGlob: Purchasing power parity (PPP)]');
+  });
+
+  it('renders a source-scoped result from a dataset with no extra dimension', async () => {
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const blocks = worldbankGetData.format!({
+      data: [{ ...usRow }],
+      indicator: { id: 'X.ONE', name: 'One' },
+      nullCount: 0,
+      sourceScoped: {
+        sourceId: '99',
+        sourceName: 'Plain Source',
+        dimension: null,
+        note: 'Not from the live WDI data endpoint.',
+      },
+    });
+    expect((blocks[0] as { text: string }).text).toContain(
+      '**Dimension:** none beyond country, series, and time',
+    );
+  });
+
+  it('leaves sourceScoped out of an indicator the standard endpoint serves', async () => {
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const result = await runToolContract(
+      worldbankGetData,
+      { indicator_id: 'NY.GDP.PCAP.CD', countries: 'US', mrv: 1 },
+      { context: { errors: worldbankGetData.errors } },
+    );
+    expect(result.structuredContent).not.toHaveProperty('sourceScoped');
+    const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+    expect(text).not.toContain('Source-scoped data');
+  });
+
+  it('forwards dimension_value trimmed and echoes it, treating blank as absent', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    const getData = vi.fn().mockResolvedValue(archiveResult);
+    vi.mocked(getWorldBankApiService).mockReturnValue({ getData } as never);
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+
+    const ctx = createMockContext({ errors: worldbankGetData.errors });
+    await worldbankGetData.handler(
+      worldbankGetData.input.parse({
+        indicator_id: 'SM.POP.REFG.OR',
+        countries: 'SDN',
+        dimension_value: ' 202503 ',
+      }),
+      ctx,
+    );
+    expect(getData.mock.calls[0]?.[0].dimensionValue).toBe('202503');
+    expect(getEnrichment(ctx).appliedFilters).toMatchObject({ dimensionValue: '202503' });
+    expect(
+      worldbankGetData.enrichmentTrailer?.appliedFilters?.render?.({
+        indicatorId: 'SM.POP.REFG.OR',
+        countries: 'SDN',
+        dimensionValue: '202503',
+        page: 1,
+        perPage: 50,
+      }),
+    ).toBe(
+      '**Applied Filters:** indicator_id=SM.POP.REFG.OR, countries=SDN, dimension_value=202503, page=1, per_page=50',
+    );
+
+    const blankCtx = createMockContext({ errors: worldbankGetData.errors });
+    await worldbankGetData.handler(
+      worldbankGetData.input.parse({
+        indicator_id: 'SM.POP.REFG.OR',
+        countries: 'SDN',
+        dimension_value: '  ',
+      }),
+      blankCtx,
+    );
+    expect(getData.mock.calls[1]?.[0]).not.toHaveProperty('dimensionValue');
+    expect(getEnrichment(blankCtx).appliedFilters).not.toHaveProperty('dimensionValue');
+  });
+
+  it('names the codes the serving dataset does not cover, alongside the empty-result notice', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      getData: vi.fn().mockResolvedValue({
+        ...archiveResult,
+        data: [],
+        total: 0,
+        nullCount: 0,
+        uncoveredCountries: ['CHL', 'XZN'],
+      }),
+    } as never);
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const result = await runToolContract(
+      worldbankGetData,
+      { indicator_id: 'SM.POP.REFG.OR', countries: 'CHL,XZN' },
+      { context: { errors: worldbankGetData.errors } },
+    );
+    const notice = (result.structuredContent as Record<string, unknown>).notice as string;
+    expect(notice).toContain('No observations returned for the requested filter.');
+    expect(notice).toContain(
+      'WDI Database Archives (source 57) publishes no data for CHL, XZN, so those codes were left out of the query.',
+    );
+    const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+    expect(text).toContain('publishes no data for CHL, XZN');
+  });
+
+  it.each([
+    [
+      'unknown_dimension_value',
+      JsonRpcErrorCode.ValidationError,
+      {
+        validValues: [{ sourceId: '57', concept: 'Version', ids: ['202407', '202503'] }],
+      },
+      'dimension_value "199912" is not a value "SM.POP.REFG.OR" can be queried at. Valid values — WDI Database Archives (source 57) Version: 202407, 202503.',
+      /Recovery:.*dimension ids the error message lists/,
+    ],
+    [
+      'dimension_not_applicable',
+      JsonRpcErrorCode.ValidationError,
+      {},
+      'dimension_value "199912" does not apply.',
+      /Recovery:.*Remove dimension_value/,
+    ],
+    [
+      'source_scope_too_large',
+      JsonRpcErrorCode.ValidationError,
+      { sourceId: '57', estimatedRows: 2_718_196 },
+      'Querying "SM.POP.REFG.OR" would read 2,718,196 rows.',
+      /Recovery:.*Narrow countries or date_range, or pin dimension_value/,
+    ],
+  ])(
+    'delivers %s with its recovery on both surfaces',
+    async (reason, code, data, message, recovery) => {
+      const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+      vi.mocked(getWorldBankApiService).mockReturnValue({
+        getData: vi.fn().mockRejectedValue(new McpError(code, message, { reason, ...data })),
+      } as never);
+      const { worldbankGetData } = await import(
+        '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+      );
+      const result = await runToolContract(
+        worldbankGetData,
+        { indicator_id: 'SM.POP.REFG.OR', countries: 'all', dimension_value: '199912' },
+        { context: { errors: worldbankGetData.errors } },
+      );
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code,
+          data: {
+            reason,
+            indicatorId: 'SM.POP.REFG.OR',
+            ...data,
+            recovery: { hint: expect.any(String) },
+          },
+        },
+      });
+      const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+      expect(text).toContain(message);
+      expect(text).toMatch(recovery);
+    },
+  );
 });
