@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.6](changelog/0.3.x/0.3.6.md) — 2026-09-12
+
+worldbank_get_data now serves indicators the standard data endpoint rejects with message id 175 — WDI Database Archives, PEFA, ICP, GDLD, International Debt Statistics: DSSI, Food Prices for Nutrition — by routing them to their catalog source's source-scoped data API.
+
 ## [0.3.5](changelog/0.3.x/0.3.5.md) — 2026-09-12
 
 worldbank_get_poverty gains a ppp_version selector, response-size caps land on worldbank_search_projects and worldbank_get_poverty, and paginated tools disclose when a request runs past the end.

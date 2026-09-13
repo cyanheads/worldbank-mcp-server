@@ -12,14 +12,14 @@
       "url": "https://worldbank.caseyjhand.com/mcp"
     }
   ],
-  "version": "0.3.5",
+  "version": "0.3.6",
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/worldbank-mcp-server",
       "runtimeHint": "bun",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "packageArguments": [
         {
           "type": "positional",
@@ -68,7 +68,7 @@
         },
         {
           "name": "WORLDBANK_CATALOG_CACHE_TTL_MS",
-          "description": "Lifetime in ms of the in-process reference caches: the indicator catalog behind keyword-only search, the aggregate-code set behind isAggregate, and the PIP versions listing behind ppp_version. 0 disables caching.",
+          "description": "Lifetime in ms of the in-process reference caches: the indicator catalog behind keyword-only search, the country index behind isAggregate and source-scoped country codes, each source-scoped dataset's concept, country, period, and dimension listings, and the PIP versions listing behind ppp_version. 0 disables caching.",
           "format": "string",
           "isRequired": false,
           "default": "3600000"
@@ -83,7 +83,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/worldbank-mcp-server",
       "runtimeHint": "bun",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "packageArguments": [
         {
           "type": "positional",
@@ -160,7 +160,7 @@
         },
         {
           "name": "WORLDBANK_CATALOG_CACHE_TTL_MS",
-          "description": "Lifetime in ms of the in-process reference caches: the indicator catalog behind keyword-only search, the aggregate-code set behind isAggregate, and the PIP versions listing behind ppp_version. 0 disables caching.",
+          "description": "Lifetime in ms of the in-process reference caches: the indicator catalog behind keyword-only search, the country index behind isAggregate and source-scoped country codes, each source-scoped dataset's concept, country, period, and dimension listings, and the PIP versions listing behind ppp_version. 0 disables caching.",
           "format": "string",
           "isRequired": false,
           "default": "3600000"

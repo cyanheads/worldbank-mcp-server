@@ -1,6 +1,6 @@
 # worldbank-mcp-server - Directory Structure
 
-Generated on: 2026-09-12 22:55:16
+Generated on: 2026-09-13 00:02:05
 
 ```text
 worldbank-mcp-server/
@@ -164,6 +164,8 @@ worldbank-mcp-server/
 │   │   │   └── types.ts
 │   │   ├── worldbank/
 │   │   │   ├── identifiers.ts
+│   │   │   ├── periods.ts
+│   │   │   ├── source-scoped.ts
 │   │   │   ├── types.ts
 │   │   │   └── worldbank-service.ts
 │   │   └── response-budget.ts
@@ -179,6 +181,8 @@ worldbank-mcp-server/
 │   │   ├── projects/
 │   │   │   └── projects-service.test.ts
 │   │   └── worldbank/
+│   │       ├── source-scoped-data.test.ts
+│   │       ├── source-scoped.test.ts
 │   │       └── worldbank-service.test.ts
 │   └── tools/
 │       ├── worldbank-get-country.tool.test.ts
