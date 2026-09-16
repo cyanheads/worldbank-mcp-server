@@ -268,10 +268,8 @@ describe('worldbankGetCountry', () => {
       { context: { errors: worldbankGetCountry.errors } },
     );
     expect(result.isError).toBe(true);
-    // The contract runner reports a schema rejection as ValidationError; on the wire the SDK
-    // answers InvalidParams (-32602) before the handler runs.
     expect(result.structuredContent).toMatchObject({
-      error: { code: JsonRpcErrorCode.ValidationError },
+      error: { code: JsonRpcErrorCode.InvalidParams },
     });
     const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
     expect(text).toContain('worldbank_list_countries');
