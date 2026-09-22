@@ -163,11 +163,7 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
       throw ctx.fail(
         'missing_filter',
         'At least one of query, topic_id, or source_id must be provided.',
-        {
-          recovery: {
-            hint: 'Provide a keyword query, a topic_id from worldbank_list_topics, or a source_id from worldbank_list_sources.',
-          },
-        },
+        ctx.recoveryFor('missing_filter'),
       );
     }
 

@@ -368,9 +368,11 @@ export const worldbankGetData = tool('worldbank_get_data', {
 
   async handler(input, ctx) {
     if (input.date_range && input.mrv !== undefined) {
-      throw ctx.fail('invalid_params', 'Provide either date_range or mrv, not both.', {
-        recovery: { hint: 'Remove date_range to use mrv, or remove mrv to use date_range.' },
-      });
+      throw ctx.fail(
+        'invalid_params',
+        'Provide either date_range or mrv, not both.',
+        ctx.recoveryFor('invalid_params'),
+      );
     }
 
     /**

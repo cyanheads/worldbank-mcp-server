@@ -399,14 +399,27 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
     } catch (err) {
       if (err instanceof McpError) {
         const reason = err.data?.reason;
-        if (
-          reason === 'country_not_found' ||
-          reason === 'invalid_parameter' ||
-          reason === 'ppp_version_unavailable' ||
-          reason === 'upstream_unavailable'
-        ) {
-          throw ctx.fail(reason, err.message, {
-            ...ctx.recoveryFor(reason),
+        if (reason === 'country_not_found') {
+          throw ctx.fail('country_not_found', err.message, {
+            ...ctx.recoveryFor('country_not_found'),
+            countries: codes,
+          });
+        }
+        if (reason === 'invalid_parameter') {
+          throw ctx.fail('invalid_parameter', err.message, {
+            ...ctx.recoveryFor('invalid_parameter'),
+            countries: codes,
+          });
+        }
+        if (reason === 'ppp_version_unavailable') {
+          throw ctx.fail('ppp_version_unavailable', err.message, {
+            ...ctx.recoveryFor('ppp_version_unavailable'),
+            countries: codes,
+          });
+        }
+        if (reason === 'upstream_unavailable') {
+          throw ctx.fail('upstream_unavailable', err.message, {
+            ...ctx.recoveryFor('upstream_unavailable'),
             countries: codes,
           });
         }

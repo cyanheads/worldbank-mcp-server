@@ -398,8 +398,15 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
     } catch (err) {
       if (err instanceof McpError) {
         const reason = err.data?.reason;
-        if (reason === 'page_out_of_range' || reason === 'upstream_unavailable') {
-          throw ctx.fail(reason, err.message, ctx.recoveryFor(reason));
+        if (reason === 'page_out_of_range') {
+          throw ctx.fail('page_out_of_range', err.message, ctx.recoveryFor('page_out_of_range'));
+        }
+        if (reason === 'upstream_unavailable') {
+          throw ctx.fail(
+            'upstream_unavailable',
+            err.message,
+            ctx.recoveryFor('upstream_unavailable'),
+          );
         }
       }
       throw err;
