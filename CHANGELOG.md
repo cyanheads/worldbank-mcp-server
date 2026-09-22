@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.8](changelog/0.3.x/0.3.8.md) — 2026-09-21
+
+Upgrades to mcp-ts-core 0.13.6: argument rejections carry a recovery hint naming what to send, near-miss argument keys and stringified arrays are normalized before validation, and tool error text closes with its reason.
+
 ## [0.3.7](changelog/0.3.x/0.3.7.md) — 2026-09-16
 
 Upgrades to mcp-ts-core 0.13.2 and declares stateless HTTP session mode in code, so an unset MCP_SESSION_MODE now resolves stateless instead of falling back to the schema default stateful.
