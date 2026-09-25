@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.1](changelog/0.4.x/0.4.1.md) — 2026-09-25
+
+worldbank_search_projects takes ISO3 country codes and a financing-window filter, reports the project page's commitment amount, and keeps newest-approval order under a query; worldbank_list_countries filters by lending type.
+
 ## [0.4.0](changelog/0.4.x/0.4.0.md) — 2026-09-25 · ⚠️ Breaking
 
 worldbank_get_poverty answers PIP's World, regional, income-group, and lending-group aggregates at any poverty line, accepts ISO2 and model-estimate-only codes, and resolves MRV to PIP's latest estimate year by default. Tools now keep the service's error data on re-throw.
