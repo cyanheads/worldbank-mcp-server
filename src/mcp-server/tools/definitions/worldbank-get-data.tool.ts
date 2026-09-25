@@ -171,7 +171,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
       ])
       .optional()
       .describe(
-        'The period form to return, for series such as Global Economic Monitor\'s that publish quarterly or monthly values beside annual ones: annual (the default), quarterly, or monthly. With mrv or mrnev it picks the form they select from — frequency "monthly" with mrv 3 returns the three latest months, where mrv 3 alone returns the three latest years. With neither, it returns the whole series at that form. A series that does not publish the form returns an empty result with a notice saying so. Mutually exclusive with date_range, whose own form (2024, 2024Q1, 2024M01) picks the periods of a window.',
+        'The period form to return, for series such as Global Economic Monitor\'s that publish quarterly or monthly values beside annual ones: annual (the default), quarterly, or monthly. With mrv or mrnev it picks the form they select from — frequency "monthly" with mrv 3 returns the three latest months, where mrv 3 alone returns the three latest years. With neither, it returns the whole series at that form. A series that does not publish the form returns an empty result with a notice saying so, except that with neither mrv nor mrnev a source that null-fills the form (Global Economic Monitor) returns null rows, and a page of them carries a notice. Mutually exclusive with date_range, whose own form (2024, 2024Q1, 2024M01) picks the periods of a window.',
       ),
     dimension_value: z
       .string()
@@ -353,7 +353,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
       .string()
       .optional()
       .describe(
-        'Recovery hint for an empty result set — how to broaden the query when nothing matched, whether the series publishes the requested frequency, or the page range that exists when the requested page is past the end — a quarter or month date_range whose observations are all null, with the same span at the other period forms, a page size reduced to the page cap, and, for source-scoped data, the requested country codes the serving dataset publishes nothing for.',
+        'Recovery hint for an empty result set — how to broaden the query when nothing matched, whether the series publishes the requested frequency, or the page range that exists when the requested page is past the end — a quarter or month date_range whose observations are all null, with the same span at the other period forms, a frequency page whose observations are all null, a page size reduced to the page cap, and, for source-scoped data, the requested country codes the serving dataset publishes nothing for.',
       ),
   },
 
@@ -685,6 +685,17 @@ export const worldbankGetData = tool('worldbank_get_data', {
     }
     const allNull = dateRange && result.allNull ? allNullWindowNotice(dateRange) : undefined;
     if (allNull) notices.push(allNull);
+    /**
+     * A source that null-fills a form a series lacks (Global Economic Monitor)
+     * answers a whole-series read at that form with null rows rather than none.
+     */
+    if (frequency && !latest && result.data.length > 0 && result.nullCount === result.data.length) {
+      const others = FREQUENCIES.filter((f) => f !== frequency).map((f) => `"${f}"`);
+      notices.push(
+        `Every observation on this page is null: this series may not publish ${frequency} values, or none for these countries at these periods. ` +
+          `Try frequency ${others.join(' or ')}, or mrnev with frequency "${frequency}", which returns only the values that exist.`,
+      );
+    }
     const reduced = pageSizeReducedNotice({
       requested: perPage,
       served: result.perPage,

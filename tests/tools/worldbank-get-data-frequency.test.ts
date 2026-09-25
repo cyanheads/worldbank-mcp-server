@@ -8,7 +8,8 @@
  * where the series lacks it. World Development Indicators and Quarterly Public
  * Sector Debt carry one form, and drop a window at any other, answering with the
  * whole series. Covers `frequency` on `mrv`, `mrnev`, and the whole series, its
- * exclusivity with `date_range`, and the notice on an all-null sub-annual window.
+ * exclusivity with `date_range`, and the notices on an all-null sub-annual window
+ * and an all-null `frequency` page.
  * @module tests/tools/worldbank-get-data-frequency.test
  */
 
@@ -721,6 +722,28 @@ describe('frequency without mrv or mrnev', () => {
     expect(
       ['date', 'page', 'per_page'].map((k) => dataRequests[0]?.searchParams.get(k)).join(' '),
     ).toBe('1900M01:2100M12 2 50');
+  });
+
+  it('carries a notice on a page of null rows, as a null-filling source answers a form the series lacks', async () => {
+    const lacking = await call({
+      indicator_id: 'CPTOTSAXN',
+      countries: 'KE',
+      frequency: 'quarterly',
+    });
+
+    expect(lacking.structured.data.length).toBeGreaterThan(0);
+    expect(lacking.structured.data.every((r) => r.value === null)).toBe(true);
+    expect(lacking.structured.notice).toMatch(
+      /^Every observation on this page is null: this series may not publish quarterly values/,
+    );
+    expect(lacking.text).toContain('Every observation on this page is null');
+
+    const publishing = await call({
+      indicator_id: 'CPTOTSAXN',
+      countries: 'KE',
+      frequency: 'monthly',
+    });
+    expect(publishing.structured.notice).toBeUndefined();
   });
 
   it('says the form is not published on a page past the end of the series upstream answered instead', async () => {
