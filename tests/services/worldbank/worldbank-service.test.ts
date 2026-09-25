@@ -135,21 +135,29 @@ const WB_ERROR_BODY = [
 ];
 
 /**
- * Resolve after `ms`, or reject first if `signal` aborts, as the framework's
- * fetch does with the signal it is handed.
+ * Fetches held open until the test calls `release`, each rejecting first if the
+ * signal it was handed aborts, as the framework's fetch does. `entered` resolves
+ * once `expected` held fetches are in flight, so a test acts while the load is
+ * pending by construction rather than by racing a timer.
  */
-function settleAfter(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(resolve, ms);
-    signal?.addEventListener(
-      'abort',
-      () => {
-        clearTimeout(timer);
-        reject(new Error('fetch was aborted'));
-      },
-      { once: true },
-    );
-  });
+function holdOpen(expected: number) {
+  const entered = Promise.withResolvers<void>();
+  const released = Promise.withResolvers<void>();
+  let inFlight = 0;
+  const wait = (signal?: AbortSignal) =>
+    new Promise<void>((resolve, reject) => {
+      const onAbort = () => reject(new Error('fetch was aborted'));
+      if (signal?.aborted) onAbort();
+      signal?.addEventListener('abort', onAbort, { once: true });
+      released.promise.then(resolve);
+      if (++inFlight === expected) entered.resolve();
+    });
+  return { entered: entered.promise, release: () => released.resolve(), wait };
+}
+
+/** Let every pending promise chain run to completion; nothing here waits on a timer. */
+function drainMicrotasks(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -682,16 +690,19 @@ describe('WorldBankApiService', () => {
   // ─── Shared reference loads ───────────────────────────────────────────────
 
   /**
-   * Answer every request with `body`, `ms` late, failing early the way the
-   * framework's fetch does when the signal it was handed aborts first.
+   * Answer every request with `body` once the returned gate is released, failing
+   * early the way the framework's fetch does when the signal it was handed
+   * aborts first. Each load here is a single request.
    */
-  function slowResponse(body: unknown, ms: number) {
+  function heldResponse(body: unknown) {
+    const gate = holdOpen(1);
     fetchWithTimeoutMock.mockImplementation(
       async (_url: string, _timeout: number, _ctx: unknown, options?: { signal?: AbortSignal }) => {
-        await settleAfter(ms, options?.signal);
+        await gate.wait(options?.signal);
         return { text: async () => JSON.stringify(body) };
       },
     );
+    return gate;
   }
 
   const COUNTRY_LISTING = [
@@ -701,14 +712,14 @@ describe('WorldBankApiService', () => {
   const CATALOG = [pagingObj(), [rawIndicator('NY.GDP.PCAP.CD', 'GDP per capita')]];
 
   it('fails only the caller that cancels while a concurrent caller shares the country index load', async () => {
-    slowResponse(COUNTRY_LISTING, 60);
+    const gate = heldResponse(COUNTRY_LISTING);
     const cancelled = new AbortController();
 
     const first = service.lookupCountry('1W', createMockContext({ signal: cancelled.signal }));
-    await settleAfter(10);
+    await gate.entered;
     const second = service.lookupCountry('1W', createMockContext());
-    await settleAfter(10);
     cancelled.abort();
+    gate.release();
 
     const [cancelledOutcome, concurrentOutcome] = await Promise.allSettled([first, second]);
 
@@ -721,15 +732,15 @@ describe('WorldBankApiService', () => {
   });
 
   it('fails only the caller that cancels while a concurrent caller shares the indicator catalog load', async () => {
-    slowResponse(CATALOG, 60);
+    const gate = heldResponse(CATALOG);
     const cancelled = new AbortController();
     const search = { query: 'gdp', page: 1, perPage: 10 };
 
     const first = service.searchIndicators(search, createMockContext({ signal: cancelled.signal }));
-    await settleAfter(10);
+    await gate.entered;
     const second = service.searchIndicators(search, createMockContext());
-    await settleAfter(10);
     cancelled.abort();
+    gate.release();
 
     const [cancelledOutcome, concurrentOutcome] = await Promise.allSettled([first, second]);
 
@@ -739,15 +750,16 @@ describe('WorldBankApiService', () => {
   });
 
   it('keeps a reference load every caller abandoned, and serves the next caller from it', async () => {
-    slowResponse(COUNTRY_LISTING, 40);
+    const gate = heldResponse(COUNTRY_LISTING);
     const cancelled = new AbortController();
 
     const abandoned = service.lookupCountry('1W', createMockContext({ signal: cancelled.signal }));
-    await settleAfter(10);
+    await gate.entered;
     cancelled.abort();
     await expect(abandoned).rejects.toThrow();
 
-    await settleAfter(60);
+    gate.release();
+    await drainMicrotasks();
     await expect(service.lookupCountry('1W', createMockContext())).resolves.toEqual({
       id: 'WLD',
       iso2: '1W',

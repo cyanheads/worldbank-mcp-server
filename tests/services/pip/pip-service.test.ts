@@ -202,21 +202,29 @@ function validationBody(parameter: string, valid: unknown[]) {
 }
 
 /**
- * Resolve after `ms`, or reject first if `signal` aborts, as the framework's
- * fetch does with the signal it is handed.
+ * Fetches held open until the test calls `release`, each rejecting first if the
+ * signal it was handed aborts, as the framework's fetch does. `entered` resolves
+ * once `expected` held fetches are in flight, so a test acts while the load is
+ * pending by construction rather than by racing a timer.
  */
-function settleAfter(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(resolve, ms);
-    signal?.addEventListener(
-      'abort',
-      () => {
-        clearTimeout(timer);
-        reject(new Error('fetch was aborted'));
-      },
-      { once: true },
-    );
-  });
+function holdOpen(expected: number) {
+  const entered = Promise.withResolvers<void>();
+  const released = Promise.withResolvers<void>();
+  let inFlight = 0;
+  const wait = (signal?: AbortSignal) =>
+    new Promise<void>((resolve, reject) => {
+      const onAbort = () => reject(new Error('fetch was aborted'));
+      if (signal?.aborted) onAbort();
+      signal?.addEventListener('abort', onAbort, { once: true });
+      released.promise.then(resolve);
+      if (++inFlight === expected) entered.resolve();
+    });
+  return { entered: entered.promise, release: () => released.resolve(), wait };
+}
+
+/** Let every pending promise chain run to completion; nothing here waits on a timer. */
+function drainMicrotasks(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -808,33 +816,36 @@ describe('PipService', () => {
   // ─── Shared reference loads ───────────────────────────────────────────────
 
   /**
-   * Answer `/versions` and the `/aux` tables `ms` late, failing early the way
-   * the framework's fetch does when the signal it was handed aborts first.
+   * Hold `/versions` and the `/aux` tables open until the returned gate is
+   * released. A query naming an economy or an aggregate reads two of them —
+   * `/versions` and the regions table — so the gate waits for two in flight.
    */
-  function slowReferenceListings(ms: number) {
+  function holdReferenceListings() {
+    const gate = holdOpen(2);
     const serve = fetchWithTimeoutMock.getMockImplementation() as
       | ((...args: unknown[]) => unknown)
       | undefined;
     fetchWithTimeoutMock.mockImplementation(
       async (url: string, timeout: number, ctx: unknown, options?: { signal?: AbortSignal }) => {
         if (url.includes('/versions') || url.includes('/aux?')) {
-          await settleAfter(ms, options?.signal);
+          await gate.wait(options?.signal);
         }
         return serve?.(url, timeout, ctx, options);
       },
     );
+    return gate;
   }
 
   it('fails only the caller that cancels while a concurrent caller shares the reference loads', async () => {
-    slowReferenceListings(60);
+    const gate = holdReferenceListings();
     mockRows([surveyRow('USA', 2022)]);
     const cancelled = new AbortController();
 
     const first = service.getPoverty(baseOpts, createMockContext({ signal: cancelled.signal }));
-    await settleAfter(10);
+    await gate.entered;
     const second = service.getPoverty(baseOpts, createMockContext());
-    await settleAfter(10);
     cancelled.abort();
+    gate.release();
 
     const [cancelledOutcome, concurrentOutcome] = await Promise.allSettled([first, second]);
 
@@ -844,16 +855,17 @@ describe('PipService', () => {
   });
 
   it('keeps a reference load every caller abandoned, and serves the next caller from it', async () => {
-    slowReferenceListings(40);
+    const gate = holdReferenceListings();
     mockRows([surveyRow('USA', 2022)]);
     const cancelled = new AbortController();
 
     const abandoned = service.getPoverty(baseOpts, createMockContext({ signal: cancelled.signal }));
-    await settleAfter(10);
+    await gate.entered;
     cancelled.abort();
     await expect(abandoned).rejects.toThrow();
 
-    await settleAfter(60);
+    gate.release();
+    await drainMicrotasks();
     await expect(service.getPoverty(baseOpts, createMockContext())).resolves.toMatchObject({
       total: 1,
     });
@@ -861,14 +873,14 @@ describe('PipService', () => {
   });
 
   it("still throws a caller's own cancellation during the regions-table load rather than degrading", async () => {
-    slowReferenceListings(40);
+    const gate = holdReferenceListings();
     const cancelled = new AbortController();
 
     const request = service.getPoverty(
       { ...baseOpts, countries: ['SSF'] },
       createMockContext({ signal: cancelled.signal }),
     );
-    await settleAfter(10);
+    await gate.entered;
     cancelled.abort();
 
     await expect(request).rejects.toThrow();
