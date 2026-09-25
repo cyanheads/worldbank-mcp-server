@@ -1,6 +1,6 @@
 /**
  * @fileoverview World Bank period arithmetic shared by both data paths: placing a
- * period (`2020`, `2020Q2`, `2020M03`) on a month axis, testing it against a
+ * period (`2020`, `2020Q2`, `2020M03`) on a month axis, naming its form, testing it against a
  * requested `date_range`, ordering periods newest first, and translating the
  * time tokens the source-scoped data API uses (`YR2015`, `YR201806`,
  * `YR2027-M11`) into that same period grammar.
@@ -29,6 +29,17 @@ export function monthSpan(period: string): MonthSpan | undefined {
   }
   if (ordinal < 1 || ordinal > 12) return;
   return { start: firstMonth + ordinal - 1, end: firstMonth + ordinal - 1 };
+}
+
+/** The shape of a World Bank period: a year, a quarter, or a month. */
+export type PeriodForm = 'year' | 'quarter' | 'month';
+
+/** The form of one period (`2020`, `2020Q2`, `2020M03`), or `undefined` for one that can't be placed. */
+export function periodForm(period: string): PeriodForm | undefined {
+  const span = monthSpan(period);
+  if (!span) return;
+  const months = span.end - span.start + 1;
+  return months === 12 ? 'year' : months === 3 ? 'quarter' : 'month';
 }
 
 /** Parse the requested `date` filter into the span of months it asks for. */

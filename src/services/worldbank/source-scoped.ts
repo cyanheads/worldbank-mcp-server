@@ -3,12 +3,14 @@
  * `/v2/sources/{id}/...` data API that serves the indicators the standard data
  * endpoint rejects with message id 175. Reads a source's concept layout, picks
  * the default value of its extra dimension, normalizes the concept/id/value rows
- * the API returns, and applies `mrv` and ordering locally: the default WDI
- * Database Archives release is resolved from the rows before `mrv` can apply,
- * and upstream's row order changes with the shape of the request.
+ * the API returns, and orders them locally, since upstream's row order changes
+ * with the shape of the request. `mrv` and `mrnev` are selected locally from the
+ * rows through {@link SCOPED_ROW_READER}, after the default WDI Database Archives
+ * release is resolved from them.
  * @module services/worldbank/source-scoped
  */
 
+import type { RowReader } from './latest-values.js';
 import { comparePeriodsDesc, periodFromToken } from './periods.js';
 import type {
   DimensionValue,
@@ -131,20 +133,15 @@ export function newestVersionWithData(
 }
 
 /**
- * Apply the standard endpoint's `mrv` rule locally, after the default release is
- * resolved — upstream's own `mrv` would pick periods across every release: keep
- * the N most recent periods holding a value for any requested country (and
- * dimension value), and every row at those periods — nulls included, as upstream
- * returns them for a country with no value at a period another country fills.
+ * How the latest-value selection reads a source-scoped row. Each country and
+ * dimension value is its own series, so an unpinned dimension answers `mrnev`
+ * with every value's own latest periods.
  */
-export function keepMostRecentPeriods(rows: readonly ScopedRow[], count: number): ScopedRow[] {
-  const recent = new Set(
-    [...new Set(rows.filter((row) => row.value !== null).map((row) => row.period))]
-      .sort(comparePeriodsDesc)
-      .slice(0, count),
-  );
-  return rows.filter((row) => recent.has(row.period));
-}
+export const SCOPED_ROW_READER: RowReader<ScopedRow> = {
+  series: (row) => `${row.countryId}|${row.dimension?.id ?? ''}`,
+  period: (row) => row.period,
+  hasValue: (row) => row.value !== null,
+};
 
 /**
  * Order rows the way the standard endpoint does — country name, then newest period

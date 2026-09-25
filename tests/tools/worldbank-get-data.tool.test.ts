@@ -1460,6 +1460,193 @@ describe('worldbankGetData', () => {
     },
   );
 
+  // ─── mrnev, lastUpdated, and upstream_inconsistent ─────────────────────────
+
+  it('forwards mrnev to the service and echoes it on both surfaces', async () => {
+    const getData = servesAsAsked(mockDataResult);
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({ getData } as never);
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const result = await runToolContract(
+      worldbankGetData,
+      { indicator_id: 'NY.GDP.PCAP.CD', countries: 'BR;ER', mrnev: 2 },
+      { context: { errors: worldbankGetData.errors } },
+    );
+
+    expect(getData.mock.calls[0]?.[0]).toMatchObject({ mrnev: 2 });
+    expect(getData.mock.calls[0]?.[0]).not.toHaveProperty('mrv');
+    expect(result.structuredContent).toMatchObject({ appliedFilters: { mrnev: 2 } });
+    const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+    expect(text).toContain(
+      '**Applied Filters:** indicator_id=NY.GDP.PCAP.CD, countries=BR;ER, mrnev=2,',
+    );
+  });
+
+  it.each([
+    [{ date_range: '2020:2022', mrnev: 1 }, 'date_range and mrnev'],
+    [{ mrv: 2, mrnev: 1 }, 'mrv and mrnev'],
+    [{ date_range: '2020:2022', mrv: 2, mrnev: 1 }, 'date_range and mrv and mrnev'],
+  ])('rejects %j as invalid_params before calling the service', async (scope, named) => {
+    const getData = servesAsAsked(mockDataResult);
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({ getData } as never);
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const result = await runToolContract(
+      worldbankGetData,
+      { indicator_id: 'NY.GDP.PCAP.CD', countries: 'US', ...scope },
+      { context: { errors: worldbankGetData.errors } },
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.ValidationError,
+        data: { reason: 'invalid_params', recovery: { hint: expect.stringContaining('mrnev') } },
+      },
+    });
+    const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+    expect(text).toContain(`this call sets ${named}`);
+    expect(getData).not.toHaveBeenCalled();
+  });
+
+  it('treats a blank date_range beside mrnev as absent', async () => {
+    const getData = servesAsAsked(mockDataResult);
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({ getData } as never);
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const result = await runToolContract(
+      worldbankGetData,
+      { indicator_id: 'NY.GDP.PCAP.CD', countries: 'US', date_range: '  ', mrnev: 1 },
+      { context: { errors: worldbankGetData.errors } },
+    );
+    expect(result.isError).toBeFalsy();
+    expect(getData.mock.calls[0]?.[0]).not.toHaveProperty('dateRange');
+  });
+
+  it('rejects mrnev below 1 and above 100 at the schema, and accepts both bounds', async () => {
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const base = { indicator_id: 'NY.GDP.PCAP.CD', countries: 'US' };
+    expect(() => worldbankGetData.input.parse({ ...base, mrnev: 0 })).toThrow();
+    expect(() => worldbankGetData.input.parse({ ...base, mrnev: 101 })).toThrow();
+    expect(() => worldbankGetData.input.parse({ ...base, mrnev: 1 })).not.toThrow();
+    expect(() => worldbankGetData.input.parse({ ...base, mrnev: 100 })).not.toThrow();
+  });
+
+  it('renders mrnev in the applied-filters trailer', async () => {
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const render = worldbankGetData.enrichmentTrailer?.appliedFilters?.render;
+    expect(
+      render?.({ indicatorId: 'SP.POP.TOTL', countries: 'USA', mrnev: 3, page: 1, perPage: 50 }),
+    ).toBe(
+      '**Applied Filters:** indicator_id=SP.POP.TOTL, countries=USA, mrnev=3, page=1, per_page=50',
+    );
+  });
+
+  it("carries the serving source's lastUpdated on both surfaces", async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      getData: servesAsAsked({ ...mockDataResult, lastUpdated: '2026-07-13' }),
+    } as never);
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const result = await runToolContract(worldbankGetData, {
+      indicator_id: 'NY.GDP.PCAP.CD',
+      countries: 'US',
+      mrnev: 1,
+    });
+
+    expect(result.structuredContent).toMatchObject({ lastUpdated: '2026-07-13' });
+    const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+    expect(text).toContain('2026-07-13');
+  });
+
+  it('omits lastUpdated when the service reports none', async () => {
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const result = await runToolContract(worldbankGetData, {
+      indicator_id: 'NY.GDP.PCAP.CD',
+      countries: 'US',
+    });
+    expect(result.structuredContent).not.toHaveProperty('lastUpdated');
+  });
+
+  it.each([
+    [{ mrnev: 1 }, 'mrnev=1'],
+    [{ mrv: 2 }, 'mrv=2'],
+  ])(
+    'explains an empty %j result as a series with no value for the countries',
+    async (scope, named) => {
+      const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+      vi.mocked(getWorldBankApiService).mockReturnValue({
+        getData: servesAsAsked({ ...mockDataResult, data: [], total: 0, nullCount: 0 }),
+      } as never);
+      const { worldbankGetData } = await import(
+        '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+      );
+      const ctx = createMockContext({ errors: worldbankGetData.errors });
+      await worldbankGetData.handler(
+        worldbankGetData.input.parse({ indicator_id: 'NY.GDP.PCAP.CD', countries: 'XK', ...scope }),
+        ctx,
+      );
+      const notice = getEnrichment(ctx).notice as string;
+      expect(notice).toContain(
+        `No requested country has a value anywhere in this series, so ${named}`,
+      );
+      expect(notice).toContain('worldbank_search_indicators');
+    },
+  );
+
+  it('delivers upstream_inconsistent with its recovery on both surfaces, marked retryable', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      getData: vi
+        .fn()
+        .mockRejectedValue(
+          new McpError(
+            JsonRpcErrorCode.ServiceUnavailable,
+            'The World Bank API answered the data request for date=2018:2020 twice with rows that do not fit it (rows outside date=2018:2020).',
+            { reason: 'upstream_inconsistent', date: '2018:2020', suspicion: 'rows outside' },
+          ),
+        ),
+    } as never);
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const result = await runToolContract(
+      worldbankGetData,
+      { indicator_id: 'NY.GDP.PCAP.CD', countries: 'AF;GN;UY', date_range: '2018:2020' },
+      { context: { errors: worldbankGetData.errors } },
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        data: {
+          reason: 'upstream_inconsistent',
+          date: '2018:2020',
+          indicatorId: 'NY.GDP.PCAP.CD',
+          recovery: { hint: expect.stringContaining('change the countries list') },
+        },
+      },
+    });
+    const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+    expect(text).toMatch(/Recovery:.*change the countries list/);
+    expect(text.trimEnd()).toMatch(/\(reason upstream_inconsistent · retryable\)$/);
+  });
+
   it('reads limit as per_page, on both surfaces', async () => {
     const getData = servesAsAsked(mockDataResult);
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');

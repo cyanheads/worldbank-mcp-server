@@ -37,7 +37,7 @@ World Bank Open Data across three separate upstream APIs — development indicat
 | `worldbank_get_country` | Fetch full metadata for a specific country or aggregate by ISO2, ISO3, or aggregate code |
 | `worldbank_search_indicators` | Search the 29,500+ indicator catalog by keyword, topic, or source |
 | `worldbank_get_indicator` | Fetch complete metadata for a single indicator: name, description, source, unit, and topics |
-| `worldbank_get_data` | Query indicator values for one or more countries across a time range or most-recent N values |
+| `worldbank_get_data` | Query indicator values for one or more countries across a time range, the most recent N periods, or each country's latest N non-empty values, annually, quarterly, or monthly |
 | `worldbank_get_poverty` | Poverty headcount, gap, and severity at any poverty line for economies and PIP's regional, income-group, and lending-group aggregates, plus the Gini coefficient and decile shares, from the Poverty and Inequality Platform |
 | `worldbank_search_projects` | Search the World Bank lending portfolio by text, country, region, status, financing window, and board approval date |
 
@@ -67,10 +67,9 @@ World Bank Open Data across three separate upstream APIs — development indicat
 
 ### `worldbank_list_countries` <sub>tool</sub>
 
-- Returns ISO codes, region, income level, lending type, capital, and coordinates; up to 150 per page (~50 KB), a larger `per_page` up to 300 served at 150, with a notice when the result runs past one page
-- Filterable by region code (`EAS`, `ECS`, `LCN`, `MEA`, `NAC`, `SAS`, `SSF`, plus membership groupings such as `AFE`, `AFW`, `ARB`, `EUU`, `LDC`), income level (`LIC`, `LMC`, `UMC`, `HIC`), and lending type (`IDX` IDA, `IBD` IBRD, `IDB` Blend, `LNX` not classified), combined by AND; an invalid region or income code is a typed `invalid_filter` error
-- Each country is listed once under `lending_type`, even though upstream sends every IDA, IBRD, and Blend entry twice
-- Individual countries only by default — `include_aggregates=true` adds regional, income-group, and world aggregate entries, distinguished by `isAggregate` (none match a `region` or `lending_type` filter)
+- Filters by region code (`EAS`, `SSF`, … plus membership groupings such as `AFE`, `EUU`, `LDC`), income level (`LIC`, `LMC`, `UMC`, `HIC`), and lending type (`IDX`, `IBD`, `IDB`, `LNX`), combined by AND; up to 150 per page (~50 KB)
+- Returns ISO codes, region, income level, lending type, capital, and coordinates; an invalid region or income code is a typed `invalid_filter` error
+- Individual countries only by default — `include_aggregates=true` adds regional, income-group, and world aggregates, flagged `isAggregate`
 
 ---
 
@@ -84,12 +83,9 @@ World Bank Open Data across three separate upstream APIs — development indicat
 
 ### `worldbank_search_indicators` <sub>tool</sub>
 
-- At least one of `query`, `topic_id`, or `source_id` is required; a topic and a source together narrow to indicators in both
-- Keyword search runs client-side over the full catalog (or the selected topic/source): every term must match the indicator ID, name, or description, in any word order, punctuation ignored — a query with no letters or digits is rejected
-- Ranking: exact ID/name matches first, then names starting with the phrase as whole words (`trade` starts `Trade (% of GDP)`, not `Trademark applications`), then whole-phrase matches, then matches where every term is a whole word of the ID or name, then other ID/name matches, then description-only matches; within each, World Development Indicators series lead, then other live sources, then archives, and a series leads its own breakdowns by sex, area, or age (`SP.DYN.LE00.IN` ahead of `SP.DYN.LE00.FE.IN`)
-- Each indicator ID appears once, even where the catalog publishes it under both a live source and an archived copy
-- Each result carries the first 150 characters of its description, marked `…` when cut; matching reads the whole description, and `worldbank_get_indicator` returns it
-- Echoes the applied `query`, `topic_id`, and `source_id`; paginated up to 100 per page
+- At least one of `query`, `topic_id`, or `source_id`; every keyword term must match the indicator ID, name, or description, in any order; up to 100 per page
+- Ranked exact ID/name matches first, then names starting with the phrase, then looser matches, then description-only ones; World Development Indicators series lead each tier, and a series leads its own breakdowns (`SP.DYN.LE00.IN` ahead of `SP.DYN.LE00.FE.IN`)
+- Each indicator ID appears once, with the first 150 characters of its description; `worldbank_get_indicator` returns the whole
 
 ---
 
@@ -103,36 +99,25 @@ World Bank Open Data across three separate upstream APIs — development indicat
 
 ### `worldbank_get_data` <sub>tool</sub>
 
-- Countries: single code, array, or a string separated by commas, semicolons, or pipes — ISO2, ISO3, regional/income aggregate codes, `WLD`, or `all` alone for every entry; an empty or separator-only value is rejected rather than read as `all`
-- A `country_not_found` error names only the codes the World Bank country listing lacks (`KE,ZZ` blames `ZZ`)
-- Every row carries both codes (`XD` / `HIC` for High income), including the income-group and Global Economic Monitor rows upstream sends with one of them missing
-- `date_range` (a year, quarter, or month, or a colon-separated range of the same period type, earliest first) and `mrv` (1–100 most recent values) are mutually exclusive; a reversed range or `all` mixed with codes is rejected before any request
-- Sparse cells return `value: null`; `nullCount` per page surfaces sparsity, and `isAggregate` distinguishes aggregates from individual countries
-- Indicators the standard endpoint doesn't serve (WDI Database Archives, PEFA, ICP, GDLD, International Debt Statistics: DSSI, Food Prices for Nutrition) are answered from their own catalog source instead — the response carries `sourceScoped`, naming the source and the applied `dimension_value` (a release, classification, sector, or counterpart area)
-- Paginated at up to 200 observations per page (~50 KB); a larger `per_page`, up to 1000, is served at 200, with a notice when the result runs past one page, and `page + 1` continues where a page ends. Echoes the normalized request as `appliedFilters`
+- `countries` as ISO2, ISO3, aggregate codes, `WLD`, or `all` alone; at most one of `date_range` (a year, quarter, or month, or a range of one type), `mrv` (the latest N periods across the countries), or `mrnev` (each country's own latest N values — Eritrea's GDP per capita at 2011, where `mrv` gives 2025 and null); `frequency` (`annual`, `quarterly`, `monthly`) picks the period form on series that publish several (`CPTOTSAXN` for Kenya, `monthly`, `mrv: 3` → 2026M07–M05); up to 200 observations a page (~50 KB)
+- Rows carry both country codes, `isAggregate`, and `value: null` for a missing cell, with `nullCount` per page and `lastUpdated`, the source's data vintage; every `date_range`, `mrv`, and `mrnev` read is checked for another query's cached answer and re-read once, and one that fails twice is an `upstream_inconsistent` error rather than a served result
+- Indicators the standard endpoint doesn't serve (WDI Database Archives, PEFA, ICP, GDLD, International Debt Statistics: DSSI, Food Prices for Nutrition) come from their own dataset, disclosed in `sourceScoped` with the release, classification, sector, or counterpart area applied (`dimension_value`)
 
 ---
 
 ### `worldbank_get_poverty` <sub>tool</sub>
 
-- Economies by ISO3 or ISO2 code — one code, an array, or a string separated by commas, semicolons, or pipes — from the Poverty and Inequality Platform (PIP) — a separate dataset from the WDI series the other tools read — including the economies PIP publishes only as model estimates (`AFG`, `GUM`)
-- PIP's own aggregates at any poverty line, in the same list: `WLD`, the World Bank regions (`SSF`, `EAS`, `AFE`, …), income groups (`HIC`, `LIC`, `LMIC`/`LMC`, `UMIC`/`UMC`), and lending groups (`IDX` for IDA only, `IDB`/`BLND` for IDA blend, `IBD`/`IBRD` for IBRD only, `REST`); aggregate rows are flagged `isAggregate` and carry `popInPoverty`. Income groups follow the fiscal-year classification PIP's release was built with (FY2026 for release 20260922) in every year. WDI's `IDA` (IDA total, ISO2 `XG`) is rejected — PIP computes no IDA total, so ask for `IDX` and `IDB` — as are FCV and PovcalNet groupings (`FCVY`, `SSA`) and WDI's `MIC`/`LMY`
-- Headcount ratio, poverty gap, severity, and the Watts index at any `poverty_line` (defaults to the international line of the applied PPP vintage); the same economy row carries the Gini coefficient, mean log deviation, polarization, and ten decile shares
-- `estimationType: "survey"` rows carry the full inequality block; `interpolation`/`extrapolation`/`CMD estimation` rows are gap-filled and null out `gini`, `mld`, `polarization`, and `decileShares` — `fill_gaps` (default `true`) controls whether gap-filled years are returned at all; aggregate rows are `actual`, `nowcast`, or `projection` and carry no inequality block
-- `welfare_type` (income/consumption) and `reporting_level` (national/urban/rural) narrow economy results and are rejected alongside an aggregate; `ppp_version` picks the PPP vintage, defaulting to the newest
-- `year` accepts a four-digit year, `all`, or `MRV`; `MRV` follows `fill_gaps` — each economy's latest estimate year when on, its latest survey year when off — and gives each aggregate its newest year. Coverage runs from 1963 to the last year of the current data release, and a year outside it fails with the accepted span named
-- Paginated locally, capped at 70 estimates per page (~50 KB) regardless of the requested `per_page`, since PIP itself has no pagination
+- Economies by ISO3 or ISO2 code, including those PIP publishes only as model estimates (`AFG`), plus PIP's aggregates: `WLD`, regions (`SSF`, `AFE`), income groups (`LMIC`/`LMC`), and lending groups (`IDX`, `IDB`, `IBD`, `REST`); `year` as a year, `all`, or `MRV`; any `poverty_line`, defaulting to the applied PPP vintage's international line; up to 70 estimates a page (~50 KB)
+- Headcount, gap, severity, and Watts index, plus the Gini coefficient, mean log deviation, polarization, and decile shares on survey rows; `estimationType` separates survey rows from gap-filled ones, whose inequality fields are null, and `isAggregate` flags aggregate rows
+- `fill_gaps` (default `true`) includes gap-filled years; `welfare_type` and `reporting_level` narrow economy results, and `ppp_version` picks the PPP vintage
 
 ---
 
 ### `worldbank_search_projects` <sub>tool</sub>
 
-- Free-text `query` across project names, abstracts, and objectives, combined by AND with exact filters on `countries`, `region` (World Bank operational regions), `status` (`Active`, `Closed`, `Dropped`, `Pipeline`), `financial_type` (financing windows `IBRD`, `IDA`, `Grants`, `Other`, combined as OR), and a board-approval date window (`approved_from`/`approved_to`, real calendar days, earliest first)
-- Countries by ISO3 or ISO2 code (`BRA`, `BR`) — an array, or a string separated by commas, semicolons, or pipes — resolved to the code the portfolio keys on — including the legacy codes it files Yemen, DR Congo, West Bank and Gaza, and Timor-Leste under (`RY`, `ZR`, `GZ`, `TP`) — or a World Bank regional code for multi-country operations (`3A`, `4E`); a WDI aggregate (`SSF`, `WLD`), an unknown code, or a value made only of separators is a typed `invalid_country_code` error, and each project's `countryCodes` reports the WDI ISO2 code so it chains into the other tools
-- A query the Projects API cannot parse (brackets or braces, an unmatched quote, a dangling AND/OR, a trailing NOT, `#`) is a typed `invalid_query` error, distinct from an upstream outage
-- Returns project ID, name, borrowing country/region, status, board approval and closing dates, the commitment amount in USD the project page reports with its IBRD, IDA, and grant parts, financing windows, major sectors, and a project-page URL — newest board approval first, with or without `query`
-- `include_abstract` (off by default) caps a page at 8 projects instead of 80 and cuts an abstract longer than 5,000 characters there (about 2% of them), naming the projects cut, to keep responses within ~50 KB; each project's URL has the full text
-- An empty result names which filter emptied it — when a country filter was in force, the response reports whether the codes match anything on their own
+- Free-text `query` combined by AND with `countries` (ISO3, ISO2, or a World Bank regional code such as `3A`), `region`, `status`, `financial_type`, and a board-approval window (`approved_from`/`approved_to`); up to 80 projects a page, newest approval first
+- Returns ID, name, country, region, status, dates, the commitment amount with its IBRD, IDA, and grant parts, financing windows, sectors, and a URL; `countryCodes` chain into the other tools, a bad code or unparseable query is a typed `invalid_country_code` / `invalid_query` error, and an empty result names the filter that emptied it
+- `include_abstract` (off by default) adds abstracts at 8 projects a page, each cut at 5,000 characters
 
 ---
 

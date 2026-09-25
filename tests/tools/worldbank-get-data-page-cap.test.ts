@@ -1,8 +1,8 @@
 /**
  * @fileoverview worldbank_get_data's served page size as a client receives it:
  * the tool runs against the real WorldBankApiService with only `fetch` stubbed,
- * so the cap, the upstream `per_page`, the local slice of a re-read date window,
- * and the disclosure on both surfaces all execute before anything is asserted.
+ * so the cap, the upstream `per_page`, the local slice of a date window read in
+ * full, and the disclosure on both surfaces all execute before anything is asserted.
  * @module tests/tools/worldbank-get-data-page-cap.test
  */
 
@@ -185,7 +185,7 @@ describe('worldbank_get_data served page size, end to end', () => {
     }
   });
 
-  it('slices a date window it re-reads in full at the served size', async () => {
+  it('slices a date window it reads in full at the served size', async () => {
     const pages = [
       await call({ per_page: 1000, date_range: '2020', page: 1 }),
       await call({ per_page: 1000, date_range: '2020', page: 2 }),

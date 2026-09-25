@@ -575,6 +575,178 @@ describe('WorldBankApiService.getData — source-scoped path', () => {
     expect(result.total).toBe(1);
   });
 
+  it("answers mrnev from the release it resolves, with the envelope's lastUpdated, from one data request", async () => {
+    route(
+      archiveRoutes({
+        '/v2/sources/57/country/SDN/series/SM.POP.REFG.OR': {
+          ...data('57', [
+            sdn('YR2014', '202503', 580000),
+            sdn('YR2015', '202503', 627080),
+            sdn('YR2016', '202503', null),
+            sdn('YR2016', '202601', null),
+          ]),
+          lastupdated: '2025-10-29',
+        },
+      }),
+    );
+    const result = await service.getData(
+      { indicatorId: 'SM.POP.REFG.OR', countries: ['SDN'], mrnev: 1, page: 1, perPage: 50 },
+      createMockContext(),
+    );
+    expect(result.sourceScoped?.dimension).toMatchObject({
+      selection: 'newest_with_data',
+      id: '202503',
+    });
+    expect(result.data.map((d) => `${d.date} ${d.value}`)).toEqual(['2015 627080']);
+    expect(result.lastUpdated).toBe('2025-10-29');
+    expect(requestedPaths().filter((p) => p.includes('/series/'))).toHaveLength(1);
+  });
+
+  it('selects mrv and mrnev among annual periods on a source that also carries monthly ones', async () => {
+    const ago = (time: string, value: number | null): Obs => ({
+      country: ['AGO', 'Angola'],
+      time,
+      dim: ['Counterpart-Area', 'WLD', 'World'],
+      value,
+    });
+    const dssi = (mode: 'mrv' | 'mrnev') => {
+      route({
+        '/v2/country/AO/indicator/DT.AMT.BLAT.CB.CD': NOT_SERVED,
+        '/v2/indicator/DT.AMT.BLAT.CB.CD': catalog([
+          'DT.AMT.BLAT.CB.CD',
+          'CB, bilateral',
+          '81',
+          'International Debt Statistics: DSSI',
+        ]),
+        '/v2/sources/81/concepts': concepts('81', 'International Debt Statistics: DSSI', [
+          'Country',
+          'Counterpart-Area',
+          'Series',
+          'Time',
+        ]),
+        '/v2/sources/81/counterpart-area': listing('81', 'counterpart-area', [['WLD', 'World']]),
+        '/v2/sources/81/country': listing('81', 'country', [['AGO', 'Angola']]),
+        '/v2/sources/81/time': listing('81', 'time', [
+          ['YR2018', '2018'],
+          ['YR2019', '2019'],
+          ['YR2027-M11', '2027 M11'],
+        ]),
+        '/v2/country': COUNTRY_INDEX,
+        '/v2/sources/81/country/AGO/series/DT.AMT.BLAT.CB.CD/counterpart-area/WLD': data('81', [
+          ago('YR2018', 4),
+          ago('YR2019', 10),
+          ago('YR2027-M11', 7),
+        ]),
+      });
+      return service.getData(
+        { indicatorId: 'DT.AMT.BLAT.CB.CD', countries: ['AO'], [mode]: 2, page: 1, perPage: 50 },
+        createMockContext(),
+      );
+    };
+    for (const mode of ['mrv', 'mrnev'] as const) {
+      const result = await dssi(mode);
+      expect(result.data.map((d) => `${d.date} ${d.value}`)).toEqual(['2019 10', '2018 4']);
+      // This fixture's envelope carries no last update, so none is reported.
+      expect(result.lastUpdated).toBeUndefined();
+    }
+  });
+
+  describe('frequency on a source whose periods come at all three forms', () => {
+    const SERIES_PATH = '/v2/sources/81/country/AGO/series/DT.AMT.BLAT.CB.CD';
+    const ago = (time: string, value: number | null): Obs => ({
+      country: ['AGO', 'Angola'],
+      time,
+      dim: ['Counterpart-Area', 'WLD', 'World'],
+      value,
+    });
+    const TOKENS: Array<[string, number | null]> = [
+      ['YR2018', 4],
+      ['YR2019', 10],
+      ['YR2019Q3', 3],
+      ['YR2019Q4', null],
+      ['YR2027-M10', 6],
+      ['YR2027-M11', 7],
+    ];
+
+    /** DSSI discovery, with a data route answering only the listed tokens at `timeSegment`. */
+    function dssiRoutes(timeSegment: string | undefined, tokens = TOKENS) {
+      const kept = timeSegment ? timeSegment.split('%3B') : tokens.map(([id]) => id);
+      const time = timeSegment ? `/time/${timeSegment}` : '';
+      route({
+        '/v2/country/AO/indicator/DT.AMT.BLAT.CB.CD': NOT_SERVED,
+        '/v2/indicator/DT.AMT.BLAT.CB.CD': catalog([
+          'DT.AMT.BLAT.CB.CD',
+          'CB, bilateral',
+          '81',
+          'International Debt Statistics: DSSI',
+        ]),
+        '/v2/sources/81/concepts': concepts('81', 'International Debt Statistics: DSSI', [
+          'Country',
+          'Counterpart-Area',
+          'Series',
+          'Time',
+        ]),
+        '/v2/sources/81/counterpart-area': listing('81', 'counterpart-area', [['WLD', 'World']]),
+        '/v2/sources/81/country': listing('81', 'country', [['AGO', 'Angola']]),
+        '/v2/sources/81/time': listing(
+          '81',
+          'time',
+          tokens.map(([id]) => [id, id.slice(2)]),
+        ),
+        '/v2/country': COUNTRY_INDEX,
+        [`${SERIES_PATH}${time}/counterpart-area/WLD`]: data(
+          '81',
+          tokens.filter(([id]) => kept.includes(id)).map(([id, value]) => ago(id, value)),
+        ),
+      });
+    }
+
+    const getData = (options: Record<string, unknown>) =>
+      service.getData(
+        { indicatorId: 'DT.AMT.BLAT.CB.CD', countries: ['AO'], page: 1, perPage: 50, ...options },
+        createMockContext(),
+      );
+    const cellsOf = (result: { data: Array<{ date: string; value: number | null }> }) =>
+      result.data.map((d) => `${d.date} ${d.value}`);
+    const dataPaths = () => requestedPaths().filter((p) => p.includes('/series/'));
+
+    it('requests only the tokens at the frequency, and selects mrv among them', async () => {
+      dssiRoutes('YR2027-M10%3BYR2027-M11');
+      const result = await getData({ frequency: 'month', mrv: 1 });
+
+      expect(cellsOf(result)).toEqual(['2027M11 7']);
+      expect(dataPaths()).toEqual([
+        `${SERIES_PATH}/time/YR2027-M10%3BYR2027-M11/counterpart-area/WLD`,
+      ]);
+      expect(result.periodForms).toEqual(['year', 'quarter', 'month']);
+    });
+
+    it('answers mrnev at a quarterly frequency from its own quarters', async () => {
+      dssiRoutes('YR2019Q3%3BYR2019Q4');
+      expect(cellsOf(await getData({ frequency: 'quarter', mrnev: 1 }))).toEqual(['2019Q3 3']);
+    });
+
+    it('returns the whole series at the frequency with neither mrv nor mrnev', async () => {
+      dssiRoutes('YR2018%3BYR2019');
+      expect(cellsOf(await getData({ frequency: 'year' }))).toEqual(['2019 10', '2018 4']);
+    });
+
+    it('keeps its annual default without frequency, reading every token', async () => {
+      dssiRoutes(undefined);
+      expect(cellsOf(await getData({ mrv: 1 }))).toEqual(['2019 10']);
+    });
+
+    it('sends no data request for a frequency the source does not publish, and reports the forms it does', async () => {
+      const noQuarters = TOKENS.filter(([id]) => !id.includes('Q'));
+      dssiRoutes(undefined, noQuarters);
+      const result = await getData({ frequency: 'quarter', mrv: 1 });
+
+      expect(result).toMatchObject({ data: [], total: 0 });
+      expect(result.periodForms).toEqual(['year', 'month']);
+      expect(dataPaths()).toEqual([]);
+    });
+  });
+
   it('returns every multi-valued classification unpinned, each row labelled, in listing order', async () => {
     const usa = (id: string, value: number): Obs => ({
       country: ['USA', 'United States'],

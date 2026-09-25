@@ -17,8 +17,46 @@ import {
   isAllSelector,
   splitCountryCodes,
 } from '@/services/worldbank/identifiers.js';
+import { type PeriodForm, parseDateWindow, periodForm } from '@/services/worldbank/periods.js';
 import type { SourceScopedDisclosure } from '@/services/worldbank/types.js';
 import { type DataResult, getWorldBankApiService } from '@/services/worldbank/worldbank-service.js';
+
+/** The `frequency` values, each naming the period form it selects. */
+const FREQUENCY_FORM = { annual: 'year', quarterly: 'quarter', monthly: 'month' } as const;
+type Frequency = keyof typeof FREQUENCY_FORM;
+const FREQUENCIES = Object.keys(FREQUENCY_FORM) as [Frequency, ...Frequency[]];
+
+/** The `frequency` value that selects each period form. */
+const FORM_FREQUENCY: Record<PeriodForm, Frequency> = {
+  year: 'annual',
+  quarter: 'quarterly',
+  month: 'monthly',
+};
+
+/**
+ * The notice for a quarter or month `date_range` whose rows are all null, which
+ * is how a source publishing several forms answers a form a series lacks: it
+ * spells the same span at the other two forms (`2024Q1:2024Q4` → `2024M01:2024M12`
+ * and `2024`). Undefined for a year window, which selects the annual rows.
+ */
+function allNullWindowNotice(dateRange: string): string | undefined {
+  const form = periodForm(dateRange.split(':')[0] ?? '');
+  const span = parseDateWindow(dateRange);
+  if (!span || (form !== 'quarter' && form !== 'month')) return;
+  const year = (month: number) => Math.floor(month / 12);
+  const spell = (first: string, last: string) => `"${first === last ? first : `${first}:${last}`}"`;
+  const at = {
+    year: (m: number) => String(year(m)),
+    quarter: (m: number) => `${year(m)}Q${Math.floor((m % 12) / 3) + 1}`,
+    month: (m: number) => `${year(m)}M${String((m % 12) + 1).padStart(2, '0')}`,
+  };
+  const other = form === 'quarter' ? 'month' : 'quarter';
+  return (
+    `Every observation in date_range "${dateRange}" is null: this series may not publish ${FORM_FREQUENCY[form]} values. ` +
+    `Ask for the same span by ${other} (${spell(at[other](span.start), at[other](span.end))}) ` +
+    `or by year (${spell(at.year(span.start), at.year(span.end))}), or use frequency with mrv or mrnev for the latest values at each form.`
+  );
+}
 
 /**
  * `"all"` is a keyword for the whole set, not a code. Inside a list upstream
@@ -56,7 +94,7 @@ const EMPTY_COUNTRIES_MESSAGE = 'Provide at least one country code, or "all" for
 
 export const worldbankGetData = tool('worldbank_get_data', {
   title: 'Get World Bank Indicator Data',
-  description: `Query World Bank indicator values for one or more countries across a time range — the primary data-access tool; find indicator_id values with worldbank_search_indicators. Observations carry a null value where data is not available for a country×year cell, which is common for sparse series. Set either date_range (historical analysis) or mrv (most recent N values), not both. For "all" countries, page through the results at up to ${MAX_OBSERVATIONS_PER_PAGE} per page, since the API returns several hundred entries per indicator. Indicators the standard data endpoint does not serve — WDI Database Archives, PEFA, ICP, GDLD, International Debt Statistics: DSSI, Food Prices for Nutrition — are answered from their own dataset instead; the response then carries sourceScoped, naming that dataset and the release, classification, sector, or counterpart area applied (see dimension_value), because those values can be archived or superseded figures rather than current ones.`,
+  description: `Query World Bank indicator values for one or more countries across a time range — the primary data-access tool; find indicator_id values with worldbank_search_indicators. Observations carry a null value where data is not available for a country×year cell, which is common for sparse series. Set at most one of date_range (a time window), mrv (the latest N periods across the requested countries), or mrnev (each country's own latest N values). Some series, such as Global Economic Monitor's, publish quarterly or monthly values beside annual ones: frequency picks the form mrv and mrnev select from (annual by default), and a date_range's own form (2024, 2024Q1, 2024M01) picks it for a window. lastUpdated gives the serving source's last update date, the data vintage to cite. For "all" countries, page through the results at up to ${MAX_OBSERVATIONS_PER_PAGE} per page, since the API returns several hundred entries per indicator. Indicators the standard data endpoint does not serve — WDI Database Archives, PEFA, ICP, GDLD, International Debt Statistics: DSSI, Food Prices for Nutrition — are answered from their own dataset instead; the response then carries sourceScoped, naming that dataset and the release, classification, sector, or counterpart area applied (see dimension_value), because those values can be archived or superseded figures rather than current ones.`,
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   inputAliases: { limit: 'per_page' },
   input: z.object({
@@ -104,7 +142,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
       )
       .optional()
       .describe(
-        'Time window to filter observations to. Accepts a whole year (`2020`), a quarter (`2020Q1`), or a month (`2020M03`), or a range of two periods of the same type separated by a colon, earliest first (`2010:2023`, `2020Q1:2021Q4`, `2020M01:2020M06`); a range running latest first is rejected. A window and an observation match whenever the periods overlap, so a year window also selects the quarters and months inside it. A window covering no part of the series returns zero observations rather than the full series. Mutually exclusive with mrv.',
+        "Time window to filter observations to. Accepts a whole year (`2020`), a quarter (`2020Q1`), or a month (`2020M03`), or a range of two periods of the same type separated by a colon, earliest first (`2010:2023`, `2020Q1:2021Q4`, `2020M01:2020M06`); a range running latest first is rejected. On a series publishing more than one period form, the window's form picks which: `2024` returns the annual value, `2024Q1:2024Q4` the quarters, `2024M01:2024M12` the months, and a quarter or month window is null-filled where the series has none (a notice then names the other forms). On a series with one form, a window at another form keeps the periods it overlaps (`2019:2021` on a quarterly series returns its twelve quarters). A window covering no part of the series returns zero observations rather than the full series. Mutually exclusive with mrv, mrnev, and frequency.",
       ),
     mrv: z
       .number()
@@ -113,7 +151,27 @@ export const worldbankGetData = tool('worldbank_get_data', {
       .max(100)
       .optional()
       .describe(
-        'Return the N most recent periods (1–100) holding a value for any requested country, clamped to the length of the series. Every requested country comes back at those periods, null where it has no value there rather than with its own older values. Rows are mrv × countries, so page through them with per_page. Mutually exclusive with date_range.',
+        "Return the N most recent periods (1–100) holding a value for any requested country, clamped to the length of the series. Every requested country comes back at those periods, null where it has no value there rather than with its own older values; mrnev returns each country's own latest values instead. The periods are annual unless frequency names another form (a series with no annual periods keeps its own). Rows are mrv × countries, so page through them with per_page. Mutually exclusive with date_range and mrnev.",
+      ),
+    mrnev: z
+      .number()
+      .int()
+      .min(1)
+      .max(100)
+      .optional()
+      .describe(
+        "Return each requested country's own N most recent periods (1–100) holding a value — its latest non-null observations, however far back they sit. A country with fewer values in the series returns the ones it has, and a country with none returns no rows. The periods are annual unless frequency names another form (a series with no annual periods keeps its own). Mutually exclusive with date_range and mrv.",
+      ),
+    frequency: z
+      .union([
+        z.literal(''),
+        z
+          .enum(FREQUENCIES)
+          .describe('annual (2025), quarterly (2025Q4), or monthly (2025M12) periods.'),
+      ])
+      .optional()
+      .describe(
+        'The period form to return, for series such as Global Economic Monitor\'s that publish quarterly or monthly values beside annual ones: annual (the default), quarterly, or monthly. With mrv or mrnev it picks the form they select from — frequency "monthly" with mrv 3 returns the three latest months, where mrv 3 alone returns the three latest years. With neither, it returns the whole series at that form. A series that does not publish the form returns an empty result with a notice saying so. Mutually exclusive with date_range, whose own form (2024, 2024Q1, 2024M01) picks the periods of a window.',
       ),
     dimension_value: z
       .string()
@@ -250,6 +308,16 @@ export const worldbankGetData = tool('worldbank_get_data', {
           .number()
           .optional()
           .describe('Most-recent-values count applied, omitted when none was requested.'),
+        mrnev: z
+          .number()
+          .optional()
+          .describe('Most-recent-non-empty-values count applied, omitted when none was requested.'),
+        frequency: z
+          .enum(FREQUENCIES)
+          .optional()
+          .describe(
+            'Period form applied (annual, quarterly, monthly), omitted when none was requested.',
+          ),
         dimensionValue: z
           .string()
           .optional()
@@ -275,11 +343,17 @@ export const worldbankGetData = tool('worldbank_get_data', {
       .number()
       .describe('Page number requested — past totalPages when the request ran off the end.'),
     totalPages: z.number().describe('Total number of pages.'),
+    lastUpdated: z
+      .string()
+      .optional()
+      .describe(
+        'Last update date of the World Bank source that served these values (YYYY-MM-DD) — the data vintage to cite with them. Omitted when upstream reports none, as for an empty result.',
+      ),
     notice: z
       .string()
       .optional()
       .describe(
-        'Recovery hint for an empty result set — how to broaden the query when nothing matched, or the page range that exists when the requested page is past the end — a page size reduced to the page cap, and, for source-scoped data, the requested country codes the serving dataset publishes nothing for.',
+        'Recovery hint for an empty result set — how to broaden the query when nothing matched, whether the series publishes the requested frequency, or the page range that exists when the requested page is past the end — a quarter or month date_range whose observations are all null, with the same span at the other period forms, a page size reduced to the page cap, and, for source-scoped data, the requested country codes the serving dataset publishes nothing for.',
       ),
   },
 
@@ -297,6 +371,8 @@ export const worldbankGetData = tool('worldbank_get_data', {
           `countries=${filters.countries}`,
           ...(filters.dateRange === undefined ? [] : [`date_range=${filters.dateRange}`]),
           ...(filters.mrv === undefined ? [] : [`mrv=${filters.mrv}`]),
+          ...(filters.mrnev === undefined ? [] : [`mrnev=${filters.mrnev}`]),
+          ...(filters.frequency === undefined ? [] : [`frequency=${filters.frequency}`]),
           ...(filters.dimensionValue === undefined
             ? []
             : [`dimension_value=${filters.dimensionValue}`]),
@@ -310,8 +386,9 @@ export const worldbankGetData = tool('worldbank_get_data', {
     {
       reason: 'invalid_params',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'Both date_range and mrv are provided simultaneously.',
-      recovery: 'Remove date_range to use mrv, or remove mrv to use date_range.',
+      when: 'More than one of date_range, mrv, and mrnev is provided, or frequency is provided with date_range.',
+      recovery:
+        "Keep one of date_range, mrv, or mrnev and remove the others: date_range for a time window, mrv for the latest periods across the countries, mrnev for each country's own latest values. Drop frequency when date_range is set: the window's own period form (2024, 2024Q1:2024Q4, 2024M01:2024M12) already picks the periods.",
     },
     {
       reason: 'mixed_all_selector',
@@ -380,13 +457,35 @@ export const worldbankGetData = tool('worldbank_get_data', {
       recovery:
         'Look the indicator up with worldbank_search_indicators and the codes with worldbank_list_countries before retrying.',
     },
+    {
+      reason: 'upstream_inconsistent',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: "The World Bank API answered a data read, and its one re-read, with rows that do not fit the request — its response cache served another query's result — so nothing was served.",
+      recovery:
+        'Retry later, or change the countries list, which sends a request the stale cached answer does not match.',
+      retryable: true,
+    },
   ],
 
   async handler(input, ctx) {
-    if (input.date_range && input.mrv !== undefined) {
+    const dateRange = input.date_range?.trim() || undefined;
+    const scopes = [
+      ...(dateRange ? ['date_range'] : []),
+      ...(input.mrv === undefined ? [] : ['mrv']),
+      ...(input.mrnev === undefined ? [] : ['mrnev']),
+    ];
+    if (scopes.length > 1) {
       throw ctx.fail(
         'invalid_params',
-        'Provide either date_range or mrv, not both.',
+        `Provide at most one of date_range, mrv, and mrnev; this call sets ${scopes.join(' and ')}.`,
+        ctx.recoveryFor('invalid_params'),
+      );
+    }
+    const frequency = input.frequency || undefined;
+    if (frequency && dateRange) {
+      throw ctx.fail(
+        'invalid_params',
+        `frequency "${frequency}" cannot be combined with date_range "${dateRange}": the window's own period form picks its periods.`,
         ctx.recoveryFor('invalid_params'),
       );
     }
@@ -404,7 +503,6 @@ export const worldbankGetData = tool('worldbank_get_data', {
       );
     }
 
-    const dateRange = input.date_range?.trim() ? input.date_range.trim() : undefined;
     const dimensionValue = input.dimension_value?.trim() ? input.dimension_value.trim() : undefined;
     const perPage = input.per_page ?? getServerConfig().defaultPerPage;
     const codes = splitCountryCodes(input.countries);
@@ -439,6 +537,8 @@ export const worldbankGetData = tool('worldbank_get_data', {
       countries: countryCodes,
       dateRange,
       mrv: input.mrv,
+      mrnev: input.mrnev,
+      frequency,
       dimensionValue,
       page: input.page,
     });
@@ -451,6 +551,8 @@ export const worldbankGetData = tool('worldbank_get_data', {
           countries: codes,
           ...(dateRange !== undefined && { dateRange }),
           ...(input.mrv !== undefined && { mrv: input.mrv }),
+          ...(input.mrnev !== undefined && { mrnev: input.mrnev }),
+          ...(frequency !== undefined && { frequency: FREQUENCY_FORM[frequency] }),
           ...(dimensionValue !== undefined && { dimensionValue }),
           page: input.page,
           perPage,
@@ -512,6 +614,13 @@ export const worldbankGetData = tool('worldbank_get_data', {
             indicatorId: input.indicator_id,
           });
         }
+        if (reason === 'upstream_inconsistent') {
+          throw ctx.fail('upstream_inconsistent', err.message, {
+            ...err.data,
+            ...ctx.recoveryFor('upstream_inconsistent'),
+            indicatorId: input.indicator_id,
+          });
+        }
       }
       throw err;
     }
@@ -522,6 +631,8 @@ export const worldbankGetData = tool('worldbank_get_data', {
         countries: countryCodes,
         ...(dateRange !== undefined && { dateRange }),
         ...(input.mrv !== undefined && { mrv: input.mrv }),
+        ...(input.mrnev !== undefined && { mrnev: input.mrnev }),
+        ...(frequency !== undefined && { frequency }),
         ...(dimensionValue !== undefined && { dimensionValue }),
         page: input.page,
         perPage: result.perPage,
@@ -529,15 +640,37 @@ export const worldbankGetData = tool('worldbank_get_data', {
       },
     });
     ctx.enrich({ totalCount: result.total, currentPage: result.page, totalPages: result.pages });
+    if (result.lastUpdated) ctx.enrich({ lastUpdated: result.lastUpdated });
 
+    const latest =
+      input.mrnev !== undefined
+        ? `mrnev=${input.mrnev}`
+        : input.mrv !== undefined
+          ? `mrv=${input.mrv}`
+          : undefined;
     const notices: string[] = [];
-    if (result.total === 0) {
+    const published = (result.periodForms ?? []).map((form) => FORM_FREQUENCY[form]);
+    if (result.total === 0 && frequency && published.length > 0 && !published.includes(frequency)) {
+      notices.push(
+        `"${result.indicator.id}" publishes no ${frequency} periods — only ${published.join(' and ')} ones — ` +
+          `so frequency "${frequency}" has nothing to return. Use frequency "${published[0]}", or omit frequency.`,
+      );
+    } else if (result.total === 0 && frequency) {
+      const others = FREQUENCIES.filter((f) => f !== frequency).map((f) => `"${f}"`);
+      notices.push(
+        `No requested country has a ${frequency} value in this series, which may not publish ${frequency} figures at all. ` +
+          `Try frequency ${others.join(' or ')}, or other countries.`,
+      );
+    } else if (result.total === 0) {
       notices.push(
         result.dateFilterDropped
           ? `No observations fall inside date_range "${dateRange}", though the series does carry data outside it. ` +
-              'Broaden date_range or use mrv to fetch the most recent available values.'
-          : 'No observations returned for the requested filter. ' +
-              'Try broadening the date range, removing date filters, or using mrv=5 to fetch the most recent available values.',
+              "Broaden date_range or use mrnev to fetch each country's latest available values."
+          : latest
+            ? `No requested country has a value anywhere in this series, so ${latest} had nothing to select. ` +
+              'Try other countries, frequency "quarterly" or "monthly" for a series publishing those, or a better-covered indicator from worldbank_search_indicators.'
+            : 'No observations returned for the requested filter. ' +
+              "Try broadening the date range, removing date filters, or using mrnev=1 to fetch each country's latest available value.",
       );
     } else if (result.data.length === 0) {
       notices.push(
@@ -550,6 +683,8 @@ export const worldbankGetData = tool('worldbank_get_data', {
         }),
       );
     }
+    const allNull = dateRange && result.allNull ? allNullWindowNotice(dateRange) : undefined;
+    if (allNull) notices.push(allNull);
     const reduced = pageSizeReducedNotice({
       requested: perPage,
       served: result.perPage,

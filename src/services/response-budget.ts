@@ -24,8 +24,9 @@
 export const RESPONSE_BUDGET_KB = 50;
 
 /**
- * Most observations one worldbank_get_data page holds, on every data path — the
- * standard endpoint, a re-read date window, and the source-scoped API.
+ * Most observations one worldbank_get_data page holds, on every data path — an
+ * upstream page of the whole series, the rows a date window or `mrv`/`mrnev`
+ * selects, and the source-scoped API's.
  */
 export const MAX_OBSERVATIONS_PER_PAGE = 200;
 

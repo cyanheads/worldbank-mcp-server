@@ -2022,19 +2022,29 @@ describe('WorldBankApiService', () => {
     expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(3);
   });
 
-  it('getData: returns empty data (no throw) when items array is empty', async () => {
-    fetchWithTimeoutMock.mockResolvedValueOnce({
-      text: async () => JSON.stringify([pagingObj({ total: 0 }), null]),
-    });
+  it('getData: returns empty data (no throw) once the re-read an empty envelope gets matches it', async () => {
+    mockResponse([pagingObj({ total: 0 }), null]);
+    mockResponse([pagingObj({ total: 0 }), null]);
     const ctx = createMockContext();
     const result = await service.getData(
-      { indicatorId: 'NY.GDP.PCAP.CD', countries: 'US', page: 1, perPage: 50 },
+      {
+        indicatorId: 'NY.GDP.PCAP.CD',
+        countries: 'US',
+        dateRange: '2018:2020',
+        page: 1,
+        perPage: 50,
+      },
       ctx,
     );
     expect(result.data).toHaveLength(0);
     expect(result.nullCount).toBe(0);
     expect(result.total).toBe(0);
     expect(result.indicator.id).toBe('NY.GDP.PCAP.CD');
+    // An empty envelope is suspect until a second read at another page size agrees.
+    const sizes = fetchWithTimeoutMock.mock.calls.map((c) =>
+      new URL(c[0] as string).searchParams.get('per_page'),
+    );
+    expect(sizes).toEqual(['20000', '19999']);
   });
 
   /**
@@ -2220,7 +2230,8 @@ describe('WorldBankApiService', () => {
     [['za', 'ls'], 'za;LSO'],
     ['LS', 'LSO'],
   ])('getData: sends Lesotho in %j as LSO', async (countries, sent) => {
-    mockResponse([pagingObj({ total: 0 }), null]);
+    mockResponse([pagingObj({ total: 1 }), [rawDataPoint('LS', 'LSO', 'Lesotho', '2020')]]);
+    mockAggregateLookup();
     await service.getData(
       { indicatorId: 'SP.POP.TOTL', countries, page: 1, perPage: 50 },
       createMockContext(),
@@ -2228,22 +2239,26 @@ describe('WorldBankApiService', () => {
     expect(sentCountrySegments()).toEqual([sent]);
   });
 
-  it('getData: sends Lesotho as LSO on the re-read a date window triggers too', async () => {
-    const rows = ['2021', '2019'].map((date) => rawDataPoint('LS', 'LSO', 'Lesotho', date));
-    mockResponse([pagingObj({ total: 2, pages: 2 }), rows.slice(0, 1)]);
-    mockResponse([pagingObj({ total: 2, pages: 1 }), rows]); // exhaustive re-read
+  it('getData: sends Lesotho as LSO on the widened read mrv falls back to too', async () => {
+    // Neither economy holds a value in the window, so mrv reads the whole list over the whole series.
+    const inWindow = ['ZA', 'LS'].map((code) => rawDataPoint(code, `${code}X`, code, '2020', null));
+    const whole = [
+      ...inWindow,
+      rawDataPoint('ZA', 'ZAX', 'ZA', '1999', 7),
+      rawDataPoint('LS', 'LSX', 'LS', '1999', null),
+    ];
+    mockResponse([pagingObj({ total: 2 }), inWindow]);
+    mockResponse([pagingObj({ total: 4 }), whole]);
     mockAggregateLookup();
-    await service.getData(
-      {
-        indicatorId: 'SP.POP.TOTL',
-        countries: ['ZA', 'LS'],
-        dateRange: '2020:2021',
-        page: 1,
-        perPage: 1,
-      },
+    const result = await service.getData(
+      { indicatorId: 'SP.POP.TOTL', countries: ['ZA', 'LS'], mrv: 1, page: 1, perPage: 50 },
       createMockContext(),
     );
     expect(sentCountrySegments()).toEqual(['ZA;LSO', 'ZA;LSO']);
+    expect(result.data.map((d) => `${d.countryCode} ${d.date} ${d.value}`)).toEqual([
+      'ZA 1999 7',
+      'LS 1999 null',
+    ]);
   });
 
   it('getData: names a rejected list by the codes sent, not the LSO sent for Lesotho', async () => {
@@ -2407,8 +2422,10 @@ describe('WorldBankApiService', () => {
       rawDataPoint('KE', 'KEN', 'Kenya', '2025', 57532493),
       rawDataPoint('KE', 'KEN', 'Kenya', '2024', 56432944),
     ];
-    mockResponse([pagingObj({ total: 66, pages: 14 }), series]);
-    mockResponse([pagingObj({ total: 66, pages: 1 }), series]); // exhaustive re-read
+    // Rows outside the window at its own form are suspect until a re-read at
+    // another page size returns the same series.
+    mockResponse([pagingObj({ total: 2, pages: 1 }), series]);
+    mockResponse([pagingObj({ total: 2, pages: 1 }), series]);
     const ctx = createMockContext();
     const result = await service.getData(
       {
@@ -2456,22 +2473,18 @@ describe('WorldBankApiService', () => {
 
   /**
    * A year window is finer than upstream applies to a quarterly series: it
-   * discards the filter and pages the whole series newest-first, so the matches
-   * sit past page 1 and upstream's totals describe the unfiltered series.
+   * discards the filter and returns the whole series newest-first, so upstream's
+   * totals describe the unfiltered series.
    */
   const QUARTERS = ['2023Q1', '2022Q4', '2021Q3', '2021Q1', '2020Q2'];
 
-  function mockDroppedQuarterlySeries(firstPage: string[]) {
+  function mockDroppedQuarterlySeries() {
     const rows = QUARTERS.map((date) => rawDataPoint('US', 'USA', 'United States', date, 1));
-    mockResponse([
-      pagingObj({ total: 5, pages: 3 }),
-      rows.filter((r) => firstPage.includes(r.date)),
-    ]);
-    mockResponse([pagingObj({ total: 5, pages: 1 }), rows]); // exhaustive re-read
+    mockResponse([pagingObj({ total: 5, pages: 1 }), rows]);
   }
 
-  it('getData: recovers in-window observations upstream dropped past the first page', async () => {
-    mockDroppedQuarterlySeries(['2023Q1', '2022Q4']);
+  it('getData: keeps the quarters inside a year window upstream dropped, from one request', async () => {
+    mockDroppedQuarterlySeries();
     mockAggregateLookup();
     const ctx = createMockContext();
     const result = await service.getData(
@@ -2482,10 +2495,12 @@ describe('WorldBankApiService', () => {
     expect(result.total).toBe(3);
     expect(result.pages).toBe(2);
     expect(result.dateFilterDropped).toBe(true);
+    // Quarters answering a year window are no sign of another request's body: no re-read.
+    expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(2);
   });
 
   it('getData: paginates the matched window, not the series upstream returned', async () => {
-    mockDroppedQuarterlySeries(['2021Q3', '2021Q1']);
+    mockDroppedQuarterlySeries();
     mockAggregateLookup();
     const ctx = createMockContext();
     const result = await service.getData(
@@ -2514,9 +2529,12 @@ describe('WorldBankApiService', () => {
     [201, 200],
     [1000, 200],
   ])(
-    'getData: asks upstream for per_page=%i as %i rows and reports the served size',
+    'getData: asks upstream for per_page=%i as %i rows of the whole span, one page',
     async (perPage, served) => {
-      mockResponse([pagingObj({ total: 450, pages: Math.ceil(450 / served) }), observations(3)]);
+      mockResponse([
+        pagingObj({ total: 450, pages: Math.ceil(450 / served), per_page: served }),
+        observations(served),
+      ]);
       mockAggregateLookup();
       const result = await service.getData(
         { indicatorId: 'SP.POP.TOTL', countries: 'all', page: 1, perPage },
@@ -2525,15 +2543,32 @@ describe('WorldBankApiService', () => {
 
       const url = new URL(fetchWithTimeoutMock.mock.calls[0]?.[0] as string);
       expect(url.searchParams.get('per_page')).toBe(String(served));
+      expect(url.searchParams.get('date')).toBe('1900:2100');
       expect(result).toMatchObject({ perPage: served, total: 450 });
+      expect(result.data).toHaveLength(served);
     },
   );
 
-  it('getData: slices a re-read date window at the served size, so pages neither skip nor repeat', async () => {
+  it('getData: reads every upstream page of a window longer than one request', async () => {
+    const series = observations(3);
+    mockResponse([pagingObj({ page: 1, pages: 2, total: 3 }), series.slice(0, 2)]);
+    mockResponse([pagingObj({ page: 2, pages: 2, total: 3 }), series.slice(2)]);
+    mockAggregateLookup();
+    const result = await service.getData(
+      { indicatorId: 'SP.POP.TOTL', countries: 'all', dateRange: '2020', page: 1, perPage: 50 },
+      createMockContext(),
+    );
+    expect(result.data.map((d) => d.countryCode)).toEqual(['C001', 'C002', 'C003']);
+    const pagesSent = fetchWithTimeoutMock.mock.calls
+      .slice(0, 2)
+      .map((c) => new URL(c[0] as string).searchParams.get('page'));
+    expect(pagesSent).toEqual(['1', '2']);
+  });
+
+  it('getData: slices a date window at the served size, so pages neither skip nor repeat', async () => {
     const series = observations(450);
     const pageAt = async (page: number) => {
-      mockResponse([pagingObj({ page, pages: 3, total: 450 }), series.slice(0, 200)]);
-      mockResponse([pagingObj({ total: 450, pages: 1 }), series]); // exhaustive re-read
+      mockResponse([pagingObj({ total: 450, pages: 1 }), series]);
       // The country listing is read once and cached for the calls after it.
       if (page === 1) mockAggregateLookup();
       return service.getData(
@@ -2554,52 +2589,45 @@ describe('WorldBankApiService', () => {
 
   // ─── getData: exhausted pages ─────────────────────────────────────────────
 
-  it('getData: reports upstream paging for a page past the end with no date window', async () => {
-    mockResponse([pagingObj({ page: 9, pages: 3, total: 125 }), null]);
+  it("getData: reports upstream's totals for a page past the end with no date window", async () => {
+    mockResponse([pagingObj({ page: 9, total: 125, pages: 3 }), null]);
     const result = await service.getData(
-      { indicatorId: 'SP.POP.TOTL', countries: 'US', page: 9, perPage: 50 },
+      { indicatorId: 'SP.POP.TOTL', countries: 'all', page: 9, perPage: 50 },
       createMockContext(),
     );
     expect(result).toMatchObject({ data: [], total: 125, pages: 3, page: 9 });
+    // No country listing is read for a page with no rows on it.
     expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(1);
   });
 
-  it('getData: skips the re-read when upstream matched nothing under a date window', async () => {
+  it('getData: re-reads a date window upstream matched nothing in, once, then reports it empty', async () => {
+    mockResponse([pagingObj({ total: 0, pages: 0 }), null]);
     mockResponse([pagingObj({ total: 0, pages: 0 }), null]);
     const result = await service.getData(
       { indicatorId: 'SP.POP.TOTL', countries: 'US', dateRange: '2020', page: 1, perPage: 50 },
       createMockContext(),
     );
     expect(result).toMatchObject({ data: [], total: 0 });
-    expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(1);
+    expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(2);
   });
 
   it('getData: keeps an honored window total on a page past the end', async () => {
     const rows = ['2021', '2020'].map((date) => rawDataPoint('US', 'USA', 'United States', date));
-    mockResponse([pagingObj({ page: 3, pages: 1, total: 2 }), null]);
-    mockResponse([pagingObj({ total: 2, pages: 1 }), rows]); // exhaustive re-read
+    mockResponse([pagingObj({ total: 2, pages: 1 }), rows]);
     const result = await service.getData(
       { indicatorId: 'SP.POP.TOTL', countries: 'US', dateRange: '2020:2021', page: 3, perPage: 50 },
       createMockContext(),
     );
     expect(result).toMatchObject({ data: [], total: 2, pages: 1, page: 3 });
     expect(result.dateFilterDropped).toBe(false);
+    expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(1);
   });
 
-  it.each([
-    // Page 3 is still inside the raw series' page count: upstream returns rows.
-    [3, QUARTERS.slice(4)],
-    // Page 50 is past the raw series' page count too: upstream returns none.
-    [50, []],
-  ])(
+  it.each([3, 50])(
     'getData: reports the filtered total on page %i when upstream drops the date window',
-    async (page, upstreamRows) => {
+    async (page) => {
       const series = QUARTERS.map((date) => rawDataPoint('US', 'USA', 'United States', date));
-      mockResponse([
-        pagingObj({ page, pages: 3, total: 5 }),
-        series.filter((row) => upstreamRows.includes(row.date)),
-      ]);
-      mockResponse([pagingObj({ total: 5, pages: 1 }), series]); // exhaustive re-read
+      mockResponse([pagingObj({ total: 5, pages: 1 }), series]);
       const result = await service.getData(
         { indicatorId: 'SP.POP.TOTL', countries: 'US', dateRange: '2020:2021', page, perPage: 2 },
         createMockContext(),
@@ -2611,33 +2639,35 @@ describe('WorldBankApiService', () => {
     },
   );
 
-  it('getData: re-reads a single-page series for page 2 rather than reading it as empty', async () => {
+  it('getData: reads the whole window for page 2 of a single-page series rather than reading it as empty', async () => {
     const series = QUARTERS.map((date) => rawDataPoint('US', 'USA', 'United States', date));
-    mockResponse([pagingObj({ page: 2, pages: 1, total: 5 }), null]);
-    mockResponse([pagingObj({ total: 5, pages: 1 }), series]); // exhaustive re-read
+    mockResponse([pagingObj({ total: 5, pages: 1 }), series]);
     const result = await service.getData(
       { indicatorId: 'SP.POP.TOTL', countries: 'US', dateRange: '2020:2021', page: 2, perPage: 50 },
       createMockContext(),
     );
     expect(result).toMatchObject({ data: [], total: 3, pages: 1, page: 2 });
+    const sent = new URL(fetchWithTimeoutMock.mock.calls[0]?.[0] as string).searchParams;
+    expect(sent.get('page')).toBe('1');
   });
 
   it.each([
-    ['2020Q2', ['2020Q2'], ['2020Q1', '2020Q3']],
-    ['2020Q2:2020Q3', ['2020Q2', '2020Q3'], ['2020Q1', '2020Q4']],
-    ['2020M04', ['2020M04'], ['2020M03', '2020M05']],
-    ['2020M12', ['2020Q4'], ['2021Q1']],
-    ['2020M01', ['2020Q1'], ['2019Q4']],
-    ['2020', ['2020Q4', '2020M01'], ['2019Q4', '2021M01']],
+    // Rows at the window's own form outside it are suspect until a re-read agrees.
+    ['2020Q2', ['2020Q2'], ['2020Q1', '2020Q3'], true],
+    ['2020Q2:2020Q3', ['2020Q2', '2020Q3'], ['2020Q1', '2020Q4'], true],
+    ['2020M04', ['2020M04'], ['2020M03', '2020M05'], true],
+    ['2020M12', ['2020Q4'], ['2021Q1'], false],
+    ['2020M01', ['2020Q1'], ['2019Q4'], false],
+    ['2020', ['2020Q4', '2020M01'], ['2019Q4', '2021M01'], false],
   ])(
     'getData: matches window %s against its own period boundaries',
-    async (dateRange, inside, outside) => {
+    async (dateRange, inside, outside, reread) => {
       const rows = [...inside, ...outside].map((date) =>
         rawDataPoint('US', 'USA', 'United States', date, 1),
       );
       // Upstream ignores a window it can't apply and hands back the whole series.
-      mockResponse([pagingObj({ total: rows.length, pages: 2 }), rows]);
       mockResponse([pagingObj({ total: rows.length, pages: 1 }), rows]);
+      if (reread) mockResponse([pagingObj({ total: rows.length, pages: 1 }), rows]);
       mockAggregateLookup();
       const ctx = createMockContext();
       const result = await service.getData(
@@ -2701,23 +2731,33 @@ describe('WorldBankApiService', () => {
     expect(url).toContain('date=2020%3A2022');
   });
 
-  it('getData: includes mrv param when provided', async () => {
-    mockResponse([pagingObj(), [rawDataPoint('US', 'USA', 'United States', '2022', 329000000)]]);
+  /**
+   * Upstream's response cache ignores `mrv`, so a request carrying it can be
+   * answered with another query's rows; `mrv` goes out as a `date` window and is
+   * selected locally.
+   */
+  it('getData: sends mrv as a date window, never as mrv', async () => {
+    mockResponse([
+      pagingObj({ total: 3 }),
+      ['2024', '2023', '2022'].map((date) => rawDataPoint('US', 'USA', 'United States', date, 3)),
+    ]);
     mockAggregateLookup();
     const ctx = createMockContext();
     const result = await service.getData(
       { indicatorId: 'SP.POP.TOTL', countries: 'US', mrv: 3, page: 1, perPage: 50 },
       ctx,
     );
-    expect(result.data).toHaveLength(1);
-    const url = fetchWithTimeoutMock.mock.calls[0]?.[0] as string;
-    expect(url).toContain('mrv=3');
+    expect(result.data.map((d) => d.date)).toEqual(['2024', '2023', '2022']);
+    const sent = new URL(fetchWithTimeoutMock.mock.calls[0]?.[0] as string).searchParams;
+    expect(sent.has('mrv')).toBe(false);
+    expect(sent.get('date')).toBe(`${new Date().getUTCFullYear() - 10}:2100`);
   });
 
-  it('getData: forwards an mrv above the former ceiling of 10', async () => {
+  it('getData: reads an mrv above 10 from a window reaching back that many years', async () => {
+    const years = Array.from({ length: 60 }, (_, i) => String(2025 - i));
     mockResponse([
-      pagingObj({ total: 60, pages: 2 }),
-      [rawDataPoint('KE', 'KEN', 'Kenya', '2025', 57532493)],
+      pagingObj({ total: 60 }),
+      years.map((date) => rawDataPoint('KE', 'KEN', 'Kenya', date, 57532493)),
     ]);
     mockAggregateLookup();
     const ctx = createMockContext();
@@ -2727,7 +2767,63 @@ describe('WorldBankApiService', () => {
     );
     expect(result.total).toBe(60);
     expect(result.pages).toBe(2);
-    expect(fetchWithTimeoutMock.mock.calls[0]?.[0] as string).toContain('mrv=60');
+    const sent = new URL(fetchWithTimeoutMock.mock.calls[0]?.[0] as string).searchParams;
+    expect(sent.get('date')).toBe(`${new Date().getUTCFullYear() - 60}:2100`);
+  });
+
+  // ─── getData: cancellation through the re-read and the widen read ─────────
+
+  /** Abort `controller` from inside the next fetch and fail that fetch with the abort, as fetch does. */
+  function abortOnNextFetch(controller: AbortController) {
+    const abort = new Error('The operation was aborted');
+    fetchWithTimeoutMock.mockImplementationOnce(async () => {
+      controller.abort(abort);
+      throw abort;
+    });
+    return abort;
+  }
+
+  it('getData: lets a cancellation during the re-read of a suspect read propagate', async () => {
+    const controller = new AbortController();
+    mockResponse([pagingObj({ total: 0 }), null]); // suspect: an empty envelope
+    const abort = abortOnNextFetch(controller);
+    await expect(
+      service.getData(
+        { indicatorId: 'SP.POP.TOTL', countries: 'US', dateRange: '2020', page: 1, perPage: 50 },
+        createMockContext({ signal: controller.signal }),
+      ),
+    ).rejects.toBe(abort);
+    expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('getData: lets a cancellation during the widen read propagate', async () => {
+    const controller = new AbortController();
+    // No value in the window, so mrnev widens to the whole series.
+    mockResponse([pagingObj({ total: 1 }), [rawDataPoint('ER', 'ERI', 'Eritrea', '2025', null)]]);
+    const abort = abortOnNextFetch(controller);
+    await expect(
+      service.getData(
+        { indicatorId: 'SP.POP.TOTL', countries: 'ER', mrnev: 1, page: 1, perPage: 50 },
+        createMockContext({ signal: controller.signal }),
+      ),
+    ).rejects.toBe(abort);
+    const widen = new URL(fetchWithTimeoutMock.mock.calls[1]?.[0] as string);
+    expect(widen.searchParams.get('date')).toBe('1900:2100');
+  });
+
+  it('getData: lets a cancellation during the re-read of a suspect widen read propagate', async () => {
+    const controller = new AbortController();
+    mockResponse([pagingObj({ total: 1 }), [rawDataPoint('ER', 'ERI', 'Eritrea', '2025', null)]]);
+    // The widen read lacks the 2025 row the window read returned: suspect.
+    mockResponse([pagingObj({ total: 1 }), [rawDataPoint('ER', 'ERI', 'Eritrea', '2011', 688)]]);
+    const abort = abortOnNextFetch(controller);
+    await expect(
+      service.getData(
+        { indicatorId: 'SP.POP.TOTL', countries: 'ER', mrnev: 1, page: 1, perPage: 50 },
+        createMockContext({ signal: controller.signal }),
+      ),
+    ).rejects.toBe(abort);
+    expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(3);
   });
 
   it('getData: preserves obsStatus in normalized data point', async () => {

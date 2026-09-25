@@ -3,11 +3,14 @@
  * (indicators, countries, data, topics, sources) with typed fetch methods,
  * retry/timeout, and sparse-payload normalization. Keyword indicator search,
  * collapse of indicators the catalog publishes twice, aggregate-free country
- * listing, aggregate classification of data rows, and verification of the
- * requested date window are computed locally over exhaustively fetched
- * candidate sets, since the API offers none of them server-side. Indicators the
- * standard data endpoint won't serve (message id 175) are answered from their
- * catalog source's source-scoped data API instead.
+ * listing, aggregate classification of data rows, verification of the requested
+ * date window, and the latest-value selection behind `mrv` and `mrnev` are
+ * computed locally over exhaustively fetched candidate sets, since the API offers
+ * none of them server-side in a form its response cache keeps apart. Every
+ * windowed or latest-value data read is checked for the signs of another request's
+ * cached body and re-read once before it is served; a read of the whole series
+ * takes one upstream page. Indicators the standard data endpoint won't serve (message
+ * id 175) are answered from their catalog source's source-scoped data API instead.
  * @module services/worldbank/worldbank-service
  */
 
@@ -24,13 +27,28 @@ import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 import { MAX_COUNTRIES_PER_PAGE, MAX_OBSERVATIONS_PER_PAGE } from '@/services/response-budget.js';
 import { sharedLoadContext, untilAborted } from '@/services/shared-load.js';
-import { isWithinWindow, monthSpan, parseDateWindow, periodFromToken } from './periods.js';
+import {
+  fullSpan,
+  type LatestSelection,
+  latestWindow,
+  type RowReader,
+  selectionForm,
+  selectLatest,
+} from './latest-values.js';
+import {
+  isWithinWindow,
+  monthSpan,
+  type PeriodForm,
+  parseDateWindow,
+  periodForm,
+  periodFromToken,
+} from './periods.js';
 import {
   defaultSelection,
-  keepMostRecentPeriods,
   layoutFromConcepts,
   newestVersionWithData,
   readRow,
+  SCOPED_ROW_READER,
   type ScopedRow,
   type SourceLayout,
   sortRows,
@@ -55,6 +73,7 @@ import type {
   SourceScopedDisclosure,
   Topic,
   WbEnvelope,
+  WbPage,
 } from './types.js';
 
 /** Minimal request-context shape that satisfies fetchWithTimeout and withRetry. */
@@ -81,6 +100,21 @@ const NOT_SERVED_MESSAGE_ID = '175';
  * only trades request count against response size.
  */
 const BULK_PAGE_SIZE = 10_000;
+
+/**
+ * Page size of a windowed or latest-value data read, which reads every page. It
+ * holds any annual series for every entry in one request (265 entries × 66 years
+ * is 17,490 rows), which matters because a read fetches page 1 before it knows
+ * how many more there are. Upstream accepts up to 32,767.
+ */
+const DATA_PAGE_SIZE = 20_000;
+
+/**
+ * Page size of the one re-read a suspect data read gets. The origin and Cloudflare
+ * both key a data response by `per_page`, so this is a separate entry in both
+ * caches from the {@link DATA_PAGE_SIZE} read it checks.
+ */
+const REREAD_PAGE_SIZE = DATA_PAGE_SIZE - 1;
 
 /** Timeout for ordinary single-page requests. */
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -144,6 +178,24 @@ function isUpstreamNotFound(error: unknown): boolean {
     error instanceof McpError &&
     error.data?.errorSource === 'FetchHttpError' &&
     error.data.status === 404
+  );
+}
+
+/**
+ * True for the HTTP 400 the Indicators API sometimes answers a well-formed request
+ * with: its web server's HTML "Request Error" page, where the API's own validation
+ * failures arrive as HTTP-200 envelopes. The same URL succeeds when repeated, so it
+ * is an upstream fault to retry, not the caller's invalid input. Any other 400
+ * keeps the framework's mapping.
+ */
+function isTransientRequestError(error: unknown): boolean {
+  if (!(error instanceof McpError) || error.data?.errorSource !== 'FetchHttpError') return false;
+  const body = error.data.body;
+  return (
+    error.data.status === 400 &&
+    typeof body === 'string' &&
+    /<html\b/i.test(body) &&
+    />\s*Request Error\s*</.test(body)
   );
 }
 
@@ -471,6 +523,103 @@ function matchIndicators(indicators: readonly Indicator[], query: string): Indic
   return rankHits(hits);
 }
 
+// ─── Observation reads ───────────────────────────────────────────────────────
+
+/** One complete standard-endpoint read: every page's rows, under the first page's envelope. */
+type SeriesRead = { paging: WbPage; items: RawDataPoint[] };
+
+/**
+ * The code a request path names a data row's entity by: the three-character
+ * code, or `country.id` where upstream leaves that empty (the income groups by
+ * ISO2, Global Economic Monitor rows by ISO3). Empty for an entity upstream sends
+ * with neither, such as Gibraltar in Human Capital Index or "IDA total" in Global
+ * Financial Development.
+ */
+function observationCode(raw: RawDataPoint): string {
+  return raw.countryiso3code || raw.country?.id || '';
+}
+
+/**
+ * The series a data row belongs to: its code and its name. A code alone does not
+ * identify an entity — Doing Business answers `CHN` for China, Beijing, and
+ * Shanghai alike, and some sources send several entities with no code at all.
+ */
+function observationSeries(raw: RawDataPoint): string {
+  return `${observationCode(raw)}|${raw.country?.value ?? ''}`;
+}
+
+/** How the latest-value selection reads a standard-endpoint row. */
+const OBSERVATION_READER: RowReader<RawDataPoint> = {
+  series: observationSeries,
+  period: (raw) => raw.date ?? '',
+  hasValue: (raw) => raw.value !== null && raw.value !== undefined,
+};
+
+/**
+ * Why a data read looks like the answer to another request, or `undefined` when
+ * it doesn't. The origin keys a data response by country path, `per_page`, and
+ * `date` alone, so a request adding `mrv`, `mrnev`, or `frequency` to the same
+ * three can answer this one, and Cloudflare then serves that body for the URL for
+ * up to a day. An honest read is a rectangular grid — every entity
+ * ({@link observationSeries}) at the same periods, null-filled — inside its window
+ * at the window's own form. A read is suspect when:
+ * - its envelope is empty;
+ * - its entities sit at different periods, as an `mrnev` body's countries do;
+ * - it holds rows outside `date` at `date`'s own form, as an `mrv` body answering
+ *   a window does;
+ * - it lacks a period in `required`: the periods the first read returned, when
+ *   this read widens it to the whole series.
+ *
+ * An honest result can look suspect too — an empty scope, or a window upstream
+ * drops and answers with the whole series — and its re-read then matches it.
+ */
+function suspectRead(
+  items: readonly RawDataPoint[],
+  date: string,
+  required?: ReadonlySet<string>,
+): string | undefined {
+  if (items.length === 0) return 'an empty envelope';
+
+  const grids = new Set(
+    [...Map.groupBy(items, observationSeries).values()].map((rows) =>
+      rows.map(OBSERVATION_READER.period).sort().join(','),
+    ),
+  );
+  if (grids.size > 1) return 'countries at different periods';
+
+  const window = parseDateWindow(date);
+  const windowForm = periodForm(date.split(':')[0] ?? '');
+  const outside =
+    window !== undefined &&
+    items.some((raw) => {
+      const period = raw.date ?? '';
+      return periodForm(period) === windowForm && !isWithinWindow(period, window);
+    });
+  if (outside) return `rows outside date=${date}`;
+
+  if (required) {
+    const periods = new Set(items.map((raw) => raw.date ?? ''));
+    const missing = [...required].find((period) => !periods.has(period));
+    if (missing) return `no ${missing} row, which the first read returned`;
+  }
+  return;
+}
+
+/** The period forms among `periods`, in first-seen order; an unplaceable period has none. */
+function formsOf(periods: readonly string[]): PeriodForm[] {
+  return [...new Set(periods.map(periodForm).filter((form) => form !== undefined))];
+}
+
+/** Whether two reads carry the same rows, in any order. */
+function sameRows(a: readonly RawDataPoint[], b: readonly RawDataPoint[]): boolean {
+  const cells = (items: readonly RawDataPoint[]) =>
+    items
+      .map((raw) => `${observationSeries(raw)}|${raw.date}|${raw.value}`)
+      .sort()
+      .join('\n');
+  return a.length === b.length && cells(a) === cells(b);
+}
+
 // ─── Service ─────────────────────────────────────────────────────────────────
 
 /** One entity of the country listing: both identifiers, and whether it is an aggregate. */
@@ -487,7 +636,16 @@ type GetDataOptions = {
   indicatorId: string;
   countries: string | string[];
   dateRange?: string;
+  /** The N most recent periods holding a value for any requested country. */
   mrv?: number;
+  /** Each requested country's N most recent periods holding a value. */
+  mrnev?: number;
+  /**
+   * The period form to return: the form `mrv` and `mrnev` select within, or with
+   * neither, the whole series at that form. Absent, a selection is annual unless
+   * the series has no annual periods, and a read keeps every form upstream returns.
+   */
+  frequency?: PeriodForm;
   /** A value of the serving source's extra dimension; applies to source-scoped data only. */
   dimensionValue?: string;
   page: number;
@@ -509,7 +667,24 @@ export type DataResult = {
   sourceScoped?: SourceScopedDisclosure;
   /** Valid codes the serving source publishes no data for, left out of the request. */
   uncoveredCountries?: string[];
+  /** The serving source's last update date (`2026-07-13`); absent when its envelope carries none. */
+  lastUpdated?: string;
+  /**
+   * The period forms the series answered with, before any selection — what tells
+   * a `frequency` the series does not publish from one no requested country has a
+   * value at. A source that null-fills a form it lacks answers with that form too.
+   */
+  periodForms?: PeriodForm[];
+  /** True when the result holds rows and every one of them, on every page, is null. */
+  allNull?: boolean;
 };
+
+/** The latest-value selection `mrv` or `mrnev` asks for, if either does. */
+function latestSelection({ mrv, mrnev }: GetDataOptions): LatestSelection | undefined {
+  if (mrnev !== undefined) return { mode: 'mrnev', count: mrnev };
+  if (mrv !== undefined) return { mode: 'mrv', count: mrv };
+  return;
+}
 
 export class WorldBankApiService {
   private readonly baseUrl: string;
@@ -586,6 +761,14 @@ export class WorldBankApiService {
     const response = await fetchWithTimeout(url, timeoutMs, reqCtx, {
       signal: ctx.signal,
       ...(expectedStatuses && { expectedStatuses }),
+    }).catch((err: unknown) => {
+      throw isTransientRequestError(err)
+        ? serviceUnavailable(
+            'World Bank API answered HTTP 400 with its "Request Error" page, which it returns intermittently for requests that succeed when repeated.',
+            { status: 400, errorSource: 'UpstreamRequestErrorPage' },
+            { cause: err },
+          )
+        : err;
     });
     const text = await response.text();
 
@@ -640,17 +823,53 @@ export class WorldBankApiService {
   }
 
   /**
-   * Fetch every upstream page for a scope and return the concatenated raw items.
+   * Fetch every upstream page for a scope: the first page's envelope and the
+   * concatenated raw items, or the HTTP-200 error envelope when any page is one.
    *
    * `pages` from the first response is the loop bound; the accumulated item
    * count — not `paging.total` — is what callers paginate against, since only
    * the rows actually in hand can be served and local filtering changes the
    * count anyway.
    *
+   * @param perPage - Rows per request; a larger page trades request count
+   *   against response size, never what is read.
+   * @param idInPath - The path carries a caller-supplied ID, so an upstream 404
+   *   comes back as the error envelope too (see {@link fetchLookup}).
+   */
+  private async readAllPages<T>(
+    path: string,
+    params: Record<string, string | number | undefined>,
+    ctx: Context,
+    { perPage = BULK_PAGE_SIZE, idInPath = false, timeoutMs = BULK_TIMEOUT_MS } = {},
+  ): Promise<{ paging: WbPage; items: T[] } | WbErrorEnvelope> {
+    const requestPage = (page: number) => {
+      const url = this.buildUrl(path, { ...params, page, per_page: perPage });
+      ctx.log.debug('Fetching upstream page', { url });
+      return idInPath
+        ? this.fetchLookup<T>(url, ctx, timeoutMs)
+        : this.fetchWithRetry<WbEnvelope<T> | WbErrorEnvelope>(url, ctx, timeoutMs);
+    };
+
+    const first = await requestPage(1);
+    if (isWbErrorEnvelope(first)) return first;
+    const [paging, items] = first;
+    const pages = Number(paging.pages);
+    if (pages <= 1) return { paging, items: items ?? [] };
+
+    const rest = await Promise.all(Array.from({ length: pages - 1 }, (_, i) => requestPage(i + 2)));
+    const failed = rest.find(isWbErrorEnvelope);
+    if (failed) return failed;
+    return {
+      paging,
+      items: [items ?? [], ...rest.map((page) => (page as WbEnvelope<T>)[1] ?? [])].flat(),
+    };
+  }
+
+  /**
+   * Every upstream item for a scope, through {@link readAllPages}.
+   *
    * @param onErrorEnvelope - Throws the caller's domain error when the World
    *   Bank returns its HTTP-200 error envelope for an invalid filter value.
-   * @param idInPath - The path carries a caller-supplied ID, so an upstream 404
-   *   reaches `onErrorEnvelope` too (see {@link fetchLookup}).
    */
   private async fetchAllPages<T>(
     path: string,
@@ -659,23 +878,9 @@ export class WorldBankApiService {
     onErrorEnvelope: () => never,
     idInPath = false,
   ): Promise<T[]> {
-    const requestPage = async (page: number) => {
-      const url = this.buildUrl(path, { ...params, page, per_page: BULK_PAGE_SIZE });
-      ctx.log.debug('Fetching upstream page', { url });
-      const data = idInPath
-        ? await this.fetchLookup<T>(url, ctx, BULK_TIMEOUT_MS)
-        : await this.fetchWithRetry<WbEnvelope<T> | WbErrorEnvelope>(url, ctx, BULK_TIMEOUT_MS);
-      if (isWbErrorEnvelope(data)) onErrorEnvelope();
-      const [paging, items] = data as WbEnvelope<T>;
-      return { paging, items: items ?? [] };
-    };
-
-    const first = await requestPage(1);
-    const pages = Number(first.paging.pages);
-    if (pages <= 1) return first.items;
-
-    const rest = await Promise.all(Array.from({ length: pages - 1 }, (_, i) => requestPage(i + 2)));
-    return [first.items, ...rest.map((r) => r.items)].flat();
+    const read = await this.readAllPages<T>(path, params, ctx, { idInPath });
+    if (isWbErrorEnvelope(read)) onErrorEnvelope();
+    return read.items;
   }
 
   // ─── Topics ──────────────────────────────────────────────────────────────
@@ -1019,15 +1224,16 @@ export class WorldBankApiService {
    * request — upstream silently drops an unknown member of a `;` list and answers
    * any other bad segment with an id-160 envelope that names none — so a response
    * with no rows is reported as an empty result. The full scope is read
-   * and paginated locally: `mrv` and the default version are computed from it, and
-   * upstream's row order changes with the shape of the request.
+   * and paginated locally: `mrv`, `mrnev`, and the default version are computed
+   * from it, and upstream's row order changes with the shape of the request.
+   * `frequency` narrows the source's own time tokens to that form before the request.
    */
   private async serveFromSource(
     opts: GetDataOptions,
     detail: string,
     ctx: Context,
   ): Promise<DataResult> {
-    const { indicatorId, countries, dateRange, mrv, dimensionValue, page, perPage } = opts;
+    const { indicatorId, countries, dateRange, dimensionValue, frequency, page, perPage } = opts;
     const catalogRows = await this.catalogRowsForUnserved(indicatorId, ctx);
     if (catalogRows.length === 0)
       throw this.indicatorNotQueryable(indicatorId, catalogRows, detail);
@@ -1086,12 +1292,11 @@ export class WorldBankApiService {
 
     // ── Periods: explicit tokens, since the API has no range syntax ──
     const window = parseDateWindow(dateRange);
-    const periodTokens = window
-      ? timeTokens.filter((token) => {
-          const period = periodFromToken(token.id);
-          return monthSpan(period) !== undefined && isWithinWindow(period, window);
-        })
-      : timeTokens;
+    const periodTokens = timeTokens.filter((token) => {
+      const period = periodFromToken(token.id);
+      if (frequency && periodForm(period) !== frequency) return false;
+      return !window || (monthSpan(period) !== undefined && isWithinWindow(period, window));
+    });
 
     const countryCount = isAll ? sourceCountries.length : countryIds.length;
     const valueCount = concept && !pinned ? Math.max(values.length, 1) : 1;
@@ -1107,6 +1312,7 @@ export class WorldBankApiService {
 
     // A scope that selects no country or no period has no rows to request.
     let rows: ScopedRow[] = [];
+    let lastUpdated: string | undefined;
     if ((isAll || countryIds.length > 0) && periodTokens.length > 0) {
       let path = `/sources/${encodeURIComponent(sourceId)}/country/${encodeURIComponent(isAll ? 'all' : countryIds.join(';'))}/series/${encodeURIComponent(row.id)}`;
       if (periodTokens.length < timeTokens.length) {
@@ -1118,7 +1324,10 @@ export class WorldBankApiService {
       const raw = await this.fetchSourcePages<RawSourceData, RawSourceObservation>(
         path,
         ctx,
-        (body) => body.source?.data,
+        (body) => {
+          lastUpdated ||= body.lastupdated;
+          return body.source?.data;
+        },
       );
       rows = raw.flatMap((item) => readRow(item, concept) ?? []);
     }
@@ -1129,7 +1338,11 @@ export class WorldBankApiService {
       pinned = newest ?? values.at(-1);
       rows = rows.filter((r) => r.dimension?.id.toLowerCase() === pinned?.id.toLowerCase());
     }
-    if (mrv !== undefined) rows = keepMostRecentPeriods(rows, mrv);
+    const latest = latestSelection(opts);
+    if (latest) {
+      const form = frequency ?? selectionForm(rows.map((r) => r.period));
+      rows = selectLatest(rows, latest, form, SCOPED_ROW_READER).rows;
+    }
     rows = sortRows(rows, values);
 
     const start = (page - 1) * perPage;
@@ -1168,6 +1381,9 @@ export class WorldBankApiService {
           "source's own dataset through the source-scoped data API, and may be archived or superseded figures.",
       },
       uncoveredCountries: uncovered,
+      ...(lastUpdated && { lastUpdated }),
+      periodForms: formsOf(timeTokens.map((token) => periodFromToken(token.id))),
+      allNull: rows.length > 0 && rows.every((r) => r.value === null),
     };
   }
 
@@ -1363,40 +1579,277 @@ export class WorldBankApiService {
   }
 
   /**
+   * The standard endpoint's path for a data request.
+   *
+   * The API's edge firewall answers HTTP 403 to any country segment carrying
+   * `;LS` — Lesotho after another code — which reads as a shell command. `LS`
+   * is the only one of the 295 codes the listing carries that it blocks, and
+   * `LSO` names the same economy, so the path sends that. Rows still name
+   * Lesotho `LS` / `LSO`.
+   */
+  private dataPath(codes: readonly string[], indicatorId: string): string {
+    const pathCodes = codes.map((code) => (code.toUpperCase() === 'LS' ? 'LSO' : code)).join(';');
+    return `/country/${encodeURIComponent(pathCodes)}/indicator/${encodeURIComponent(indicatorId)}`;
+  }
+
+  /**
+   * Every page of one data request over `date`, at `perPage` rows a page. A read
+   * of every entry can run to megabytes a page and gets the bulk timeout. A read
+   * of listed countries is small and gets the ordinary one: the origin sometimes
+   * holds a request for about a minute before answering, and a retry after the
+   * ordinary timeout answers it sooner.
+   */
+  private readSeries(
+    path: string,
+    date: string,
+    perPage: number,
+    ctx: Context,
+  ): Promise<SeriesRead | WbErrorEnvelope> {
+    const timeoutMs = /^\/country\/all\//i.test(path) ? BULK_TIMEOUT_MS : REQUEST_TIMEOUT_MS;
+    return this.readAllPages<RawDataPoint>(path, { date }, ctx, {
+      perPage,
+      idInPath: true,
+      timeoutMs,
+    });
+  }
+
+  /** Upstream page `page` of one data request over `date`, at `perPage` rows a page. */
+  private async readSeriesPage(
+    path: string,
+    date: string,
+    page: number,
+    perPage: number,
+    ctx: Context,
+  ): Promise<SeriesRead | WbErrorEnvelope> {
+    const url = this.buildUrl(path, { date, page, per_page: perPage });
+    ctx.log.debug('Fetching upstream page', { url });
+    const body = await this.fetchLookup<RawDataPoint>(url, ctx);
+    if (isWbErrorEnvelope(body)) return body;
+    const [paging, items] = body;
+    return { paging, items: items ?? [] };
+  }
+
+  /**
+   * One upstream page of a call reading the whole series — no `date_range`,
+   * `mrv`, or `mrnev` — served with upstream's own paging. It is not checked:
+   * a page boundary cuts a country's periods, so the grid check would fire on
+   * honest pages, and the whole-series read it would need costs up to 27 MB for
+   * one 200-row page. With `frequency`, a page holding rows at another form is
+   * the whole series a single-form source answers a window at a form it lacks
+   * with, so the form is not published; a page past the end shows no rows, and
+   * page 1 is read to tell which.
+   */
+  private async servePage(
+    path: string,
+    date: string,
+    read: SeriesRead,
+    opts: GetDataOptions,
+    ctx: Context,
+  ): Promise<DataResult> {
+    const { indicatorId, frequency, page, perPage } = opts;
+    let { items } = read;
+    let total = Number(read.paging.total ?? 0);
+    let pages = Number(read.paging.pages ?? 0);
+    let periodForms = formsOf(items.map(OBSERVATION_READER.period));
+
+    if (frequency) {
+      let sample = items;
+      if (sample.length === 0 && total > 0 && page !== 1) {
+        const first = await this.readSeriesPage(path, date, 1, perPage, ctx);
+        if (!isWbErrorEnvelope(first)) sample = first.items;
+      }
+      if (sample.some((raw) => periodForm(raw.date ?? '') !== frequency)) {
+        periodForms = formsOf(sample.map(OBSERVATION_READER.period));
+        items = [];
+        total = 0;
+        pages = 1;
+      }
+    }
+
+    const index = items.length > 0 ? await this.loadCountryIndex(ctx) : undefined;
+    const data = index ? items.map((raw) => normalizeDataPoint(raw, index)) : [];
+    const indicatorMeta = items[0]?.indicator;
+    const lastUpdated = read.paging.lastupdated;
+
+    return {
+      data,
+      indicator: { id: indicatorMeta?.id ?? indicatorId, name: indicatorMeta?.value ?? '' },
+      total,
+      page,
+      pages,
+      perPage,
+      nullCount: data.filter((d) => d.value === null).length,
+      dateFilterDropped: false,
+      ...(lastUpdated && { lastUpdated }),
+      periodForms,
+    };
+  }
+
+  /**
+   * `read`, once it passes {@link suspectRead}; a suspect read is requested once
+   * more at {@link REREAD_PAGE_SIZE}. The re-read is served when it passes, or
+   * when it matches the first read, which makes the suspect shape the honest
+   * answer. Otherwise neither is served and the call fails as
+   * `upstream_inconsistent`.
+   */
+  private async confirmRead(
+    path: string,
+    date: string,
+    read: SeriesRead,
+    ctx: Context,
+    required?: ReadonlySet<string>,
+  ): Promise<SeriesRead> {
+    const suspicion = suspectRead(read.items, date, required);
+    if (!suspicion) return read;
+
+    ctx.log.warning('Data read looks like the answer to another request; re-reading it', {
+      path,
+      date,
+      suspicion,
+    });
+    const again = await this.readSeries(path, date, REREAD_PAGE_SIZE, ctx);
+    if (
+      !isWbErrorEnvelope(again) &&
+      (!suspectRead(again.items, date, required) || sameRows(read.items, again.items))
+    ) {
+      return again;
+    }
+    throw serviceUnavailable(
+      `The World Bank API answered the data request for date=${date} twice with rows that do not fit it (${suspicion}); ` +
+        'its response cache can answer one query with the rows computed for another, so neither answer is served.',
+      { reason: 'upstream_inconsistent', date, suspicion },
+    );
+  }
+
+  /**
+   * The rows `latest` selects at `frequency` (by default annual, or the series'
+   * own form when it has no annual periods), the last update of the envelope
+   * serving them, and the period forms the reads carried. The window read answers
+   * nearly every call; when it falls short, one read over the {@link fullSpan} at
+   * the same form follows — of the whole list for `mrv`, when every country (or
+   * the window read itself) came up short, or when a short one has no code of its
+   * own to request it by (none, or one it shares: Doing Business sends Beijing as
+   * `CHN`, which the country path reads as China alone), and otherwise of the codes
+   * of only the countries short of `count` values, whose rows then take their
+   * place in the window read's order. The widened read must hold every period the
+   * window read did.
+   *
+   * A list of short countries can name an entity the country path rejects by
+   * code — Global Economic Monitor returns legacy `YUG` under `all` — and upstream
+   * then answers the whole list with its invalid-value envelope, so the widen
+   * falls back to the list the window read was accepted for.
+   */
+  private async latestRows(
+    path: string,
+    indicatorId: string,
+    read: SeriesRead,
+    latest: LatestSelection,
+    frequency: PeriodForm | undefined,
+    ctx: Context,
+  ): Promise<{ rows: RawDataPoint[]; lastUpdated: string | undefined; periodForms: PeriodForm[] }> {
+    const form = frequency ?? selectionForm(read.items.map(OBSERVATION_READER.period));
+    const inWindow = selectLatest(read.items, latest, form, OBSERVATION_READER);
+    if (inWindow.complete) {
+      return {
+        rows: inWindow.rows,
+        lastUpdated: read.paging.lastupdated,
+        periodForms: formsOf(read.items.map(OBSERVATION_READER.period)),
+      };
+    }
+
+    const span = fullSpan(frequency ?? 'year');
+    const codes = new Map(read.items.map((raw) => [observationSeries(raw), observationCode(raw)]));
+    const entitiesByCode = new Map<string, number>();
+    for (const code of codes.values())
+      entitiesByCode.set(code, (entitiesByCode.get(code) ?? 0) + 1);
+    const shortCodes = [...new Set(inWindow.short.map((series) => codes.get(series) ?? ''))];
+    let everyCountry =
+      latest.mode === 'mrv' ||
+      inWindow.short.length === codes.size ||
+      shortCodes.some((code) => !code || (entitiesByCode.get(code) ?? 0) > 1);
+    let widenPath = everyCountry ? path : this.dataPath(shortCodes, indicatorId);
+    let widened = await this.readSeries(widenPath, span, DATA_PAGE_SIZE, ctx);
+    if (isWbErrorEnvelope(widened) && !everyCountry) {
+      ctx.log.debug('Upstream rejected the short countries by code; widening the whole list', {
+        path: widenPath,
+      });
+      everyCountry = true;
+      widenPath = path;
+      widened = await this.readSeries(path, span, DATA_PAGE_SIZE, ctx);
+    }
+    if (isWbErrorEnvelope(widened)) {
+      throw serviceUnavailable('World Bank returned an error response for the observation series.');
+    }
+    const windowPeriods = new Set(read.items.map(OBSERVATION_READER.period));
+    const whole = await this.confirmRead(widenPath, span, widened, ctx, windowPeriods);
+    const selected = selectLatest(
+      whole.items,
+      latest,
+      form ?? selectionForm(whole.items.map(OBSERVATION_READER.period)),
+      OBSERVATION_READER,
+    ).rows;
+    const lastUpdated = read.paging.lastupdated || whole.paging.lastupdated;
+    const periodForms = formsOf([...read.items, ...whole.items].map(OBSERVATION_READER.period));
+    if (everyCountry) return { rows: selected, lastUpdated, periodForms };
+
+    const short = new Set(inWindow.short);
+    const order = new Map([...codes.keys()].map((s, i) => [s, i]));
+    const position = (raw: RawDataPoint) => order.get(observationSeries(raw)) ?? order.size;
+    const rows = [
+      ...inWindow.rows.filter((raw) => !short.has(observationSeries(raw))),
+      ...selected,
+    ].sort((a, b) => position(a) - position(b));
+    return { rows, lastUpdated, periodForms };
+  }
+
+  /**
    * One page of observations. The page size is reduced to
    * {@link MAX_OBSERVATIONS_PER_PAGE} once, here, so every path below serves and
-   * counts pages at that size: the upstream request, the local slice of a re-read
-   * date window, and the local slice of the source-scoped API.
+   * counts pages at that size.
+   *
+   * Every standard-endpoint read carries `date` and never `mrv`, `mrnev`, or
+   * `frequency`, which the API's response cache does not key on: `date_range` as
+   * given, the {@link latestWindow} at the `frequency` form for `mrv` and
+   * `mrnev`, and otherwise the {@link fullSpan} at that form. A call with neither
+   * `date_range` nor `mrv`/`mrnev` reads just the page asked for
+   * ({@link servePage}). Every other read takes every upstream page and passes
+   * {@link confirmRead} before anything is served, and pages are sliced locally
+   * out of the rows served — those inside `date_range`, or those `mrv`/`mrnev`
+   * select — so `total` and `pages` are the same on every page.
+   *
+   * A window's period form selects which periods a series publishing several
+   * returns (Global Economic Monitor: a year window its annual rows, a quarter or
+   * month window rows at that form, null-filled where it has none). A window the
+   * API can't apply — one overlapping no part of the series, or at a form a
+   * single-form series lacks — makes upstream discard the filter and return the
+   * whole series, which is indistinguishable from a hit until the returned
+   * periods are checked against the ones asked for, so rows are kept by their
+   * overlap with the window: `2019:2021` keeps a quarterly series' twelve quarters.
    */
   async getData(requested: GetDataOptions, ctx: Context): Promise<DataResult> {
     const opts = { ...requested, perPage: Math.min(requested.perPage, MAX_OBSERVATIONS_PER_PAGE) };
-    const { indicatorId, countries, dateRange, mrv, dimensionValue, page, perPage } = opts;
+    const { indicatorId, countries, dateRange, dimensionValue, frequency, page, perPage } = opts;
+    const latest = latestSelection(opts);
 
     const codes = Array.isArray(countries) ? countries : countries.split(';');
+    const path = this.dataPath(codes, indicatorId);
+    const date =
+      dateRange ??
+      (latest
+        ? latestWindow(latest.count, new Date().getUTCFullYear(), frequency)
+        : fullSpan(frequency ?? 'year'));
+    ctx.log.debug('Fetching data', { indicatorId, countries: codes, date });
 
-    const scope: Record<string, string | number | undefined> = {};
-    if (dateRange) scope.date = dateRange;
-    if (mrv !== undefined) scope.mrv = mrv;
+    const paged = dateRange === undefined && !latest;
+    const first = paged
+      ? await this.readSeriesPage(path, date, page, perPage, ctx)
+      : await this.readSeries(path, date, DATA_PAGE_SIZE, ctx);
 
-    /**
-     * The API's edge firewall answers HTTP 403 to any country segment carrying
-     * `;LS` — Lesotho after another code — which reads as a shell command. `LS`
-     * is the only one of the 295 codes the listing carries that it blocks, and
-     * `LSO` names the same economy, so the path sends that. Rows still name
-     * Lesotho `LS` / `LSO`.
-     */
-    const pathCodes = codes.map((code) => (code.toUpperCase() === 'LS' ? 'LSO' : code)).join(';');
-    const path = `/country/${encodeURIComponent(pathCodes)}/indicator/${encodeURIComponent(indicatorId)}`;
-    const url = this.buildUrl(path, { ...scope, page, per_page: perPage });
-    ctx.log.debug('Fetching data', { indicatorId, countries: codes, url });
-
-    const data = await this.fetchLookup<RawDataPoint>(url, ctx);
-
-    if (isWbErrorEnvelope(data)) {
+    if (isWbErrorEnvelope(first)) {
       // The /country/{codes}/indicator/{id} endpoint wraps errors in an array:
-      // [{ message: [...] }], so data itself is an array and data.message would
-      // be undefined. Unwrap before accessing.
-      const envelope = (Array.isArray(data) ? data[0] : data) as WbErrorEnvelope;
+      // [{ message: [...] }], so the envelope itself is an array and .message
+      // would be undefined. Unwrap before accessing.
+      const envelope = (Array.isArray(first) ? first[0] : first) as WbErrorEnvelope;
       const detail = envelope.message[0]?.value ?? 'Invalid value';
 
       // Upstream emits one message per rejected path segment and never names
@@ -1437,94 +1890,47 @@ export class WorldBankApiService {
       );
     }
 
-    const [paging, items] = data as WbEnvelope<RawDataPoint>;
+    if (paged) return this.servePage(path, date, first, opts, ctx);
 
-    /**
-     * A date window the API can't apply — one overlapping no part of the series,
-     * or finer-grained than the series it was asked of — makes upstream discard
-     * the filter and return the whole thing, which is indistinguishable from a
-     * hit until the returned periods are checked against the ones asked for.
-     * Whether that happened can only be judged over the complete response, so a
-     * windowed query is re-read in full and paginated locally unless the page in
-     * hand already is the whole series; otherwise in-window observations past
-     * this page are unreachable and total/pages report the series length instead
-     * of the match count.
-     *
-     * That includes a page past the end, which comes back empty: upstream's
-     * paging on it still describes whatever series it chose to serve, so only
-     * a response with nothing in it at all (`total: 0`) — or one with no window
-     * to verify — can be reported as-is. An empty page is no reason to skip the
-     * window check, or the total would depend on which page was requested.
-     */
-    const dateWindow = parseDateWindow(dateRange);
+    const read = await this.confirmRead(path, date, first, ctx);
 
-    if (!items?.length && (!dateWindow || !(paging.total > 0))) {
-      return {
-        data: [],
-        indicator: { id: indicatorId, name: '' },
-        total: paging.total ?? 0,
-        page: paging.page ?? page,
-        pages: paging.pages ?? 1,
-        perPage,
-        nullCount: 0,
-        dateFilterDropped: false,
-      };
-    }
-
-    let matched = items ?? [];
-    let total = paging.total;
-    let pages = paging.pages;
-    let currentPage = paging.page ?? page;
+    let rows = read.items;
+    let lastUpdated = read.paging.lastupdated;
+    let periodForms = formsOf(read.items.map(OBSERVATION_READER.period));
     let dateFilterDropped = false;
-    let indicatorMeta = matched[0]?.indicator;
-
-    if (dateWindow) {
-      const wholeSeriesInHand = page === 1 && paging.pages <= 1;
-      const candidates = wholeSeriesInHand
-        ? matched
-        : await this.fetchAllPages<RawDataPoint>(path, scope, ctx, () => {
-            throw serviceUnavailable(
-              'World Bank returned an error response for the observation series.',
-            );
-          });
-      const inWindow = candidates.filter((raw) => isWithinWindow(raw.date ?? '', dateWindow));
-      const start = (page - 1) * perPage;
-
-      matched = inWindow.slice(start, start + perPage);
-      total = inWindow.length;
-      pages = Math.max(1, Math.ceil(inWindow.length / perPage));
-      currentPage = page;
-      dateFilterDropped = inWindow.length < candidates.length;
-      indicatorMeta ??= candidates[0]?.indicator;
+    const dateWindow = parseDateWindow(dateRange);
+    if (latest) {
+      ({ rows, lastUpdated, periodForms } = await this.latestRows(
+        path,
+        indicatorId,
+        read,
+        latest,
+        frequency,
+        ctx,
+      ));
+    } else if (dateWindow) {
+      rows = read.items.filter((raw) => isWithinWindow(raw.date ?? '', dateWindow));
+      dateFilterDropped = rows.length < read.items.length;
     }
 
-    const indicator = { id: indicatorMeta?.id ?? indicatorId, name: indicatorMeta?.value ?? '' };
-
-    if (!matched.length) {
-      return {
-        data: [],
-        indicator,
-        total,
-        page: currentPage,
-        pages,
-        perPage,
-        nullCount: 0,
-        dateFilterDropped,
-      };
-    }
-
-    const index = await this.loadCountryIndex(ctx);
-    const dataPoints = matched.map((raw) => normalizeDataPoint(raw, index));
+    const indicatorMeta = (read.items[0] ?? rows[0])?.indicator;
+    const start = (page - 1) * perPage;
+    const pageRows = rows.slice(start, start + perPage);
+    const index = pageRows.length > 0 ? await this.loadCountryIndex(ctx) : undefined;
+    const data = index ? pageRows.map((raw) => normalizeDataPoint(raw, index)) : [];
 
     return {
-      data: dataPoints,
-      indicator,
-      total,
-      page: currentPage,
-      pages,
+      data,
+      indicator: { id: indicatorMeta?.id ?? indicatorId, name: indicatorMeta?.value ?? '' },
+      total: rows.length,
+      page,
+      pages: Math.max(1, Math.ceil(rows.length / perPage)),
       perPage,
-      nullCount: dataPoints.filter((d) => d.value === null).length,
+      nullCount: data.filter((d) => d.value === null).length,
       dateFilterDropped,
+      ...(lastUpdated && { lastUpdated }),
+      periodForms,
+      allNull: rows.length > 0 && rows.every((raw) => !OBSERVATION_READER.hasValue(raw)),
     };
   }
 }

@@ -1,7 +1,8 @@
 /**
  * @fileoverview Tests for the pure source-scoped helpers and period arithmetic:
  * concept layouts, per-concept default dimension values, row normalization,
- * version resolution, `mrv` emulation, ordering, and time-token translation.
+ * version resolution, ordering, and time-token translation. The `mrv` and
+ * `mrnev` selection over these rows is covered in latest-values.test.ts.
  * @module tests/services/worldbank/source-scoped.test
  */
 
@@ -14,7 +15,6 @@ import {
 } from '@/services/worldbank/periods.js';
 import {
   defaultSelection,
-  keepMostRecentPeriods,
   layoutFromConcepts,
   newestVersionWithData,
   readRow,
@@ -265,45 +265,6 @@ describe('newestVersionWithData', () => {
 
   it('is undefined when every row is null', () => {
     expect(newestVersionWithData([row('SDN', '2015', null, '202601')], versions)).toBeUndefined();
-  });
-});
-
-describe('keepMostRecentPeriods', () => {
-  /**
-   * Measured against the standard endpoint: `country/ERI;SSD/.../mrv=2` returns
-   * 2015 and 2014 for both countries — South Sudan's last two years with data —
-   * with Eritrea null at both, not Eritrea's own last values (2011, 2010).
-   */
-  it('keeps the N most recent periods holding a value anywhere, nulls at those periods included', () => {
-    const rows = [
-      row('ERI', '2015', null),
-      row('ERI', '2014', null),
-      row('ERI', '2011', 688),
-      row('SSD', '2015', 1080),
-      row('SSD', '2014', 1242),
-      row('SSD', '2013', 1300),
-      row('SSD', '2016', null),
-    ];
-    const kept = keepMostRecentPeriods(rows, 2);
-    expect(kept.map((r) => `${r.countryId}/${r.period}`).sort()).toEqual([
-      'ERI/2014',
-      'ERI/2015',
-      'SSD/2014',
-      'SSD/2015',
-    ]);
-  });
-
-  it('counts periods across dimension values and granularities', () => {
-    const rows = [
-      row('AGO', '2027M11', null, 'WLD'),
-      row('AGO', '2027', 3, 'WLD'),
-      row('AGO', '2026M12', 2, '009'),
-    ];
-    expect(keepMostRecentPeriods(rows, 1).map((r) => r.period)).toEqual(['2027']);
-  });
-
-  it('keeps nothing when no row holds a value', () => {
-    expect(keepMostRecentPeriods([row('ERI', '2015', null)], 3)).toEqual([]);
   });
 });
 
