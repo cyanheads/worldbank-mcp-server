@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.0](changelog/0.4.x/0.4.0.md) — 2026-09-25 · ⚠️ Breaking
+
+worldbank_get_poverty answers PIP's World, regional, income-group, and lending-group aggregates at any poverty line, accepts ISO2 and model-estimate-only codes, and resolves MRV to PIP's latest estimate year by default. Tools now keep the service's error data on re-throw.
+
 ## [0.3.8](changelog/0.3.x/0.3.8.md) — 2026-09-21
 
 Upgrades to mcp-ts-core 0.13.6: argument rejections carry a recovery hint naming what to send, near-miss argument keys and stringified arrays are normalized before validation, and tool error text closes with its reason.
