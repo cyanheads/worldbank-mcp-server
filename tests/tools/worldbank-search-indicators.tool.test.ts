@@ -112,14 +112,19 @@ describe('worldbankSearchIndicators', () => {
     const { worldbankSearchIndicators } = await import(
       '@/mcp-server/tools/definitions/worldbank-search-indicators.tool.js'
     );
-    const ctx = createMockContext({ errors: worldbankSearchIndicators.errors });
-    const input = worldbankSearchIndicators.input.parse({ query: 'gdp', page: 99 });
-    await worldbankSearchIndicators.handler(input, ctx);
-    const enrichment = getEnrichment(ctx);
-    expect(enrichment.notice).toBe(
-      'Page 99 is past the last page of 7. Request a page between 1 and 7.',
+    const result = await runToolContract(
+      worldbankSearchIndicators,
+      { query: 'gdp', page: 99, per_page: 100 },
+      { context: { errors: worldbankSearchIndicators.errors } },
     );
-    expect(enrichment.notice).not.toContain('No indicators matched');
+    /** The wording every other paged tool uses for the same situation, page size included. */
+    const notice =
+      'Page 99 is past the end of the results — 679 indicators span 7 pages (1–7) at per_page=100. Keep the same filters and request a page from 1 to 7.';
+    expect(result.isError).toBeFalsy();
+    expect((result.structuredContent as { notice?: string }).notice).toBe(notice);
+    const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+    expect(text).toContain(notice);
+    expect(text).not.toContain('No indicators matched');
   });
 
   it('maps an invalid topic/source filter to the invalid_filter contract error', async () => {
@@ -541,13 +546,81 @@ describe('worldbankSearchIndicators', () => {
       { query: 'SE.PRM.INPT' },
       { context: { errors: worldbankSearchIndicators.errors } },
     );
+    /**
+     * The note runs past the 150-character excerpt: the line break inside it
+     * survives the cut, and the space the cut lands after is dropped before the mark.
+     */
+    const excerpt =
+      'School survey.  Total score is the sum of whether a school has:   , Functional blackboard    - Pens, pencils, exercise books\n- Textbooks   - Fraction…';
     expect(result.isError).toBeFalsy();
     expect(result.structuredContent).toMatchObject({
-      indicators: [{ id: 'SE.PRM.INPT', sourceNote: cleanedNote }],
+      indicators: [{ id: 'SE.PRM.INPT', sourceNote: excerpt }],
     });
     const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
-    expect(text).toContain(cleanedNote);
+    expect(text).toContain(excerpt);
     expect(text).not.toMatch(/<\/?br/i);
+  });
+
+  // ─── Description excerpt ──────────────────────────────────────────────────
+
+  /** Run the tool through the contract runner over one indicator carrying `sourceNote`. */
+  async function searchWithNote(sourceNote: string) {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      searchIndicators: vi.fn().mockResolvedValue({
+        ...mockSearchResult,
+        indicators: [{ ...mockIndicator, sourceNote }],
+      }),
+    } as never);
+    const { worldbankSearchIndicators } = await import(
+      '@/mcp-server/tools/definitions/worldbank-search-indicators.tool.js'
+    );
+    const result = await runToolContract(
+      worldbankSearchIndicators,
+      { query: 'GDP per capita' },
+      { context: { errors: worldbankSearchIndicators.errors } },
+    );
+    expect(result.isError).toBeFalsy();
+    const structured = result.structuredContent as { indicators: Array<{ sourceNote: string }> };
+    const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+    return { note: structured.indicators[0]?.sourceNote, text };
+  }
+
+  it.each([
+    ['an empty note', ''],
+    ['a note of exactly 150 characters', 'a'.repeat(150)],
+  ])('returns %s unchanged', async (_label, sent) => {
+    const { note, text } = await searchWithNote(sent);
+    expect(note).toBe(sent);
+    expect(text).not.toContain('…');
+  });
+
+  it('cuts a longer note to its first 150 characters and marks the cut, on both surfaces', async () => {
+    const sent = `${'b'.repeat(150)}TAIL`;
+    const { note, text } = await searchWithNote(sent);
+    expect(note).toBe(`${'b'.repeat(150)}…`);
+    expect(text).toContain(`${'b'.repeat(150)}…`);
+    expect(text).not.toContain('TAIL');
+  });
+
+  it('cuts the longest note in the catalog to the same 151-character excerpt', async () => {
+    const { note, text } = await searchWithNote('x'.repeat(3937));
+    expect(note).toHaveLength(151);
+    expect(text).not.toContain('x'.repeat(151));
+  });
+
+  it('describes sourceNote as an excerpt and points at worldbank_get_indicator for the whole note', async () => {
+    const { worldbankSearchIndicators } = await import(
+      '@/mcp-server/tools/definitions/worldbank-search-indicators.tool.js'
+    );
+    const item = (
+      worldbankSearchIndicators.output.shape.indicators as unknown as {
+        element: { shape: Record<string, { description?: string }> };
+      }
+    ).element.shape;
+    expect(item.sourceNote?.description).toMatch(/150 characters/);
+    expect(item.sourceNote?.description).toMatch(/worldbank_get_indicator/);
+    expect(worldbankSearchIndicators.description).toMatch(/150 characters/);
   });
 
   // ─── Format edge cases ────────────────────────────────────────────────────

@@ -184,7 +184,7 @@ describe('worldbankSearchProjects', () => {
     expect(searchProjects.mock.calls[0]?.[0]).toMatchObject({ countryCodes: ['3A'] });
   });
 
-  it("splits a single string on either separator this server's tools use", async () => {
+  it('splits a single string on the comma and semicolon separators', async () => {
     const searchProjects = await stubService({ projects: [project], total: 1 });
     const tool = await loadTool();
     await tool.handler(
@@ -196,6 +196,67 @@ describe('worldbankSearchProjects', () => {
       countryCodes: ['BR', 'IN', 'ZA'],
     });
   });
+
+  it.each([
+    ['BJ|BF', ['BJ', 'BF']],
+    ['bj | bf', ['BJ', 'BF']],
+    [['BJ|BF'], ['BJ', 'BF']],
+    ['BJ|BF;IN, ZA', ['BJ', 'BF', 'IN', 'ZA']],
+  ])(
+    'splits the pipe-joined countries %j and echoes them comma-joined',
+    async (countries, codes) => {
+      const searchProjects = await stubService({ projects: [project], total: 1 });
+      const tool = await loadTool();
+      const result = await runToolContract(tool, { countries });
+
+      expect(result.isError).toBeFalsy();
+      expect(searchProjects.mock.calls[0]?.[0]).toMatchObject({ countryCodes: codes });
+      expect(result.structuredContent).toMatchObject({
+        appliedFilters: { countries: codes.join(',') },
+      });
+      expect(textOf(result)).toContain(`countries=${codes.join(',')}`);
+    },
+  );
+
+  it.each([[','], ['|'], [' ; '], ['|;,'], [['|']], [[',', ' ']]])(
+    'rejects countries=%j, which names no code, as invalid_country_code before any request, on both surfaces',
+    async (countries) => {
+      const searchProjects = await stubService({ projects: [project], total: 1 });
+      const tool = await loadTool();
+      const result = await runToolContract(tool, { countries });
+
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ValidationError,
+          data: {
+            reason: 'invalid_country_code',
+            recovery: { hint: expect.stringContaining('omit countries') },
+          },
+        },
+      });
+      const text = textOf(result);
+      expect(text).toMatch(/names no country code/);
+      expect(text).toMatch(/Recovery:.*omit countries/);
+      expect(text.trimEnd()).toMatch(/\(reason invalid_country_code\)$/);
+      expect(searchProjects).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([[''], ['   '], [[]], [['']], [['  ', '']]])(
+    'reads the blank countries value %j as no country filter',
+    async (countries) => {
+      const searchProjects = await stubService({ projects: [project], total: 1 });
+      const tool = await loadTool();
+      const result = await runToolContract(tool, { countries });
+
+      expect(result.isError).toBeFalsy();
+      expect(searchProjects.mock.calls[0]?.[0]).toMatchObject({ countryCodes: [] });
+      expect(
+        (result.structuredContent as { appliedFilters: Record<string, unknown> }).appliedFilters,
+      ).not.toHaveProperty('countries');
+    },
+  );
 
   it('reads a blank countries value as no country filter rather than an error', async () => {
     const searchProjects = await stubService({ projects: [project], total: 1 });
@@ -592,10 +653,76 @@ describe('worldbankSearchProjects', () => {
     expect(notice).toMatch(
       /totalPages counts pages of 8, so page 2 with the same filters continues/,
     );
-    expect(notice).toMatch(/Abstracts are never shortened/);
+    expect(notice).not.toMatch(/never shortened/);
+    // Nothing on this page ran past the abstract ceiling, so no project is named as cut.
+    expect(notice).not.toMatch(/cut there/);
     const text = textOf(result);
     expect(text).toContain('per_page=8 (requested 1000)');
     expect(text).toContain('per_page=1000 was reduced to 8');
+  });
+
+  // ─── Abstract ceiling ─────────────────────────────────────────────────────
+
+  it('returns an abstract of up to 5,000 characters whole', async () => {
+    const whole = 'a'.repeat(5000);
+    await stubService({ projects: [{ ...project, abstract: whole }], total: 1 });
+    const tool = await loadTool();
+    const result = await runToolContract(tool, { query: 'P513080', include_abstract: true });
+
+    expect(result.structuredContent).toMatchObject({ projects: [{ abstract: whole }] });
+    expect(textOf(result)).toContain(`**abstract:** ${whole}`);
+    expect(textOf(result)).not.toContain('…');
+    expect((result.structuredContent as { notice?: string }).notice).toBeUndefined();
+  });
+
+  it('cuts a longer abstract at 5,000 characters on both surfaces and names the projects cut', async () => {
+    const long = { ...project, abstract: `${'b'.repeat(5000)}TAIL` };
+    const second = { ...project, id: 'P100002', abstract: `${'c'.repeat(7999)}.` };
+    const short = { ...project, id: 'P100003', abstract: 'Rehabilitation of the dam.' };
+    await stubService({ projects: [long, short, second], total: 3 });
+    const tool = await loadTool();
+    const result = await runToolContract(tool, { query: 'dam', include_abstract: true });
+
+    const structured = result.structuredContent as {
+      projects: Array<{ id: string; abstract: string | null }>;
+      notice: string;
+    };
+    expect(structured.projects.map((p) => p.abstract?.length)).toEqual([5001, 26, 5001]);
+    expect(structured.projects[0]?.abstract).toBe(`${'b'.repeat(5000)}…`);
+    expect(structured.projects[1]?.abstract).toBe('Rehabilitation of the dam.');
+    expect(structured.notice).toMatch(
+      /The abstracts of P513080 and P100002 run past 5,000 characters and are cut there, marked with …/,
+    );
+    expect(structured.notice).toMatch(/project page at url/);
+    const text = textOf(result);
+    expect(text).toContain(`**abstract:** ${'b'.repeat(5000)}…`);
+    expect(text).not.toContain('TAIL');
+    expect(text).toContain('The abstracts of P513080 and P100002 run past 5,000 characters');
+  });
+
+  it('names a single cut project in the singular', async () => {
+    await stubService({ projects: [{ ...project, abstract: 'd'.repeat(6000) }], total: 1 });
+    const tool = await loadTool();
+    const ctx = createMockContext({ errors: tool.errors });
+    await tool.handler(tool.input.parse({ query: 'P513080', include_abstract: true }), ctx);
+
+    expect(getEnrichment(ctx).notice).toMatch(
+      /^The abstract of P513080 runs past 5,000 characters and is cut there, marked with …/,
+    );
+  });
+
+  it('describes the abstract ceiling where include_abstract and abstract are described', async () => {
+    const tool = await loadTool();
+    const item = (
+      tool.output.shape.projects as unknown as {
+        element: { shape: Record<string, { description?: string }> };
+      }
+    ).element.shape;
+    const includeAbstract = (tool.input.shape.include_abstract as { description?: string })
+      .description;
+    expect(includeAbstract).toMatch(/5,000 characters/);
+    expect(includeAbstract).not.toMatch(/whole/);
+    expect(item.abstract?.description).toMatch(/5,000 characters/);
   });
 
   it('holds the server default to the same cap', async () => {
@@ -608,6 +735,38 @@ describe('worldbankSearchProjects', () => {
     expect(enrichment).toMatchObject({ appliedFilters: { perPage: 8, requestedPerPage: 50 } });
     expect(enrichment.notice).toMatch(/per_page=50 was reduced to 8/);
   });
+
+  /**
+   * A result that fits on one page at the served size is the page the requested
+   * size would have served too, so there is no reduction to disclose, with or
+   * without abstracts; the echo still carries both sizes.
+   */
+  it.each([
+    [false, 80, 1, [project]],
+    [true, 8, 1, [project]],
+    [false, 80, 2, []],
+  ])(
+    'discloses no reduction when the whole result fits on one page (include_abstract %s, %i served, page %i)',
+    async (includeAbstract, served, page, projects) => {
+      await stubService({ projects, total: 1, page, pages: 1, perPage: served });
+      const tool = await loadTool();
+      const result = await runToolContract(tool, {
+        per_page: 1000,
+        include_abstract: includeAbstract,
+        page,
+      });
+
+      expect(result.structuredContent).toMatchObject({
+        appliedFilters: { perPage: served, requestedPerPage: 1000 },
+        totalPages: 1,
+      });
+      expect((result.structuredContent as { notice?: string }).notice ?? '').not.toMatch(
+        /was reduced/,
+      );
+      expect(textOf(result)).not.toContain('was reduced');
+      expect(textOf(result)).toContain(`per_page=${served} (requested 1000)`);
+    },
+  );
 
   it('keeps the page-past-end notice alongside the reduction', async () => {
     await stubService({ projects: [], total: 100, page: 90, pages: 2, perPage: 80 });
@@ -733,19 +892,24 @@ describe('worldbankSearchProjects', () => {
 
   it('renders every project field into content[]', async () => {
     const tool = await loadTool();
-    const [block] =
-      tool.format?.({
-        projects: [{ ...project, abstract: 'Rehabilitation of the dam.' }, sparseProject],
-      }) ?? [];
+    const blended = {
+      ...project,
+      abstract: 'Rehabilitation of the dam.',
+      totalCommitment: 49_300_000,
+      idaCommitment: 5_000_000,
+      grantAmount: 2_500_000,
+    };
+    const [block] = tool.format?.({ projects: [blended, sparseProject] }) ?? [];
     const text = (block as { text: string }).text;
 
     expect(text).toContain('(P513080)');
-    expect(text).toContain('**status:** Active');
-    expect(text).toContain('**countryCodes:** BR');
+    expect(text).toContain(
+      '- **status:** Active | **countryName:** Federative Republic of Brazil | **countryCodes:** BR | **regionName:** Latin America and Caribbean\n',
+    );
     expect(text).toContain('**boardApprovalDate:** 2026-03-30');
     expect(text).toContain('**closingDate:** 2031-12-19');
     expect(text).toContain(
-      '**totalCommitment:** 41,800,000 USD (ibrdCommitment 41,800,000 · idaCommitment 0)',
+      '**totalCommitment:** 49,300,000 USD (ibrdCommitment 41,800,000 · idaCommitment 5,000,000 · grantAmount 2,500,000)',
     );
     expect(text).toContain('**financialTypes:** IBRD, Other');
     expect(text).toContain('**majorSectors:** Public Administration, Education');
@@ -756,8 +920,20 @@ describe('worldbankSearchProjects', () => {
     expect(text).toContain('**closingDate:** null');
     expect(text).toContain('**totalCommitment:** null | **financialTypes:** none');
     expect(text).toContain('**majorSectors:** none');
-    expect(text).toContain('**countryCodes:** none');
-    expect(text).toContain('**abstract:** null');
+    expect(text).toContain('**countryCodes:** none | **regionName:** Other');
+  });
+
+  it('prints no abstract line for a row without one, and one for a row that has one', async () => {
+    const tool = await loadTool();
+    const [block] =
+      tool.format?.({
+        projects: [sparseProject, { ...project, abstract: 'Rehabilitation of the dam.' }, project],
+      }) ?? [];
+    const text = (block as { text: string }).text;
+
+    expect(text).not.toContain('**abstract:** null');
+    expect(text.match(/\*\*abstract:\*\*/g)).toHaveLength(1);
+    expect(text).not.toMatch(/^- \*\*regionName:\*\*/m);
   });
 
   it('carries the commitment breakdown on both surfaces, a grant-only operation included', async () => {
@@ -793,12 +969,13 @@ describe('worldbankSearchProjects', () => {
     });
     const text = textOf(result);
     expect(text).toContain('**totalCommitment:** 22,000,000 USD | **financialTypes:** Grants');
+    // The published zero stays in structuredContent; the text names only the parts that add up.
     expect(text).toContain(
-      '**totalCommitment:** 880,000,000 USD (ibrdCommitment 610,000,000 · idaCommitment 0 · grantAmount 270,000,000)',
+      '**totalCommitment:** 880,000,000 USD (ibrdCommitment 610,000,000 · grantAmount 270,000,000)',
     );
   });
 
-  it('prints only the published breakdown parts, and none when one part is the whole total', async () => {
+  it('prints only the non-zero published breakdown parts, and none when one part is the whole total', async () => {
     const tool = await loadTool();
     const ibrdOnly = {
       ...project,
@@ -814,12 +991,10 @@ describe('worldbankSearchProjects', () => {
 
     // One published part equal to the total adds nothing, so no parenthetical.
     expect(text).toContain('**totalCommitment:** 50,000,000 USD | **financialTypes:** IBRD');
-    // A null part is never printed; a published zero is.
-    expect(text).toContain(
-      '**totalCommitment:** 41,800,000 USD (ibrdCommitment 41,800,000 · idaCommitment 0) |',
-    );
+    // A zero part drops out like a null one, leaving IBRD as the whole total.
+    expect(text).toContain('**totalCommitment:** 41,800,000 USD | **financialTypes:** IBRD, Other');
     expect(text).toContain('**totalCommitment:** null | **financialTypes:** none');
-    expect(text).not.toMatch(/(ibrdCommitment|idaCommitment|grantAmount) null/);
+    expect(text).not.toMatch(/(ibrdCommitment|idaCommitment|grantAmount) (null|0\b)/);
   });
 
   it('describes the grant amount apart from the Grants financing window', async () => {

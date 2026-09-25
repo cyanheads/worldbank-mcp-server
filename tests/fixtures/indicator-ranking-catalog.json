@@ -1,0 +1,783 @@
+{
+  "capturedAt": "2026-09-25",
+  "request": "GET https://api.worldbank.org/v2/indicator?format=json&per_page=30000",
+  "note": "Every catalog row whose ID or name holds all terms of one of the ranking queries, in catalog order, with sourceNote and topics dropped.",
+  "rows": [
+    {
+      "id": "6.0.GDPpc_constant",
+      "name": "GDP per capita, PPP (constant 2011 international $) ",
+      "source": {
+        "id": "37",
+        "value": "LAC Equity Lab"
+      }
+    },
+    {
+      "id": "CC.GHG.MEMG.GC",
+      "name": "Macro drivers of GHG emissions growth in the period 2012-2018 - GDP per capita",
+      "source": {
+        "id": "87",
+        "value": "Country Climate and Development Report (CCDR)"
+      }
+    },
+    {
+      "id": "EN.ATM.CO2E.PC",
+      "name": "CO2 emissions (metric tons per capita)",
+      "source": {
+        "id": "57",
+        "value": "WDI Database Archives"
+      }
+    },
+    {
+      "id": "EN.ATM.METH.PC",
+      "name": "Methane emissions (kt of CO2 equivalent per capita)",
+      "source": {
+        "id": "57",
+        "value": "WDI Database Archives"
+      }
+    },
+    {
+      "id": "EN.ATM.NOXE.PC",
+      "name": "Nitrous oxide emissions (metric tons of CO2 equivalent per capita)",
+      "source": {
+        "id": "57",
+        "value": "WDI Database Archives"
+      }
+    },
+    {
+      "id": "EN.GHG.ALL.PC.CE.AR5",
+      "name": "Total greenhouse gas emissions excluding LULUCF per capita (t CO2e/capita)",
+      "source": {
+        "id": "2",
+        "value": "World Development Indicators"
+      }
+    },
+    {
+      "id": "EN.GHG.CO2.PC.CE.AR5",
+      "name": "Carbon dioxide (CO2) emissions excluding LULUCF per capita (t CO2e/capita)",
+      "source": {
+        "id": "2",
+        "value": "World Development Indicators"
+      }
+    },
+    {
+      "id": "FB.DPT.INSU.PC.ZS",
+      "name": "Deposit insurance coverage (% of GDP per capita)",
+      "source": {
+        "id": "57",
+        "value": "WDI Database Archives"
+      }
+    },
+    {
+      "id": "NA.GDP.BUSS.SNA08.CR",
+      "name": "GDP on Business Services Sector (in IDR Million), SNA 2008, Current Price",
+      "source": {
+        "id": "45",
+        "value": "Indonesia Database for Policy and Economic Research"
+      }
+    },
+    {
+      "id": "NA.GDP.EDUS.SNA08.CR",
+      "name": "GDP on Education Services Sector (in IDR Million), SNA 2008, Current Price",
+      "source": {
+        "id": "45",
+        "value": "Indonesia Database for Policy and Economic Research"
+      }
+    },
+    {
+      "id": "NA.GDP.MNF.SNA08.CR",
+      "name": "GDP on Manufacturing Industry Sector (in IDR Million), SNA 2008, Current Price",
+      "source": {
+        "id": "45",
+        "value": "Indonesia Database for Policy and Economic Research"
+      }
+    },
+    {
+      "id": "NV.AGR.PCAP.KD.ZG",
+      "name": "Real agricultural GDP per capita growth rate (%)",
+      "source": {
+        "id": "11",
+        "value": "Africa Development Indicators"
+      }
+    },
+    {
+      "id": "NV.SRV.DISC.CD",
+      "name": "Discrepancy in GDP, value added (current US$)",
+      "source": {
+        "id": "11",
+        "value": "Africa Development Indicators"
+      }
+    },
+    {
+      "id": "NY.GDP.DISC.CD",
+      "name": "Discrepancy in expenditure estimate of GDP (current US$)",
+      "source": {
+        "id": "11",
+        "value": "Africa Development Indicators"
+      }
+    },
+    {
+      "id": "NY.GDP.FCST.CD",
+      "name": "Gross value added at basic prices (GVA) (current US$)",
+      "source": {
+        "id": "2",
+        "value": "World Development Indicators"
+      }
+    },
+    {
+      "id": "NY.GDP.MKTP.CD",
+      "name": "GDP (current US$)",
+      "source": {
+        "id": "2",
+        "value": "World Development Indicators"
+      }
+    },
+    {
+      "id": "NY.GDP.MKTP.CD.XD",
+      "name": "GDP deflator, index (2000=100; US$ series)",
+      "source": {
+        "id": "11",
+        "value": "Africa Development Indicators"
+      }
+    },
+    {
+      "id": "NY.GDP.MKTP.PP.CD",
+      "name": "GDP, PPP (current international $)",
+      "source": {
+        "id": "2",
+        "value": "World Development Indicators"
+      }
+    },
+    {
+      "id": "NY.GDP.PCAP.CD",
+      "name": "GDP per capita (current US$)",
+      "source": {
+        "id": "2",
+        "value": "World Development Indicators"
+      }
+    },
+    {
+      "id": "NY.GDP.PCAP.CN",
+      "name": "GDP per capita (current LCU)",
+      "source": {
+        "id": "2",
+        "value": "World Development Indicators"
+      }
+    },
+    {
+      "id": "NY.GDP.PCAP.KD",
+      "name": "GDP per capita (constant 2015 US$)",
+      "source": {
+        "id": "2",
+        "value": "World Development Indicators"
+      }
+    },
+    {
+      "id": "NY.GDP.PCAP.KD.ZG",
+      "name": "GDP per capita growth (annual %)",
+      "source": {
+        "id": "2",
+        "value": "World Development Indicators"
+      }
+    },
+    {
+      "id": "NY.GDP.PCAP.KN",
+      "name": "GDP per capita (constant LCU)",
+      "source": {
+        "id": "2",
+        "value": "World Development Indicators"
+      }
+    },
+    {
+      "id": "NY.GDP.PCAP.PP.CD",
+      "name": "GDP per capita, PPP (current international $)",
+      "source": {
+        "id": "2",
+        "value": "World Development Indicators"
+      }
+    },
+    {
+      "id": "NY.GDP.PCAP.PP.KD",
+      "name": "GDP per capita, PPP (constant 2021 international $)",
+      "source": {
+        "id": "2",
+        "value": "World Development Indicators"
+      }
+    },
+    {
+      "id": "NY.GDP.PCAP.PP.KD.87",
+      "name": "GDP per capita, PPP (constant 1987 international $)",
+      "source": {
+        "id": "57",
+        "value": "WDI Database Archives"
+      }
+    },
+    {
+      "id": "NY.GDP.PCAP.PP.KD.ZG",
+      "name": "GDP per capita, PPP annual growth (%)",
+      "source": {
+        "id": "11",
+        "value": "Africa Development Indicators"
+      }
+    },
+    {
+      "id": "NYGDPMKTPSACD",
+      "name": "GDP,current US$,millions,seas. adj.,",
+      "source": {
+        "id": "15",
+        "value": "Global Economic Monitor"
+      }
+    },
+    {
+      "id": "PER.ALL.CPL.GDP",
+      "name": "World Bank: Public capital expenditure on education as % of GDP",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "PER.ALL.PS.GDP",
+      "name": "World Bank: Public education expenditure per student (% of GDP per capita)",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "PER.ALL.TSAL.GDP",
+      "name": "World Bank: Ratio of Teacher Salaries to per capita GDP",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "PER.BAS.PS.GDP",
+      "name": "World Bank: Public education expenditure per student (% of GDP per capita), basic",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "PER.BAS.SAL.GDP",
+      "name": "World Bank: Ratio of Teacher Salaries to per capita GDP, basic education",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "PER.JR.PS.GDP",
+      "name": "World Bank: Public education expenditure per student (% of GDP per capita), junior secondary",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "PER.JR.SAL.GDP",
+      "name": "World Bank: Ratio of Teacher Salaries to per capita GDP, junior secondary",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "PER.PP.PS.GDP",
+      "name": "World Bank: Public education expenditure per student (% of GDP per capita), pre-primary",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "PER.PRM.PS.GDP",
+      "name": "World Bank: Public education expenditure per student (% of GDP per capita), primary",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "PER.PRM.SAL.GDP",
+      "name": "World Bank: Ratio of Teacher Salaries to per capita GDP, primary",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "PER.SEC.PS.GDP",
+      "name": "World Bank: Public education expenditure per student (% of GDP per capita), secondary",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "PER.SEC.SAL.GDP",
+      "name": "World Bank: Ratio of Teacher Salaries to per capita GDP, secondary",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "PER.SR.PS.GDP",
+      "name": "World Bank: Public education expenditure per student (% of GDP per capita), senior secondary",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "PER.SR.SAL.GDP",
+      "name": "World Bank: Ratio of Teacher Salaries to per capita GDP, senior secondary",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "PER.TER.PS.GDP",
+      "name": "World Bank: Public education expenditure per student (% of GDP per capita), tertiary",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "PER.TER.SAL.GDP",
+      "name": "World Bank: Ratio of Teacher Salaries to per capita GDP, tertiary",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "PER.TT.PS.GDP",
+      "name": "World Bank: Public education expenditure per student (% of GDP per capita), teacher training",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "PER.VOC.PS.GDP",
+      "name": "World Bank: Public education expenditure per student (% of GDP per capita), technical/vocational education",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "SE.PRM.SATT.2",
+      "name": "(De Facto) Average principal salary as percent of GDP per capita",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "SE.PRM.TATT.1",
+      "name": "(De Jure) Average starting public-school teacher salary as percent of GDP per capita",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "SE.SCH.LIFE",
+      "name": "School life expectancy, primary to tertiary, both sexes (years)",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "SE.SCH.LIFE.FE",
+      "name": "School life expectancy, primary to tertiary, female (years)",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "SE.SCH.LIFE.MA",
+      "name": "School life expectancy, primary to tertiary, male (years)",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "SE.XPD.PRIM.PC.ZS",
+      "name": "Government expenditure per student, primary (% of GDP per capita)",
+      "source": {
+        "id": "2",
+        "value": "World Development Indicators"
+      }
+    },
+    {
+      "id": "SE.XPD.SECO.PC.ZS",
+      "name": "Government expenditure per student, secondary (% of GDP per capita)",
+      "source": {
+        "id": "2",
+        "value": "World Development Indicators"
+      }
+    },
+    {
+      "id": "SE.XPD.TERT.PC.ZS",
+      "name": "Government expenditure per student, tertiary (% of GDP per capita)",
+      "source": {
+        "id": "2",
+        "value": "World Development Indicators"
+      }
+    },
+    {
+      "id": "SP.DYN.LE00.FE.IN",
+      "name": "Life expectancy at birth, female (years)",
+      "source": {
+        "id": "2",
+        "value": "World Development Indicators"
+      }
+    },
+    {
+      "id": "SP.DYN.LE00.IN",
+      "name": "Life expectancy at birth, total (years)",
+      "source": {
+        "id": "2",
+        "value": "World Development Indicators"
+      }
+    },
+    {
+      "id": "SP.DYN.LE00.MA.IN",
+      "name": "Life expectancy at birth, male (years)",
+      "source": {
+        "id": "2",
+        "value": "World Development Indicators"
+      }
+    },
+    {
+      "id": "SP.DYN.LE60.FE.IN",
+      "name": "Life expectancy at age 60, female (years)",
+      "source": {
+        "id": "14",
+        "value": "Gender Statistics"
+      }
+    },
+    {
+      "id": "SP.DYN.LE60.MA.IN",
+      "name": "Life expectancy at age 60, male (years)",
+      "source": {
+        "id": "14",
+        "value": "Gender Statistics"
+      }
+    },
+    {
+      "id": "UIS.SLE.02",
+      "name": "School life expectancy, pre-primary, both sexes (years)",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "UIS.SLE.02.F",
+      "name": "School life expectancy, pre-primary, female (years)",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "UIS.SLE.02.GPI",
+      "name": "School life expectancy, pre-primary, gender parity index (GPI)",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "UIS.SLE.02.M",
+      "name": "School life expectancy, pre-primary, male (years)",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "UIS.SLE.1",
+      "name": "School life expectancy, primary, both sexes (years)",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "UIS.SLE.1.F",
+      "name": "School life expectancy, primary, female (years)",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "UIS.SLE.1.GPI",
+      "name": "School life expectancy, primary, gender parity index (GPI)",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "UIS.SLE.1.M",
+      "name": "School life expectancy, primary, male (years)",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "UIS.SLE.12",
+      "name": "School life expectancy, primary and lower secondary, both sexes (years)",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "UIS.SLE.12.F",
+      "name": "School life expectancy, primary and lower secondary, female (years)",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "UIS.SLE.12.M",
+      "name": "School life expectancy, primary and lower secondary, male (years)",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "UIS.SLE.123",
+      "name": "School life expectancy, primary and secondary, both sexes (years)",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "UIS.SLE.123.F",
+      "name": "School life expectancy, primary and secondary, female (years)",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "UIS.SLE.123.GPI",
+      "name": "School life expectancy, primary and secondary, gender parity index (GPI)",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "UIS.SLE.123.M",
+      "name": "School life expectancy, primary and secondary, male (years)",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "UIS.SLE.1T2.GPI",
+      "name": "School life expectancy, primary and lower secondary, gender parity index (GPI)",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "UIS.SLE.1T6.GPI",
+      "name": "School life expectancy, primary to tertiary, gender parity index (GPI)",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "UIS.SLE.23",
+      "name": "School life expectancy, secondary, both sexes (years)",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "UIS.SLE.23.F",
+      "name": "School life expectancy, secondary, female (years)",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "UIS.SLE.23.GPI",
+      "name": "School life expectancy, secondary, gender parity index (GPI)",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "UIS.SLE.23.M",
+      "name": "School life expectancy, secondary, male (years)",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "UIS.SLE.4",
+      "name": "School life expectancy, post-secondary non-tertiary, both sexes (years)",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "UIS.SLE.4.F",
+      "name": "School life expectancy, post-secondary non-tertiary, female (years)",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "UIS.SLE.4.GPI",
+      "name": "School life expectancy, post-secondary non-tertiary, gender parity index (GPI)",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "UIS.SLE.4.M",
+      "name": "School life expectancy, post-secondary non-tertiary, male (years)",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "UIS.SLE.56",
+      "name": "School life expectancy, tertiary, both sexes (years)",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "UIS.SLE.56.F",
+      "name": "School life expectancy, tertiary, female (years)",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "UIS.SLE.56.GPI",
+      "name": "School life expectancy, tertiary, gender parity index (GPI)",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "UIS.SLE.56.M",
+      "name": "School life expectancy, tertiary, male (years)",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "UIS.XUNIT.GDPCAP.02.FSGOV",
+      "name": "Initial government funding per pre-primary student as a percentage of GDP per capita",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "UIS.XUNIT.GDPCAP.1.FSGOV",
+      "name": "Initial government funding per primary student as a percentage of GDP per capita",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "UIS.XUNIT.GDPCAP.1.FSHH",
+      "name": "Initial household funding per primary student as a percentage of GDP per capita",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "UIS.XUNIT.GDPCAP.2.FSGOV",
+      "name": "Initial government funding per lower secondary student as a percentage of GDP per capita",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "UIS.XUNIT.GDPCAP.23.FSGOV",
+      "name": "Initial government funding per secondary student as a percentage of GDP per capita",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "UIS.XUNIT.GDPCAP.23.FSHH",
+      "name": "Initial household funding per secondary student as a percentage of GDP per capita",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "UIS.XUNIT.GDPCAP.3.FSGOV",
+      "name": "Initial government funding per upper secondary student as a percentage of GDP per capita",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "UIS.XUNIT.GDPCAP.5T8.FSGOV",
+      "name": "Initial government funding per tertiary student as a percentage of GDP per capita",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    },
+    {
+      "id": "UIS.XUNIT.GDPCAP.5T8.FSHH",
+      "name": "Initial household funding per tertiary student as a percentage of GDP per capita",
+      "source": {
+        "id": "12",
+        "value": "Education Statistics"
+      }
+    }
+  ]
+}

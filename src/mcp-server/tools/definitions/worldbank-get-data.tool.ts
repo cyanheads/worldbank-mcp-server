@@ -8,21 +8,17 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { getServerConfig } from '@/config/server-config.js';
 import { pagePastEndNotice } from '@/mcp-server/tools/page-past-end-notice.js';
+import { pageSizeReducedNotice } from '@/mcp-server/tools/page-size-reduced-notice.js';
+import { MAX_OBSERVATIONS_PER_PAGE, RESPONSE_BUDGET_KB } from '@/services/response-budget.js';
 import {
+  COUNTRY_LIST_CONTENT,
   INDICATOR_ID,
   INDICATOR_ID_MESSAGE,
   isAllSelector,
+  splitCountryCodes,
 } from '@/services/worldbank/identifiers.js';
 import type { SourceScopedDisclosure } from '@/services/worldbank/types.js';
 import { type DataResult, getWorldBankApiService } from '@/services/worldbank/worldbank-service.js';
-
-/** Split a caller-supplied country string on either separator this server's tools use. */
-function splitCodes(value: string): string[] {
-  return value
-    .split(/[;,]/)
-    .map((code) => code.trim())
-    .filter((code) => code.length > 0);
-}
 
 /**
  * `"all"` is a keyword for the whole set, not a code. Inside a list upstream
@@ -60,8 +56,7 @@ const EMPTY_COUNTRIES_MESSAGE = 'Provide at least one country code, or "all" for
 
 export const worldbankGetData = tool('worldbank_get_data', {
   title: 'Get World Bank Indicator Data',
-  description:
-    'Query World Bank indicator values for one or more countries across a time range — the primary data-access tool; find indicator_id values with worldbank_search_indicators. Observations carry a null value where data is not available for a country×year cell, which is common for sparse series. Set either date_range (historical analysis) or mrv (most recent N values), not both. For "all" countries, page through the results (per_page up to 1000), since the API returns several hundred entries per indicator. Indicators the standard data endpoint does not serve — WDI Database Archives, PEFA, ICP, GDLD, International Debt Statistics: DSSI, Food Prices for Nutrition — are answered from their own dataset instead; the response then carries sourceScoped, naming that dataset and the release, classification, sector, or counterpart area applied (see dimension_value), because those values can be archived or superseded figures rather than current ones.',
+  description: `Query World Bank indicator values for one or more countries across a time range — the primary data-access tool; find indicator_id values with worldbank_search_indicators. Observations carry a null value where data is not available for a country×year cell, which is common for sparse series. Set either date_range (historical analysis) or mrv (most recent N values), not both. For "all" countries, page through the results at up to ${MAX_OBSERVATIONS_PER_PAGE} per page, since the API returns several hundred entries per indicator. Indicators the standard data endpoint does not serve — WDI Database Archives, PEFA, ICP, GDLD, International Debt Statistics: DSSI, Food Prices for Nutrition — are answered from their own dataset instead; the response then carries sourceScoped, naming that dataset and the release, classification, sector, or counterpart area applied (see dimension_value), because those values can be archived or superseded figures rather than current ones.`,
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   inputAliases: { limit: 'per_page' },
   input: z.object({
@@ -75,8 +70,10 @@ export const worldbankGetData = tool('worldbank_get_data', {
       .union([
         z
           .string()
-          .regex(/[^\s;,]/, EMPTY_COUNTRIES_MESSAGE)
-          .describe('A single country code, a comma- or semicolon-separated list, or "all".'),
+          .regex(COUNTRY_LIST_CONTENT, EMPTY_COUNTRIES_MESSAGE)
+          .describe(
+            'A single country code, a list separated by commas, semicolons, or pipes, or "all".',
+          ),
         z
           .array(z.string().describe('A country code.'))
           .min(1)
@@ -85,11 +82,13 @@ export const worldbankGetData = tool('worldbank_get_data', {
            * element length: the API reads an empty country segment as every
            * entry, so an array holding nothing but separators must not reach it.
            */
-          .refine((codes) => codes.flatMap(splitCodes).length > 0, EMPTY_COUNTRIES_MESSAGE)
-          .describe('An array of country codes.'),
+          .refine((codes) => splitCountryCodes(codes).length > 0, EMPTY_COUNTRIES_MESSAGE)
+          .describe(
+            'An array of country codes; an element holding several codes separated by commas, semicolons, or pipes is split too.',
+          ),
       ])
       .describe(
-        'Country codes. Accepts: ISO2 (US, CN), ISO3 (USA, CHN), regional aggregate codes (EAS, LCN, MEA, SAS, SSF, ECS, NAC), income group codes (HIC, UMC, LMC, LIC), world code (WLD), or "all" on its own for every entry (use pagination). Pass a single code, an array, or one string separated by commas or semicolons. At least one code is required — an empty value is rejected rather than treated as "all".',
+        'Country codes. Accepts: ISO2 (US, CN), ISO3 (USA, CHN), regional aggregate codes (EAS, LCN, MEA, SAS, SSF, ECS, NAC), income group codes (HIC, UMC, LMC, LIC), world code (WLD), or "all" on its own for every entry (use pagination). Pass a single code, an array, or one string separated by commas, semicolons, or pipes (US,JP · US;JP · US|JP). At least one code is required — an empty value, or one made only of separators, is rejected rather than treated as "all".',
       ),
     date_range: z
       .string()
@@ -130,7 +129,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
       .max(1000)
       .optional()
       .describe(
-        'Results per page (default: server default, max: 1000). Use higher values for "all" country queries.',
+        `Results per page (default: server default, max: 1000). One page holds at most ${MAX_OBSERVATIONS_PER_PAGE} observations, which keeps a response within about ${RESPONSE_BUDGET_KB} KB; a larger value is reduced to that cap and echoed as appliedFilters.perPage, and totalPages is counted at the reduced size, so page + 1 continues where a page ends; notice discloses the reduction whenever the result runs past one page.`,
       ),
   }),
   output: z.object({
@@ -138,8 +137,14 @@ export const worldbankGetData = tool('worldbank_get_data', {
       .array(
         z
           .object({
-            countryCode: z.string().describe('ISO2 country code (or aggregate code).'),
-            countryIso3: z.string().describe('ISO3 country code (empty for some aggregates).'),
+            countryCode: z
+              .string()
+              .describe('ISO2 code of the country or aggregate (US, XD for High income).'),
+            countryIso3: z
+              .string()
+              .describe(
+                'Three-character code of the country or aggregate (USA, HIC) — the form the countries input takes. Empty only for an entity the World Bank country listing does not carry.',
+              ),
             countryName: z.string().describe('Country or aggregate name.'),
             date: z
               .string()
@@ -235,7 +240,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
         countries: z
           .string()
           .describe(
-            'Country codes as sent to the API — array elements and comma- or semicolon-separated strings are split and rejoined with semicolons, so this shows the normalized value.',
+            'Country codes as requested, normalized — array elements and strings separated by commas, semicolons, or pipes are split and rejoined with semicolons, the separator the API takes.',
           ),
         dateRange: z
           .string()
@@ -250,7 +255,17 @@ export const worldbankGetData = tool('worldbank_get_data', {
           .optional()
           .describe('dimension_value as requested, omitted when none was given.'),
         page: z.number().describe('Page number requested.'),
-        perPage: z.number().describe('Results per page used, including the server default.'),
+        perPage: z
+          .number()
+          .describe(
+            'Results per page actually served — the requested size or server default, reduced to the page cap when larger. totalPages is counted at this size.',
+          ),
+        requestedPerPage: z
+          .number()
+          .optional()
+          .describe(
+            'Page size asked for, present only when it exceeded the page cap and perPage was reduced.',
+          ),
       })
       .describe(
         'The effective parameters sent to the World Bank API — confirms country code normalization and which filters were in force for these observations.',
@@ -264,7 +279,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
       .string()
       .optional()
       .describe(
-        'Recovery hint for an empty result set — how to broaden the query when nothing matched, or the page range that exists when the requested page is past the end — and, for source-scoped data, the requested country codes the serving dataset publishes nothing for.',
+        'Recovery hint for an empty result set — how to broaden the query when nothing matched, or the page range that exists when the requested page is past the end — a page size reduced to the page cap, and, for source-scoped data, the requested country codes the serving dataset publishes nothing for.',
       ),
   },
 
@@ -286,7 +301,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
             ? []
             : [`dimension_value=${filters.dimensionValue}`]),
           `page=${filters.page}`,
-          `per_page=${filters.perPage}`,
+          `per_page=${filters.perPage}${filters.requestedPerPage === undefined ? '' : ` (requested ${filters.requestedPerPage})`}`,
         ].join(', ')}`,
     },
   },
@@ -355,13 +370,13 @@ export const worldbankGetData = tool('worldbank_get_data', {
     {
       reason: 'country_not_found',
       code: JsonRpcErrorCode.NotFound,
-      when: 'One or more country codes are invalid.',
+      when: 'One or more country codes are invalid. The message and countryCodes name the codes the World Bank country listing lacks, or every requested code when it lacks none.',
       recovery: 'Use worldbank_list_countries to browse valid ISO2, ISO3, and aggregate codes.',
     },
     {
       reason: 'indicator_and_country_not_found',
       code: JsonRpcErrorCode.NotFound,
-      when: 'The indicator ID and the country codes are both invalid.',
+      when: 'The indicator ID and the country codes are both invalid. The codes are named as on country_not_found.',
       recovery:
         'Look the indicator up with worldbank_search_indicators and the codes with worldbank_list_countries before retrying.',
     },
@@ -392,9 +407,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
     const dateRange = input.date_range?.trim() ? input.date_range.trim() : undefined;
     const dimensionValue = input.dimension_value?.trim() ? input.dimension_value.trim() : undefined;
     const perPage = input.per_page ?? getServerConfig().defaultPerPage;
-    const codes = Array.isArray(input.countries)
-      ? input.countries.flatMap(splitCodes)
-      : splitCodes(input.countries);
+    const codes = splitCountryCodes(input.countries);
     const countryCodes = codes.join(';');
 
     if (mixesAll(codes)) {
@@ -465,7 +478,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
           throw ctx.fail('country_not_found', err.message, {
             ...err.data,
             ...ctx.recoveryFor('country_not_found'),
-            countries: countryCodes,
+            countries: codes,
           });
         }
         if (reason === 'indicator_and_country_not_found') {
@@ -473,7 +486,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
             ...err.data,
             ...ctx.recoveryFor('indicator_and_country_not_found'),
             indicatorId: input.indicator_id,
-            countries: countryCodes,
+            countries: codes,
           });
         }
         if (reason === 'unknown_dimension_value') {
@@ -511,7 +524,8 @@ export const worldbankGetData = tool('worldbank_get_data', {
         ...(input.mrv !== undefined && { mrv: input.mrv }),
         ...(dimensionValue !== undefined && { dimensionValue }),
         page: input.page,
-        perPage,
+        perPage: result.perPage,
+        ...(result.perPage < perPage && { requestedPerPage: perPage }),
       },
     });
     ctx.enrich({ totalCount: result.total, currentPage: result.page, totalPages: result.pages });
@@ -531,11 +545,18 @@ export const worldbankGetData = tool('worldbank_get_data', {
           noun: ['observation', 'observations'],
           page: result.page,
           pages: result.pages,
-          perPage,
+          perPage: result.perPage,
           total: result.total,
         }),
       );
     }
+    const reduced = pageSizeReducedNotice({
+      requested: perPage,
+      served: result.perPage,
+      page: result.page,
+      pages: result.pages,
+    });
+    if (reduced) notices.push(reduced);
     const uncovered = result.uncoveredCountries ?? [];
     if (result.sourceScoped && uncovered.length > 0) {
       const { sourceName, sourceId } = result.sourceScoped;

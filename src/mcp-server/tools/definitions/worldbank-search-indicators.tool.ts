@@ -7,6 +7,8 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { getServerConfig } from '@/config/server-config.js';
+import { pagePastEndNotice } from '@/mcp-server/tools/page-past-end-notice.js';
+import { INDICATOR_NOTE_EXCERPT_CHARS, shorten } from '@/services/response-budget.js';
 import {
   CATALOG_FILTER_ID,
   SOURCE_ID_MESSAGE,
@@ -16,8 +18,7 @@ import { getWorldBankApiService } from '@/services/worldbank/worldbank-service.j
 
 export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
   title: 'Search World Bank Indicators',
-  description:
-    'Search the 29,500+ World Bank indicator catalog by keyword, topic, or source, returning indicator IDs and metadata for worldbank_get_data. Provide at least one of query, topic_id, or source_id; a topic and a source together narrow to indicators in both. A keyword query matches every term against indicator ID, name, and description, in any word order, across the whole catalog or the whole selected topic or source; punctuation is ignored, so the query needs at least one letter or digit. Exact ID or name matches rank first, then whole-phrase matches, then other ID/name matches, then description-only matches. Each indicator ID appears once, even where the catalog publishes it under two sources. Find topic IDs with worldbank_list_topics and source IDs with worldbank_list_sources.',
+  description: `Search the 29,500+ World Bank indicator catalog by keyword, topic, or source, returning indicator IDs and metadata for worldbank_get_data. Provide at least one of query, topic_id, or source_id; a topic and a source together narrow to indicators in both. A keyword query matches every term against indicator ID, name, and full description, in any word order, across the whole catalog or the whole selected topic or source; punctuation is ignored, so the query needs at least one letter or digit. Exact ID or name matches rank first, then names starting with the phrase as whole words, then whole-phrase matches, then matches where every term is a whole word of the ID or name, then other ID/name matches, then description-only matches; within each of those, World Development Indicators series come first, then other live sources, then archives, and a series comes ahead of its own breakdowns by sex, area, or age. Each indicator ID appears once, even where the catalog publishes it under two sources. Each result carries the first ${INDICATOR_NOTE_EXCERPT_CHARS} characters of its description; worldbank_get_indicator returns the whole of it. Find topic IDs with worldbank_list_topics and source IDs with worldbank_list_sources.`,
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   inputAliases: { limit: 'per_page' },
   input: z.object({
@@ -63,7 +64,11 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
             name: z.string().describe('Indicator name.'),
             sourceId: z.string().describe('Source dataset ID.'),
             sourceName: z.string().describe('Source dataset name.'),
-            sourceNote: z.string().describe('Brief indicator description.'),
+            sourceNote: z
+              .string()
+              .describe(
+                `Indicator description, cut to its first ${INDICATOR_NOTE_EXCERPT_CHARS} characters and marked with … when longer. worldbank_get_indicator returns it whole.`,
+              ),
             topics: z
               .array(
                 z
@@ -112,7 +117,9 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
     notice: z
       .string()
       .optional()
-      .describe('Recovery hint when no indicators matched — suggests how to broaden the search.'),
+      .describe(
+        'Recovery hint for an empty page — how to broaden the search when no indicators matched, or the page range that exists when the requested page is past the end.',
+      ),
   },
 
   enrichmentTrailer: {
@@ -224,7 +231,13 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
     if (result.indicators.length === 0) {
       let hint: string;
       if (result.total > 0) {
-        hint = `Page ${result.page} is past the last page of ${result.pages}. Request a page between 1 and ${result.pages}.`;
+        hint = pagePastEndNotice({
+          noun: ['indicator', 'indicators'],
+          page: result.page,
+          pages: result.pages,
+          perPage,
+          total: result.total,
+        });
       } else if (query) {
         hint = `No indicators matched "${query}". Try a synonym or browse by topic using worldbank_list_topics.`;
       } else {
@@ -233,7 +246,17 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
       ctx.enrich.notice(hint);
     }
 
-    return { indicators: result.indicators };
+    /**
+     * A note runs up to ~4,000 characters, so a 100-row page of whole notes
+     * reaches ~148 KB. Matching has already read every note in full; the rows
+     * returned carry an excerpt.
+     */
+    return {
+      indicators: result.indicators.map((indicator) => ({
+        ...indicator,
+        sourceNote: shorten(indicator.sourceNote, INDICATOR_NOTE_EXCERPT_CHARS),
+      })),
+    };
   },
 
   format: (result) => {

@@ -22,6 +22,7 @@ import {
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
+import { MAX_COUNTRIES_PER_PAGE, MAX_OBSERVATIONS_PER_PAGE } from '@/services/response-budget.js';
 import { sharedLoadContext, untilAborted } from '@/services/shared-load.js';
 import { isWithinWindow, monthSpan, parseDateWindow, periodFromToken } from './periods.js';
 import {
@@ -233,19 +234,26 @@ function normalizeCountry(raw: RawCountry): Country {
   };
 }
 
-function normalizeDataPoint(raw: RawDataPoint, aggregateCodes: Set<string>): DataPoint {
-  const countryCode = raw.country?.id ?? '';
+/**
+ * Normalize one data-endpoint row, completing its two codes from the country
+ * index. `country.id` is normally ISO2 and `countryiso3code` the three-character
+ * code, but upstream leaves `countryiso3code` empty on the income groups and Not
+ * classified (`XD`, `XY`), and Global Economic Monitor rows put the ISO3 code in
+ * `country.id` (`KEN`) with `countryiso3code` empty. An entity the index does not
+ * carry keeps what upstream sent.
+ */
+function normalizeDataPoint(raw: RawDataPoint, index: CountryIndex): DataPoint {
+  const entity = index.entities.get((raw.country?.id ?? '').toUpperCase());
+  const countryCode = entity?.iso2 || (raw.country?.id ?? '');
+  const countryIso3 = raw.countryiso3code || entity?.id || '';
   return {
     countryCode,
-    countryIso3: raw.countryiso3code ?? '',
+    countryIso3,
     countryName: raw.country?.value ?? '',
     date: raw.date ?? '',
     value: raw.value ?? null,
     obsStatus: raw.obs_status ?? '',
-    // Data endpoint returns country.id as ISO2 (e.g. "ZH" for AFE), but
-    // countryiso3code carries the aggregate code (e.g. "AFE"). Check both;
-    // aggregateCodes holds both identifiers for every aggregate.
-    isAggregate: aggregateCodes.has(raw.countryiso3code ?? '') || aggregateCodes.has(countryCode),
+    isAggregate: index.aggregateCodes.has(countryIso3) || index.aggregateCodes.has(countryCode),
   };
 }
 
@@ -272,6 +280,14 @@ function normalizeSource(raw: RawSource): Source {
 // ─── Duplicate indicator collapse ────────────────────────────────────────────
 
 /**
+ * Whether a catalog source is an archive of another — WDI Database Archives and
+ * FPN Datahub Archive, whose series are superseded copies of live ones.
+ */
+function isArchivedSource(sourceName: string): boolean {
+  return /archive/i.test(sourceName);
+}
+
+/**
  * Pick the row to keep out of two catalog entries sharing one indicator ID.
  * Dozens of indicators are published twice, identical but for their `source`:
  * a live dataset and an archived copy of it. The archived copy loses; when
@@ -282,8 +298,8 @@ function preferredRow<T extends { sourceId: string; sourceName: string }>(
   current: T,
   candidate: T,
 ): T {
-  const currentArchived = /archive/i.test(current.sourceName);
-  const candidateArchived = /archive/i.test(candidate.sourceName);
+  const currentArchived = isArchivedSource(current.sourceName);
+  const candidateArchived = isArchivedSource(candidate.sourceName);
   if (currentArchived !== candidateArchived) return currentArchived ? candidate : current;
   return Number(candidate.sourceId) < Number(current.sourceId) ? candidate : current;
 }
@@ -341,24 +357,87 @@ function normalizeForMatch(value: string): string {
     .trim();
 }
 
+/** Source ID of World Development Indicators, the Bank's flagship series. */
+const WDI_SOURCE_ID = '2';
+
 /**
- * Rank the ID/name hits so a caller who typed something specific gets it first:
- * an exact ID or name, then the query as a contiguous phrase, then the rest in
- * catalog order. Without this, `Population, total` buries `SP.POP.TOTL` behind
- * whichever loosely-related indicators happen to sort earlier upstream.
+ * Order of a hit's source within a match tier: World Development Indicators,
+ * then any other live source, then an archive. A regional dataset or an archived
+ * copy otherwise sorts ahead of the canonical series whenever the catalog lists
+ * it first.
  */
-function rankIdOrNameHits(hits: readonly Indicator[], phrase: string): Indicator[] {
-  const exact: Indicator[] = [];
-  const contiguous: Indicator[] = [];
-  const rest: Indicator[] = [];
-  for (const indicator of hits) {
-    const id = normalizeForMatch(indicator.id);
-    const name = normalizeForMatch(indicator.name);
-    if (phrase === id || phrase === name) exact.push(indicator);
-    else if (`${id} ${name}`.includes(phrase)) contiguous.push(indicator);
-    else rest.push(indicator);
-  }
-  return [...exact, ...contiguous, ...rest];
+function sourceRank(indicator: Indicator): number {
+  if (indicator.sourceId === WDI_SOURCE_ID) return 0;
+  return isArchivedSource(indicator.sourceName) ? 2 : 1;
+}
+
+/**
+ * What may follow the phrase at the start of a name for the name to start with
+ * it: the end of a word, optionally after a plural `s` or `es` on its last word.
+ * `trade` starts `Trade (% of GDP)` but not `Trademark applications`, and `export`
+ * still starts `Exports of goods and services`.
+ */
+const PHRASE_WORD_END = /^(?:e?s)?(?: |$)/;
+
+/**
+ * How specifically an ID/name hit matches the normalized query: an exact ID or
+ * name (0), a name starting with the phrase as whole words (1), the phrase
+ * anywhere in the ID or name (2), every term a whole word of them (3), or terms
+ * found only inside longer words (4) — `co2` inside `CO2e` matches, but a series
+ * whose name carries `CO2` itself is the likelier target.
+ */
+function matchTier(indicator: Indicator, phrase: string, terms: readonly string[]): number {
+  const id = normalizeForMatch(indicator.id);
+  const name = normalizeForMatch(indicator.name);
+  if (phrase === id || phrase === name) return 0;
+  if (name.startsWith(phrase) && PHRASE_WORD_END.test(name.slice(phrase.length))) return 1;
+  const idAndName = `${id} ${name}`;
+  if (idAndName.includes(phrase)) return 2;
+  const words = new Set(idAndName.split(' '));
+  return terms.every((term) => words.has(term)) ? 3 : 4;
+}
+
+/**
+ * The series family an indicator ID belongs to: its first three segments
+ * (`SP.DYN.LE00` for `SP.DYN.LE00.FE.IN`), or the whole ID when it has no more.
+ * World Bank IDs mark a breakdown — by sex, area, age, or quintile — with an
+ * extra segment, so the family member with the fewest segments is the series for
+ * the whole population.
+ */
+function seriesFamily(id: string): string {
+  return id.split('.').slice(0, 3).join('.');
+}
+
+/** Tier of a hit that matched only the prose in `sourceNote`, after every ID/name tier. */
+const DESCRIPTION_ONLY_TIER = 5;
+
+/**
+ * Rank the hits so a caller who typed something specific gets it first: by
+ * match tier, then by source within a tier, then in catalog order, except that
+ * a series family is gathered at its first member's place, fewest ID segments
+ * first. Without this, `Population, total` buries `SP.POP.TOTL` behind whichever
+ * loosely-related indicators happen to sort earlier upstream, `GDP per capita`
+ * leads with a regional dataset's copy of the series, and `access to electricity`
+ * with the rural rate, which the catalog lists ahead of the total. Both sorts are
+ * stable, so catalog order breaks the remaining ties.
+ */
+function rankHits(hits: ReadonlyArray<{ indicator: Indicator; tier: number }>): Indicator[] {
+  const ranked = hits
+    .map((hit) => ({ ...hit, source: sourceRank(hit.indicator) }))
+    .sort((a, b) => a.tier - b.tier || a.source - b.source);
+  const familyLead = new Map<string, number>();
+  return ranked
+    .map((hit, index) => {
+      const family = `${hit.tier}|${hit.source}|${seriesFamily(hit.indicator.id)}`;
+      let lead = familyLead.get(family);
+      if (lead === undefined) {
+        lead = index;
+        familyLead.set(family, lead);
+      }
+      return { indicator: hit.indicator, lead, segments: hit.indicator.id.split('.').length };
+    })
+    .sort((a, b) => a.lead - b.lead || a.segments - b.segments)
+    .map(({ indicator }) => indicator);
 }
 
 /**
@@ -369,26 +448,27 @@ function rankIdOrNameHits(hits: readonly Indicator[], phrase: string): Indicator
  * raw haystack directly: an alphanumeric run in the normalized text is present
  * verbatim in the original, so normalizing 29.5k source notes per query buys
  * nothing. Results matching on ID or name are ranked ahead of those that only
- * matched the prose in `sourceNote`, which keeps the useful hits on page one.
+ * matched the prose in `sourceNote`, which keeps the useful hits on page one;
+ * those description-only hits form the last tier, ranked like the others. The
+ * whole note is read here, whatever excerpt of it a tool returns.
  */
 function matchIndicators(indicators: readonly Indicator[], query: string): Indicator[] {
   const phrase = normalizeForMatch(query);
   const tokens = phrase.split(' ');
 
-  const byIdOrName: Indicator[] = [];
-  const byNote: Indicator[] = [];
+  const hits: Array<{ indicator: Indicator; tier: number }> = [];
   for (const indicator of indicators) {
     const idAndName = `${indicator.id} ${indicator.name}`.toLowerCase();
     if (tokens.every((token) => idAndName.includes(token))) {
-      byIdOrName.push(indicator);
+      hits.push({ indicator, tier: matchTier(indicator, phrase, tokens) });
       continue;
     }
     const note = indicator.sourceNote.toLowerCase();
     if (tokens.every((token) => idAndName.includes(token) || note.includes(token))) {
-      byNote.push(indicator);
+      hits.push({ indicator, tier: DESCRIPTION_ONLY_TIER });
     }
   }
-  return [...rankIdOrNameHits(byIdOrName, phrase), ...byNote];
+  return rankHits(hits);
 }
 
 // ─── Service ─────────────────────────────────────────────────────────────────
@@ -421,6 +501,8 @@ export type DataResult = {
   total: number;
   page: number;
   pages: number;
+  /** Page size actually served: the requested size, reduced to the page cap when larger. */
+  perPage: number;
   nullCount: number;
   dateFilterDropped: boolean;
   /** Present when the source-scoped data API served the result instead of the standard endpoint. */
@@ -1071,6 +1153,7 @@ export class WorldBankApiService {
       total: rows.length,
       page,
       pages: Math.max(1, Math.ceil(rows.length / perPage)),
+      perPage,
       nullCount: data.filter((d) => d.value === null).length,
       dateFilterDropped: false,
       sourceScoped: {
@@ -1090,6 +1173,10 @@ export class WorldBankApiService {
 
   // ─── Countries ───────────────────────────────────────────────────────────
 
+  /**
+   * One page of the country listing, at most {@link MAX_COUNTRIES_PER_PAGE}
+   * entries, with pages counted at the size served on either path.
+   */
   async listCountries(
     opts: {
       region?: string;
@@ -1101,8 +1188,16 @@ export class WorldBankApiService {
       perPage: number;
     },
     ctx: Context,
-  ): Promise<{ countries: Country[]; total: number; page: number; pages: number }> {
-    const { region, incomeLevel, lendingType, includeAggregates, page, perPage } = opts;
+  ): Promise<{
+    countries: Country[];
+    total: number;
+    page: number;
+    pages: number;
+    /** Page size actually served: the requested size, reduced to the page cap when larger. */
+    perPage: number;
+  }> {
+    const { region, incomeLevel, lendingType, includeAggregates, page } = opts;
+    const perPage = Math.min(opts.perPage, MAX_COUNTRIES_PER_PAGE);
 
     const filterParams: Record<string, string | number | undefined> = {};
     if (region) filterParams.region = region;
@@ -1143,6 +1238,7 @@ export class WorldBankApiService {
         total: countries.length,
         page,
         pages: Math.max(1, Math.ceil(countries.length / perPage)),
+        perPage,
       };
     }
 
@@ -1158,6 +1254,7 @@ export class WorldBankApiService {
       total: paging.total,
       page: paging.page,
       pages: paging.pages,
+      perPage,
     };
   }
 
@@ -1244,18 +1341,54 @@ export class WorldBankApiService {
 
   // ─── Data ─────────────────────────────────────────────────────────────────
 
-  async getData(opts: GetDataOptions, ctx: Context): Promise<DataResult> {
+  /**
+   * Place a rejection of the country segment on the requested codes the country
+   * index lacks — upstream's envelope never names the codes at fault. Read only
+   * once upstream has rejected the request, so the index never gates a call
+   * upstream would accept. It places the blame and never decides it: when it
+   * knows every code, or fails to load, every requested code is named.
+   */
+  private async blamedCountryCodes(codes: string[], ctx: Context): Promise<string> {
+    try {
+      const { entities } = await this.loadCountryIndex(ctx);
+      const unknown = codes.filter((code) => !entities.has(code.toUpperCase()));
+      return (unknown.length > 0 ? unknown : codes).join(';');
+    } catch (err) {
+      if (ctx.signal.aborted) throw err;
+      ctx.log.warning('Country index unavailable; naming every requested country code', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return codes.join(';');
+    }
+  }
+
+  /**
+   * One page of observations. The page size is reduced to
+   * {@link MAX_OBSERVATIONS_PER_PAGE} once, here, so every path below serves and
+   * counts pages at that size: the upstream request, the local slice of a re-read
+   * date window, and the local slice of the source-scoped API.
+   */
+  async getData(requested: GetDataOptions, ctx: Context): Promise<DataResult> {
+    const opts = { ...requested, perPage: Math.min(requested.perPage, MAX_OBSERVATIONS_PER_PAGE) };
     const { indicatorId, countries, dateRange, mrv, dimensionValue, page, perPage } = opts;
 
-    const countryCodes = Array.isArray(countries) ? countries.join(';') : countries;
+    const codes = Array.isArray(countries) ? countries : countries.split(';');
 
     const scope: Record<string, string | number | undefined> = {};
     if (dateRange) scope.date = dateRange;
     if (mrv !== undefined) scope.mrv = mrv;
 
-    const path = `/country/${encodeURIComponent(countryCodes)}/indicator/${encodeURIComponent(indicatorId)}`;
+    /**
+     * The API's edge firewall answers HTTP 403 to any country segment carrying
+     * `;LS` — Lesotho after another code — which reads as a shell command. `LS`
+     * is the only one of the 295 codes the listing carries that it blocks, and
+     * `LSO` names the same economy, so the path sends that. Rows still name
+     * Lesotho `LS` / `LSO`.
+     */
+    const pathCodes = codes.map((code) => (code.toUpperCase() === 'LS' ? 'LSO' : code)).join(';');
+    const path = `/country/${encodeURIComponent(pathCodes)}/indicator/${encodeURIComponent(indicatorId)}`;
     const url = this.buildUrl(path, { ...scope, page, per_page: perPage });
-    ctx.log.debug('Fetching data', { indicatorId, countryCodes, url });
+    ctx.log.debug('Fetching data', { indicatorId, countries: codes, url });
 
     const data = await this.fetchLookup<RawDataPoint>(url, ctx);
 
@@ -1273,6 +1406,7 @@ export class WorldBankApiService {
       // codes have passed, and it means this endpoint does not serve the
       // indicator — its catalog source's source-scoped API is tried instead.
       if (envelope.message.length > 1) {
+        const countryCodes = await this.blamedCountryCodes(codes, ctx);
         throw notFound(
           `Neither indicator "${indicatorId}" nor country code(s) "${countryCodes}" are valid. Detail: ${detail}. Use worldbank_search_indicators and worldbank_list_countries.`,
           { reason: 'indicator_and_country_not_found', indicatorId, countryCodes, detail },
@@ -1287,6 +1421,7 @@ export class WorldBankApiService {
           { reason: 'indicator_not_found', indicatorId, detail },
         );
       }
+      const countryCodes = await this.blamedCountryCodes(codes, ctx);
       throw notFound(
         `Country code(s) "${countryCodes}" not valid. Detail: ${detail}. Use worldbank_list_countries to browse valid codes.`,
         { reason: 'country_not_found', countryCodes, indicatorId, detail },
@@ -1330,6 +1465,7 @@ export class WorldBankApiService {
         total: paging.total ?? 0,
         page: paging.page ?? page,
         pages: paging.pages ?? 1,
+        perPage,
         nullCount: 0,
         dateFilterDropped: false,
       };
@@ -1371,13 +1507,14 @@ export class WorldBankApiService {
         total,
         page: currentPage,
         pages,
+        perPage,
         nullCount: 0,
         dateFilterDropped,
       };
     }
 
-    const { aggregateCodes } = await this.loadCountryIndex(ctx);
-    const dataPoints = matched.map((raw) => normalizeDataPoint(raw, aggregateCodes));
+    const index = await this.loadCountryIndex(ctx);
+    const dataPoints = matched.map((raw) => normalizeDataPoint(raw, index));
 
     return {
       data: dataPoints,
@@ -1385,6 +1522,7 @@ export class WorldBankApiService {
       total,
       page: currentPage,
       pages,
+      perPage,
       nullCount: dataPoints.filter((d) => d.value === null).length,
       dateFilterDropped,
     };

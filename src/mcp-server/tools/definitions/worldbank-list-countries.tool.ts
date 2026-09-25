@@ -8,6 +8,8 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { getServerConfig } from '@/config/server-config.js';
 import { pagePastEndNotice } from '@/mcp-server/tools/page-past-end-notice.js';
+import { pageSizeReducedNotice } from '@/mcp-server/tools/page-size-reduced-notice.js';
+import { MAX_COUNTRIES_PER_PAGE, RESPONSE_BUDGET_KB } from '@/services/response-budget.js';
 import { getWorldBankApiService } from '@/services/worldbank/worldbank-service.js';
 
 /** The `/v2/lendingType` ids — the complete set. */
@@ -56,7 +58,9 @@ export const worldbankListCountries = tool('worldbank_list_countries', {
       .min(1)
       .max(300)
       .optional()
-      .describe('Results per page (default: server default, max: 300).'),
+      .describe(
+        `Results per page (default: server default, max: 300). One page holds at most ${MAX_COUNTRIES_PER_PAGE} entries, which keeps a response within about ${RESPONSE_BUDGET_KB} KB; a larger value is reduced to that cap and echoed as appliedFilters.perPage, and totalPages is counted at the reduced size, so page + 1 continues where a page ends; notice discloses the reduction whenever the result runs past one page.`,
+      ),
   }),
   output: z.object({
     countries: z
@@ -97,9 +101,39 @@ export const worldbankListCountries = tool('worldbank_list_countries', {
       .describe('Countries (and optionally aggregates) matching the filters.'),
   }),
 
-  // Agent-facing context: pagination totals. Kept out of the domain return so it
-  // reaches both structuredContent and content[] automatically.
+  // Agent-facing context: the applied filters and pagination totals. Kept out of
+  // the domain return so it reaches both structuredContent and content[] automatically.
   enrichment: {
+    appliedFilters: z
+      .object({
+        region: z.string().optional().describe('Region code applied, omitted when none.'),
+        incomeLevel: z
+          .string()
+          .optional()
+          .describe('Income level code applied, omitted when none.'),
+        lendingType: z
+          .string()
+          .optional()
+          .describe('Lending type code applied, omitted when none.'),
+        includeAggregates: z
+          .boolean()
+          .describe('Whether aggregates were requested, including the default of false.'),
+        page: z.number().describe('Page number requested.'),
+        perPage: z
+          .number()
+          .describe(
+            'Results per page actually served — the requested size or server default, reduced to the page cap when larger. totalPages is counted at this size.',
+          ),
+        requestedPerPage: z
+          .number()
+          .optional()
+          .describe(
+            'Page size asked for, present only when it exceeded the page cap and perPage was reduced.',
+          ),
+      })
+      .describe(
+        'The effective listing parameters — which filters were in force and the page size served.',
+      ),
     totalCount: z
       .number()
       .describe(
@@ -113,8 +147,26 @@ export const worldbankListCountries = tool('worldbank_list_countries', {
       .string()
       .optional()
       .describe(
-        'Context for an empty page: which filters matched nothing, or the page range that exists when the requested page is past the end.',
+        'Context for an empty page — which filters matched nothing, or the page range that exists when the requested page is past the end — or for a page size reduced to the page cap.',
       ),
+  },
+
+  enrichmentTrailer: {
+    appliedFilters: {
+      /**
+       * A per-field `render` replaces the whole trailer line, `label` included,
+       * so the heading has to be part of what it returns.
+       */
+      render: (filters) =>
+        `**Applied Filters:** ${[
+          ...(filters.region === undefined ? [] : [`region=${filters.region}`]),
+          ...(filters.incomeLevel === undefined ? [] : [`income_level=${filters.incomeLevel}`]),
+          ...(filters.lendingType === undefined ? [] : [`lending_type=${filters.lendingType}`]),
+          `include_aggregates=${filters.includeAggregates}`,
+          `page=${filters.page}`,
+          `per_page=${filters.perPage}${filters.requestedPerPage === undefined ? '' : ` (requested ${filters.requestedPerPage})`}`,
+        ].join(', ')}`,
+    },
   },
 
   errors: [
@@ -163,6 +215,17 @@ export const worldbankListCountries = tool('worldbank_list_countries', {
       }
       throw err;
     }
+    ctx.enrich({
+      appliedFilters: {
+        ...(region !== undefined && { region }),
+        ...(incomeLevel !== undefined && { incomeLevel }),
+        ...(lendingType !== undefined && { lendingType }),
+        includeAggregates: input.include_aggregates,
+        page: input.page,
+        perPage: result.perPage,
+        ...(result.perPage < perPage && { requestedPerPage: perPage }),
+      },
+    });
     ctx.enrich({ totalCount: result.total, currentPage: result.page, totalPages: result.pages });
 
     if (result.total === 0) {
@@ -178,16 +241,27 @@ export const worldbankListCountries = tool('worldbank_list_countries', {
             ? `No countries matched ${filters[0]}.`
             : 'The World Bank returned no countries.',
       );
-    } else if (result.countries.length === 0) {
-      ctx.enrich.notice(
-        pagePastEndNotice({
-          noun: ['country', 'countries'],
+    } else {
+      const notices = [
+        ...(result.countries.length === 0
+          ? [
+              pagePastEndNotice({
+                noun: ['country', 'countries'],
+                page: result.page,
+                pages: result.pages,
+                perPage: result.perPage,
+                total: result.total,
+              }),
+            ]
+          : []),
+        pageSizeReducedNotice({
+          requested: perPage,
+          served: result.perPage,
           page: result.page,
           pages: result.pages,
-          perPage,
-          total: result.total,
         }),
-      );
+      ].filter((notice) => notice !== undefined);
+      if (notices.length > 0) ctx.enrich.notice(notices.join(' '));
     }
     return { countries: result.countries };
   },

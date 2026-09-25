@@ -48,11 +48,22 @@ const mockCountriesResult = {
   pages: 1,
 };
 
+/**
+ * A listCountries stub resolving with `result`, echoing the requested page size
+ * as the served one — the service's answer for any size up to its cap.
+ */
+function servesAsAsked(result: object) {
+  return vi.fn().mockImplementation(async (opts: { perPage: number }) => ({
+    perPage: opts.perPage,
+    ...result,
+  }));
+}
+
 describe('worldbankListCountries', () => {
   beforeEach(async () => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
     vi.mocked(getWorldBankApiService).mockReturnValue({
-      listCountries: vi.fn().mockResolvedValue(mockCountriesResult),
+      listCountries: servesAsAsked(mockCountriesResult),
     } as never);
   });
 
@@ -82,7 +93,7 @@ describe('worldbankListCountries', () => {
 
   it('skips empty string region/income filters from form clients', async () => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
-    const listCountriesMock = vi.fn().mockResolvedValue(mockCountriesResult);
+    const listCountriesMock = servesAsAsked(mockCountriesResult);
     vi.mocked(getWorldBankApiService).mockReturnValue({
       listCountries: listCountriesMock,
     } as never);
@@ -184,7 +195,7 @@ describe('worldbankListCountries', () => {
 
   it('reads limit as per_page', async () => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
-    const listCountriesMock = vi.fn().mockResolvedValue(mockCountriesResult);
+    const listCountriesMock = servesAsAsked(mockCountriesResult);
     vi.mocked(getWorldBankApiService).mockReturnValue({
       listCountries: listCountriesMock,
     } as never);
@@ -213,6 +224,17 @@ describe('worldbankListCountries', () => {
     expect(() => worldbankListCountries.input.parse({ per_page: 301 })).toThrow();
   });
 
+  it('keeps accepting per_page up to 300, and says one page holds at most 150', async () => {
+    const { worldbankListCountries } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
+    );
+    expect(worldbankListCountries.input.safeParse({ per_page: 300 }).success).toBe(true);
+    const perPage = (worldbankListCountries.input.shape.per_page as { description?: string })
+      .description;
+    expect(perPage).toMatch(/at most 150 entries/);
+    expect(perPage).toMatch(/appliedFilters\.perPage/);
+  });
+
   it('accepts include_aggregates=true', async () => {
     const { worldbankListCountries } = await import(
       '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
@@ -224,7 +246,7 @@ describe('worldbankListCountries', () => {
 
   it('passes include_aggregates=true to service', async () => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
-    const listCountriesMock = vi.fn().mockResolvedValue(mockCountriesResult);
+    const listCountriesMock = servesAsAsked(mockCountriesResult);
     vi.mocked(getWorldBankApiService).mockReturnValue({
       listCountries: listCountriesMock,
     } as never);
@@ -241,7 +263,7 @@ describe('worldbankListCountries', () => {
 
   it('passes include_aggregates=false with the requested page to the service', async () => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
-    const listCountriesMock = vi.fn().mockResolvedValue(mockCountriesResult);
+    const listCountriesMock = servesAsAsked(mockCountriesResult);
     vi.mocked(getWorldBankApiService).mockReturnValue({
       listCountries: listCountriesMock,
     } as never);
@@ -274,9 +296,7 @@ describe('worldbankListCountries', () => {
       isAggregate: false,
     };
     vi.mocked(getWorldBankApiService).mockReturnValue({
-      listCountries: vi
-        .fn()
-        .mockResolvedValue({ countries: [deepCountry], total: 320, page: 7, pages: 7 }),
+      listCountries: servesAsAsked({ countries: [deepCountry], total: 320, page: 7, pages: 7 }),
     } as never);
 
     const { worldbankListCountries } = await import(
@@ -306,7 +326,7 @@ describe('worldbankListCountries', () => {
   it('flags a page past the end on both surfaces without claiming nothing matched', async () => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
     vi.mocked(getWorldBankApiService).mockReturnValue({
-      listCountries: vi.fn().mockResolvedValue({ countries: [], total: 6, page: 2, pages: 1 }),
+      listCountries: servesAsAsked({ countries: [], total: 6, page: 2, pages: 1 }),
     } as never);
     const { worldbankListCountries } = await import(
       '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
@@ -335,7 +355,7 @@ describe('worldbankListCountries', () => {
   it('says which filters matched nothing when the total is zero', async () => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
     vi.mocked(getWorldBankApiService).mockReturnValue({
-      listCountries: vi.fn().mockResolvedValue({ countries: [], total: 0, page: 1, pages: 1 }),
+      listCountries: servesAsAsked({ countries: [], total: 0, page: 1, pages: 1 }),
     } as never);
     const { worldbankListCountries } = await import(
       '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
@@ -354,7 +374,7 @@ describe('worldbankListCountries', () => {
 
   it('passes lending_type to the service beside the other filters, and omits it when absent', async () => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
-    const listCountriesMock = vi.fn().mockResolvedValue(mockCountriesResult);
+    const listCountriesMock = servesAsAsked(mockCountriesResult);
     vi.mocked(getWorldBankApiService).mockReturnValue({
       listCountries: listCountriesMock,
     } as never);
@@ -389,7 +409,7 @@ describe('worldbankListCountries', () => {
   it('names every filter in force when nothing matched, on both surfaces', async () => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
     vi.mocked(getWorldBankApiService).mockReturnValue({
-      listCountries: vi.fn().mockResolvedValue({ countries: [], total: 0, page: 1, pages: 1 }),
+      listCountries: servesAsAsked({ countries: [], total: 0, page: 1, pages: 1 }),
     } as never);
     const { worldbankListCountries } = await import(
       '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'

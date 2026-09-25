@@ -10,8 +10,10 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { getServerConfig } from '@/config/server-config.js';
 import { pagePastEndNotice } from '@/mcp-server/tools/page-past-end-notice.js';
+import { pageSizeReducedNotice } from '@/mcp-server/tools/page-size-reduced-notice.js';
 import { getPipService } from '@/services/pip/pip-service.js';
 import { MAX_ESTIMATES_PER_PAGE, RESPONSE_BUDGET_KB } from '@/services/response-budget.js';
+import { COUNTRY_LIST_CONTENT, splitCountryCodes } from '@/services/worldbank/identifiers.js';
 import { getWorldBankApiService } from '@/services/worldbank/worldbank-service.js';
 
 /**
@@ -20,14 +22,6 @@ import { getWorldBankApiService } from '@/services/worldbank/worldbank-service.j
  * code is refused rather than answered with PIP's narrower `IDA`.
  */
 const IDA_TOTAL_CODES: ReadonlySet<string> = new Set(['IDA', 'XG']);
-
-/** Split a caller-supplied country string on either separator this server's tools use. */
-function splitCodes(value: string): string[] {
-  return value
-    .split(/[;,]/)
-    .map((code) => code.trim())
-    .filter((code) => code.length > 0);
-}
 
 /** `a` or `a and b`, for naming one to a handful of codes in a notice. */
 function listCodes(codes: readonly string[]): string {
@@ -56,8 +50,13 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
       .union([
         z
           .string()
-          .regex(/[^\s;,]/, 'Provide at least one country code, or "all" for every economy.')
-          .describe('A single country code, a comma-separated list, or "all".'),
+          .regex(
+            COUNTRY_LIST_CONTENT,
+            'Provide at least one country code, or "all" for every economy.',
+          )
+          .describe(
+            'A single country code, a list separated by commas, semicolons, or pipes, or "all".',
+          ),
         z
           .array(z.string().describe('A country code.'))
           .min(1)
@@ -67,13 +66,15 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
            * array holding nothing but separators must not reach it.
            */
           .refine(
-            (codes) => codes.flatMap(splitCodes).length > 0,
+            (codes) => splitCountryCodes(codes).length > 0,
             'Provide at least one country code, or "all" for every economy.',
           )
-          .describe('An array of country codes.'),
+          .describe(
+            'An array of country codes; an element holding several codes separated by commas, semicolons, or pipes is split too.',
+          ),
       ])
       .describe(
-        'Country codes: a single code, an array, or one string separated by commas or semicolons. Economies go by ISO3 (IND, USA) or ISO2 (IN, US) code, including those PIP publishes only as model estimates (AFG); "all" returns every economy. PIP\'s aggregates are served too: WLD; the World Bank regions AFE, AFW, EAS, ECS, LCN, MEA, NAC, SAS, SSF; the income groups HIC, LIC, LMIC (or LMC), UMIC (or UMC); and the lending groups IDX (IDA only), IDB or BLND (IDA blend), IBD or IBRD (IBRD only), and REST. Income groups follow the fiscal-year classification PIP\'s data release was built with — FY2026 (July 2025) for release 20260922 — applied to every year, so membership can differ from the current one worldbank_get_country reports. IDA (IDA total) is rejected because PIP computes no IDA total: ask for IDX and IDB together. Other aggregate codes (SSA, EAP, FCVY, MIC, LMY) are rejected, and welfare_type and reporting_level cannot be combined with an aggregate.',
+        'Country codes: a single code, an array, or one string separated by commas, semicolons, or pipes. Economies go by ISO3 (IND, USA) or ISO2 (IN, US) code, including those PIP publishes only as model estimates (AFG); "all" returns every economy. PIP\'s aggregates are served too: WLD; the World Bank regions AFE, AFW, EAS, ECS, LCN, MEA, NAC, SAS, SSF; the income groups HIC, LIC, LMIC (or LMC), UMIC (or UMC); and the lending groups IDX (IDA only), IDB or BLND (IDA blend), IBD or IBRD (IBRD only), and REST. Income groups follow the fiscal-year classification PIP\'s data release was built with — FY2026 (July 2025) for release 20260922 — applied to every year, so membership can differ from the current one worldbank_get_country reports. IDA (IDA total) is rejected because PIP computes no IDA total: ask for IDX and IDB together. Other aggregate codes (SSA, EAP, FCVY, MIC, LMY) are rejected, and welfare_type and reporting_level cannot be combined with an aggregate.',
       ),
     year: z
       .string()
@@ -145,7 +146,7 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
       .max(1000)
       .optional()
       .describe(
-        `Results per page (default: server default, max: 1000). "all" countries across "all" years runs to several thousand rows. One page holds at most ${MAX_ESTIMATES_PER_PAGE} estimates, which keeps a response within about ${RESPONSE_BUDGET_KB} KB; a larger value, the server default included, is reduced to that cap, disclosed in notice, and echoed as appliedFilters.perPage, and totalPages is counted at the reduced size.`,
+        `Results per page (default: server default, max: 1000). "all" countries across "all" years runs to several thousand rows. One page holds at most ${MAX_ESTIMATES_PER_PAGE} estimates, which keeps a response within about ${RESPONSE_BUDGET_KB} KB; a larger value, the server default included, is reduced to that cap and echoed as appliedFilters.perPage, and totalPages is counted at the reduced size; notice discloses the reduction whenever the result runs past one page.`,
       ),
   }),
   output: z.object({
@@ -444,9 +445,7 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
   ],
 
   async handler(input, ctx) {
-    const codes = Array.isArray(input.countries)
-      ? input.countries.flatMap(splitCodes)
-      : splitCodes(input.countries);
+    const codes = splitCountryCodes(input.countries);
     const year = input.year?.trim() ? input.year.trim() : undefined;
     const welfareType = input.welfare_type || undefined;
     const reportingLevel = input.reporting_level || undefined;
@@ -639,11 +638,13 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
           }),
         );
       }
-      if (result.perPage < perPage) {
-        notices.push(
-          `per_page=${perPage} was reduced to ${result.perPage}, the most one page holds, to keep this response within about ${RESPONSE_BUDGET_KB} KB. totalPages counts pages of ${result.perPage}${result.page < result.pages ? `, so page ${result.page + 1} with the same filters continues where this page ends` : ''}.`,
-        );
-      }
+      const reduced = pageSizeReducedNotice({
+        requested: perPage,
+        served: result.perPage,
+        page: result.page,
+        pages: result.pages,
+      });
+      if (reduced) notices.push(reduced);
       if (result.rows.length > 0 && result.gapFilled) {
         notices.push(
           'Some rows are gap-filled: no survey covers those years, so PIP estimated the poverty measures and published no distributional data alongside them. Their gini, mld, polarization, and decileShares are null by design. Read estimationType per row to tell a survey-derived row from an estimated one — the two come from different upstream series, so their poverty figures are close but not on the same footing.',

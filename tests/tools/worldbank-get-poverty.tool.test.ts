@@ -242,7 +242,7 @@ describe('worldbankGetPoverty', () => {
     });
   });
 
-  it("splits a single string on either separator this server's tools use", async () => {
+  it('splits a single string on the comma and semicolon separators', async () => {
     const getPoverty = await stubService({ rows: [surveyRow], total: 1 });
     const tool = await loadTool();
     await tool.handler(
@@ -251,6 +251,43 @@ describe('worldbankGetPoverty', () => {
     );
     expect(getPoverty.mock.calls[0]?.[0]).toMatchObject({ countries: ['IND', 'USA', 'BRA'] });
   });
+
+  it.each([
+    ['BEN|BFA', ['BEN', 'BFA']],
+    ['BEN | BFA', ['BEN', 'BFA']],
+    [['BEN|BFA'], ['BEN', 'BFA']],
+    ['BEN|BFA;IND, USA', ['BEN', 'BFA', 'IND', 'USA']],
+  ])(
+    'splits the pipe-joined countries %j and echoes them comma-joined',
+    async (countries, codes) => {
+      const getPoverty = await stubService({ rows: [surveyRow], total: 1 });
+      const tool = await loadTool();
+      const result = await runToolContract(tool, { countries, year: '2021' });
+
+      expect(result.isError).toBeFalsy();
+      expect(getPoverty.mock.calls[0]?.[0]).toMatchObject({ countries: codes });
+      expect(result.structuredContent).toMatchObject({
+        appliedFilters: { countries: codes.join(',') },
+      });
+      expect(textOf(result)).toContain(`countries=${codes.join(',')}`);
+    },
+  );
+
+  it.each([['|'], [' | '], [['|']], ['|;,'], [['|', ' , ']]])(
+    'rejects %j, which splits to no code, at the schema before any request',
+    async (countries) => {
+      const getPoverty = await stubService({ rows: [surveyRow], total: 1 });
+      const tool = await loadTool();
+      const result = await runToolContract(tool, { countries });
+
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: { code: JsonRpcErrorCode.InvalidParams },
+      });
+      expect(textOf(result)).toContain('Provide at least one country code');
+      expect(getPoverty).not.toHaveBeenCalled();
+    },
+  );
 
   // ─── Empty results ────────────────────────────────────────────────────────
 
@@ -343,6 +380,32 @@ describe('worldbankGetPoverty', () => {
     expect(notice).toMatch(/per_page=500 was reduced to 70/);
     expect(notice).toMatch(/Some rows are gap-filled/);
   });
+
+  /**
+   * One estimate fits on one page at the served 70, the page per_page=1000 would
+   * have served too, so there is no reduction to disclose; the echo still carries both sizes.
+   */
+  it.each([
+    [1, [surveyRow]],
+    [2, []],
+  ])(
+    'discloses no reduction on page %i when the whole result fits on one page',
+    async (page, rows) => {
+      await stubService({ rows, total: 1, page, pages: 1, perPage: 70 });
+      const tool = await loadTool();
+      const result = await runToolContract(tool, { countries: 'USA', per_page: 1000, page });
+
+      expect(result.structuredContent).toMatchObject({
+        appliedFilters: { perPage: 70, requestedPerPage: 1000 },
+        totalPages: 1,
+      });
+      expect((result.structuredContent as { notice?: string }).notice ?? '').not.toMatch(
+        /was reduced/,
+      );
+      expect(textOf(result)).not.toContain('was reduced');
+      expect(textOf(result)).toContain('per_page=70 (requested 1000)');
+    },
+  );
 
   it('echoes no requestedPerPage when the requested size fit', async () => {
     await stubService({ rows: [surveyRow], total: 1 });

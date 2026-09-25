@@ -877,6 +877,42 @@ describe('WorldBankApiService.getData — source-scoped path', () => {
     expect(past).toMatchObject({ total: 3, pages: 2, page: 9, data: [] });
   });
 
+  it('pages a scope larger than the served size at 200 rows, contiguously', async () => {
+    const years = Array.from({ length: 450 }, (_, i) => 2025 - i);
+    route(
+      archiveRoutes({
+        '/v2/sources/57/time': listing(
+          '57',
+          'time',
+          years.map((year): [string, string] => [`YR${year}`, String(year)]),
+        ),
+        '/v2/sources/57/country/SDN/series/SM.POP.REFG.OR/version/202503': data(
+          '57',
+          years.map((year) => sdn(`YR${year}`, '202503', year)),
+        ),
+      }),
+    );
+    const ctx = createMockContext();
+    const call = (page: number) =>
+      service.getData(
+        {
+          indicatorId: 'SM.POP.REFG.OR',
+          countries: ['SDN'],
+          dimensionValue: '202503',
+          page,
+          perPage: 1000,
+        },
+        ctx,
+      );
+    const pages = [await call(1), await call(2), await call(3), await call(4)];
+
+    expect(pages.map((p) => p.data.length)).toEqual([200, 200, 50, 0]);
+    expect(pages.map((p) => [p.perPage, p.pages, p.total])).toEqual(
+      Array.from({ length: 4 }, () => [200, 3, 450]),
+    );
+    expect(pages.flatMap((p) => p.data.map((d) => d.value))).toEqual(years);
+  });
+
   it('reads every upstream page of a large scope', async () => {
     route(
       archiveRoutes({

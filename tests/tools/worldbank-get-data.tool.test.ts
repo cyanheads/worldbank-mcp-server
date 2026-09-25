@@ -57,11 +57,22 @@ const mockDataResult = {
   dateFilterDropped: false,
 };
 
+/**
+ * A getData stub resolving with `result`, echoing the requested page size as the
+ * served one — the service's answer for any size up to its cap.
+ */
+function servesAsAsked(result: object) {
+  return vi.fn().mockImplementation(async (opts: { perPage: number }) => ({
+    perPage: opts.perPage,
+    ...result,
+  }));
+}
+
 describe('worldbankGetData', () => {
   beforeEach(async () => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
     vi.mocked(getWorldBankApiService).mockReturnValue({
-      getData: vi.fn().mockResolvedValue(mockDataResult),
+      getData: servesAsAsked(mockDataResult),
     } as never);
   });
 
@@ -150,7 +161,7 @@ describe('worldbankGetData', () => {
   it('sets enrichment notice on empty data', async () => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
     vi.mocked(getWorldBankApiService).mockReturnValue({
-      getData: vi.fn().mockResolvedValue({
+      getData: servesAsAsked({
         ...mockDataResult,
         data: [],
         total: 0,
@@ -297,6 +308,32 @@ describe('worldbankGetData', () => {
     });
   });
 
+  it.each(['country_not_found', 'indicator_and_country_not_found'])(
+    'carries the requested codes as an array on a %s re-throw, beside the codes the service blamed',
+    async (reason) => {
+      const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+      vi.mocked(getWorldBankApiService).mockReturnValue({
+        getData: vi.fn().mockRejectedValue(
+          new McpError(JsonRpcErrorCode.NotFound, 'Country code(s) "ZZ" not valid.', {
+            reason,
+            countryCodes: 'ZZ',
+          }),
+        ),
+      } as never);
+      const { worldbankGetData } = await import(
+        '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+      );
+      const result = await runToolContract(
+        worldbankGetData,
+        { indicator_id: 'SP.POP.TOTL', countries: 'KE, ZZ|QQ' },
+        { context: { errors: worldbankGetData.errors } },
+      );
+      expect(result.structuredContent).toMatchObject({
+        error: { data: { reason, countryCodes: 'ZZ', countries: ['KE', 'ZZ', 'QQ'] } },
+      });
+    },
+  );
+
   it('rethrows indicator_not_queryable via ctx.fail, pointing at search, not the country list', async () => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
     vi.mocked(getWorldBankApiService).mockReturnValue({
@@ -390,7 +427,7 @@ describe('worldbankGetData', () => {
   it('notices that a dropped date_range matched nothing', async () => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
     vi.mocked(getWorldBankApiService).mockReturnValue({
-      getData: vi.fn().mockResolvedValue({
+      getData: servesAsAsked({
         data: [],
         indicator: { id: 'SP.POP.TOTL', name: 'Population, total' },
         total: 0,
@@ -420,7 +457,7 @@ describe('worldbankGetData', () => {
   it('flags a page past the end rather than claiming the window matched nothing, on both surfaces', async () => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
     vi.mocked(getWorldBankApiService).mockReturnValue({
-      getData: vi.fn().mockResolvedValue({
+      getData: servesAsAsked({
         data: [],
         indicator: { id: 'DP.DOD.DECD.CR.BC.CD', name: 'Gross PSD' },
         total: 12,
@@ -458,7 +495,7 @@ describe('worldbankGetData', () => {
   it('keeps the zero-match wording for a window that matched nothing', async () => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
     vi.mocked(getWorldBankApiService).mockReturnValue({
-      getData: vi.fn().mockResolvedValue({
+      getData: servesAsAsked({
         data: [],
         indicator: { id: 'SP.POP.TOTL', name: 'Population, total' },
         total: 0,
@@ -490,7 +527,7 @@ describe('worldbankGetData', () => {
   it('returns empty data (no throw) when service returns no observations', async () => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
     vi.mocked(getWorldBankApiService).mockReturnValue({
-      getData: vi.fn().mockResolvedValue({
+      getData: servesAsAsked({
         data: [],
         indicator: { id: 'NY.GDP.PCAP.CD', name: '' },
         total: 0,
@@ -623,7 +660,7 @@ describe('worldbankGetData', () => {
     'rejects indicator_id %j in the handler as multiple_indicators with its recovery on both surfaces',
     async (indicatorId) => {
       const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
-      const getData = vi.fn().mockResolvedValue(mockDataResult);
+      const getData = servesAsAsked(mockDataResult);
       vi.mocked(getWorldBankApiService).mockReturnValue({ getData } as never);
 
       const { worldbankGetData } = await import(
@@ -715,7 +752,7 @@ describe('worldbankGetData', () => {
 
   it('forwards an mrv above the former ceiling of 10 to the service', async () => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
-    const getDataMock = vi.fn().mockResolvedValue(mockDataResult);
+    const getDataMock = servesAsAsked(mockDataResult);
     vi.mocked(getWorldBankApiService).mockReturnValue({ getData: getDataMock } as never);
 
     const { worldbankGetData } = await import(
@@ -743,6 +780,11 @@ describe('worldbankGetData', () => {
     [[',']],
     [[';']],
     [[',', ' ; ', '']],
+    ['|'],
+    [' | '],
+    ['|;,'],
+    [['|']],
+    [['|', ' , ']],
   ])('rejects an empty countries value: %j', async (countries) => {
     const { worldbankGetData } = await import(
       '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
@@ -773,9 +815,13 @@ describe('worldbankGetData', () => {
     [['US,JP', 'KR'], ['US', 'JP', 'KR'], 'US;JP;KR'],
     [['US', 'CN', 'ZW'], ['US', 'CN', 'ZW'], 'US;CN;ZW'],
     ['all', ['all'], 'all'],
+    ['BJ|BF', ['BJ', 'BF'], 'BJ;BF'],
+    ['BJ | BF', ['BJ', 'BF'], 'BJ;BF'],
+    [['BJ|BF'], ['BJ', 'BF'], 'BJ;BF'],
+    ['US|JP;KR, DE', ['US', 'JP', 'KR', 'DE'], 'US;JP;KR;DE'],
   ])('splits countries %j into the codes sent upstream', async (countries, codes, echoed) => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
-    const getDataMock = vi.fn().mockResolvedValue(mockDataResult);
+    const getDataMock = servesAsAsked(mockDataResult);
     vi.mocked(getWorldBankApiService).mockReturnValue({ getData: getDataMock } as never);
 
     const { worldbankGetData } = await import(
@@ -813,7 +859,7 @@ describe('worldbankGetData', () => {
     'rejects "all" mixed with other codes as mixed_all_selector, on both surfaces: %j',
     async (countries) => {
       const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
-      const getDataMock = vi.fn().mockResolvedValue(mockDataResult);
+      const getDataMock = servesAsAsked(mockDataResult);
       vi.mocked(getWorldBankApiService).mockReturnValue({ getData: getDataMock } as never);
 
       const { worldbankGetData } = await import(
@@ -855,7 +901,7 @@ describe('worldbankGetData', () => {
     'rejects the reversed date_range %j as reversed_date_range before any request, on both surfaces',
     async (date_range, start, end) => {
       const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
-      const getDataMock = vi.fn().mockResolvedValue(mockDataResult);
+      const getDataMock = servesAsAsked(mockDataResult);
       vi.mocked(getWorldBankApiService).mockReturnValue({ getData: getDataMock } as never);
 
       const { worldbankGetData } = await import(
@@ -894,7 +940,7 @@ describe('worldbankGetData', () => {
 
   it('accepts a single-period range whose endpoints are equal', async () => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
-    const getDataMock = vi.fn().mockResolvedValue(mockDataResult);
+    const getDataMock = servesAsAsked(mockDataResult);
     vi.mocked(getWorldBankApiService).mockReturnValue({ getData: getDataMock } as never);
     const { worldbankGetData } = await import(
       '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
@@ -981,6 +1027,24 @@ describe('worldbankGetData', () => {
     ).not.toThrow();
   });
 
+  it('keeps accepting per_page up to 1000, and says one page holds at most 200', async () => {
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    expect(
+      worldbankGetData.input.safeParse({
+        indicator_id: 'SP.POP.TOTL',
+        countries: 'all',
+        per_page: 1000,
+      }).success,
+    ).toBe(true);
+    const perPage = (worldbankGetData.input.shape.per_page as { description?: string }).description;
+    expect(perPage).toMatch(/at most 200 observations/);
+    expect(perPage).not.toMatch(/higher values/i);
+    expect(worldbankGetData.description).toMatch(/200 per page/);
+    expect(worldbankGetData.description).not.toMatch(/per_page up to 1000/);
+  });
+
   it('rejects per_page above maximum (1001)', async () => {
     const { worldbankGetData } = await import(
       '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
@@ -1007,7 +1071,7 @@ describe('worldbankGetData', () => {
 
   it('trims whitespace from date_range before using it', async () => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
-    const getDataMock = vi.fn().mockResolvedValue(mockDataResult);
+    const getDataMock = servesAsAsked(mockDataResult);
     vi.mocked(getWorldBankApiService).mockReturnValue({ getData: getDataMock } as never);
 
     const { worldbankGetData } = await import(
@@ -1026,7 +1090,7 @@ describe('worldbankGetData', () => {
 
   it('treats whitespace-only date_range as absent', async () => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
-    const getDataMock = vi.fn().mockResolvedValue(mockDataResult);
+    const getDataMock = servesAsAsked(mockDataResult);
     vi.mocked(getWorldBankApiService).mockReturnValue({ getData: getDataMock } as never);
 
     const { worldbankGetData } = await import(
@@ -1122,7 +1186,7 @@ describe('worldbankGetData', () => {
 
   it('discloses the serving source, release, and path on both surfaces', async () => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
-    const getData = vi.fn().mockResolvedValue(archiveResult);
+    const getData = servesAsAsked(archiveResult);
     vi.mocked(getWorldBankApiService).mockReturnValue({ getData } as never);
     const { worldbankGetData } = await import(
       '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
@@ -1225,7 +1289,7 @@ describe('worldbankGetData', () => {
 
   it('forwards dimension_value trimmed and echoes it, treating blank as absent', async () => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
-    const getData = vi.fn().mockResolvedValue(archiveResult);
+    const getData = servesAsAsked(archiveResult);
     vi.mocked(getWorldBankApiService).mockReturnValue({ getData } as never);
     const { worldbankGetData } = await import(
       '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
@@ -1270,7 +1334,7 @@ describe('worldbankGetData', () => {
   it('names the codes the serving dataset does not cover, alongside the empty-result notice', async () => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
     vi.mocked(getWorldBankApiService).mockReturnValue({
-      getData: vi.fn().mockResolvedValue({
+      getData: servesAsAsked({
         ...archiveResult,
         data: [],
         total: 0,
@@ -1397,7 +1461,7 @@ describe('worldbankGetData', () => {
   );
 
   it('reads limit as per_page, on both surfaces', async () => {
-    const getData = vi.fn().mockResolvedValue(mockDataResult);
+    const getData = servesAsAsked(mockDataResult);
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
     vi.mocked(getWorldBankApiService).mockReturnValue({ getData } as never);
     const { worldbankGetData } = await import(

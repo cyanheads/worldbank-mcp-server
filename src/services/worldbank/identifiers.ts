@@ -19,6 +19,26 @@ export const COUNTRY_CODE_MESSAGE =
   'Pass one ISO2, ISO3, or aggregate code of 2–3 letters or digits, not a list of codes. Use worldbank_list_countries to browse countries, or worldbank_get_data to query several at once.';
 
 /**
+ * A `countries` value that holds at least one code: some character that is
+ * neither whitespace nor one of the separators {@link splitCountryCodes} splits
+ * on. The schema pattern of the tools that require a code.
+ */
+export const COUNTRY_LIST_CONTENT = /[^\s;,|]/;
+
+/**
+ * Split a `countries` value, a string or every element of an array, into codes.
+ * Comma, semicolon, and pipe all separate codes, since no country or aggregate
+ * code contains any of them; surrounding whitespace and blank segments drop out.
+ */
+export function splitCountryCodes(value: string | readonly string[]): string[] {
+  return [value]
+    .flat()
+    .flatMap((part) => part.split(/[;,|]/))
+    .map((code) => code.trim())
+    .filter((code) => code.length > 0);
+}
+
+/**
  * One indicator ID. All 29,544 catalog IDs use only letters, digits, `.`, `_`,
  * and `-` (`NY.GDP.PCAP.CD`, `CoCA_fexp`, `3.0.Rate75-25`). Anything else is
  * either a list, or a character that escapes into a path upstream answers with

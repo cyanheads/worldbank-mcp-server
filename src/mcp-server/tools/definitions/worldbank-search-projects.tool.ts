@@ -9,28 +9,18 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { getServerConfig } from '@/config/server-config.js';
 import { pagePastEndNotice } from '@/mcp-server/tools/page-past-end-notice.js';
+import { pageSizeReducedNotice } from '@/mcp-server/tools/page-size-reduced-notice.js';
 import { toPortfolioCode } from '@/services/projects/portfolio-country-codes.js';
 import { getProjectsService } from '@/services/projects/projects-service.js';
 import {
+  MAX_ABSTRACT_CHARS,
   MAX_PROJECTS_PER_PAGE,
   MAX_PROJECTS_PER_PAGE_WITH_ABSTRACT,
   RESPONSE_BUDGET_KB,
+  shorten,
 } from '@/services/response-budget.js';
+import { splitCountryCodes } from '@/services/worldbank/identifiers.js';
 import { getWorldBankApiService } from '@/services/worldbank/worldbank-service.js';
-
-/** Split a caller-supplied country string on either separator this server's tools use. */
-function splitCodes(value: string): string[] {
-  return value
-    .split(/[;,]/)
-    .map((code) => code.trim())
-    .filter((code) => code.length > 0);
-}
-
-/** Collect country codes from either accepted input shape. */
-function collectCodes(value: string | string[] | undefined): string[] {
-  if (value === undefined) return [];
-  return Array.isArray(value) ? value.flatMap(splitCodes) : splitCodes(value);
-}
 
 /**
  * The Projects API keys countries on a two-character code — ISO2 for an
@@ -105,14 +95,18 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
       .union([
         z
           .string()
-          .describe('A single country code, or a comma- or semicolon-separated list of them.'),
+          .describe(
+            'A single country code, or a list of them separated by commas, semicolons, or pipes.',
+          ),
         z
           .array(z.string().describe('An ISO3, ISO2, or World Bank regional code.'))
-          .describe('An array of country codes.'),
+          .describe(
+            'An array of country codes; an element holding several codes separated by commas, semicolons, or pipes is split too.',
+          ),
       ])
       .optional()
       .describe(
-        'Borrowing countries: an economy by ISO3 or ISO2 code (BRA or BR), or a World Bank regional code for a multi-country operation (3A for Africa, 4E for East Asia and Pacific). Several codes are combined as OR — a project matching any of them is returned. Yemen, DR Congo, West Bank and Gaza, and Timor-Leste are searched under the legacy codes the portfolio files them by (RY, ZR, GZ, TP), which are also accepted as sent. A WDI aggregate (SSF, WLD, SAS) is rejected; use region for a regional search. Omit for every country.',
+        'Borrowing countries: an economy by ISO3 or ISO2 code (BRA or BR), or a World Bank regional code for a multi-country operation (3A for Africa, 4E for East Asia and Pacific). Several codes — an array, or one string separated by commas, semicolons, or pipes — are combined as OR: a project matching any of them is returned. A value made only of separators is rejected rather than read as every country. Yemen, DR Congo, West Bank and Gaza, and Timor-Leste are searched under the legacy codes the portfolio files them by (RY, ZR, GZ, TP), which are also accepted as sent. A WDI aggregate (SSF, WLD, SAS) is rejected; use region for a regional search. Omit for every country.',
       ),
     status: z
       .array(z.enum(PROJECT_STATUSES))
@@ -160,7 +154,7 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
       .boolean()
       .default(false)
       .describe(
-        `Include each project's abstract. Abstracts run long — a median of roughly 1,200 characters, up to 8,000 — so a page carrying them holds at most ${MAX_PROJECTS_PER_PAGE_WITH_ABSTRACT} projects rather than ${MAX_PROJECTS_PER_PAGE}, with every abstract returned whole; leave this off while narrowing a search and turn it on once the result set is small enough to read. Projects that publish no abstract report null either way, which appliedFilters.includeAbstract distinguishes.`,
+        `Include each project's abstract. Abstracts run long — a median of roughly 1,200 characters, up to 8,000 — so a page carrying them holds at most ${MAX_PROJECTS_PER_PAGE_WITH_ABSTRACT} projects rather than ${MAX_PROJECTS_PER_PAGE}, and an abstract longer than ${MAX_ABSTRACT_CHARS.toLocaleString('en-US')} characters (about 2% of them) is cut there and marked with …, with notice naming the projects cut and each project's url leading to the full text; leave this off while narrowing a search and turn it on once the result set is small enough to read. Projects that publish no abstract report null either way, which appliedFilters.includeAbstract distinguishes.`,
       ),
     page: z.number().int().min(1).default(1).describe('Pagination page number (1-based).'),
     per_page: z
@@ -170,7 +164,7 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
       .max(1000)
       .optional()
       .describe(
-        `Results per page (default: server default, max: 1000). One page holds at most ${MAX_PROJECTS_PER_PAGE} projects, or ${MAX_PROJECTS_PER_PAGE_WITH_ABSTRACT} with include_abstract, which keeps a response within about ${RESPONSE_BUDGET_KB} KB; a larger value, the server default included, is reduced to that cap, disclosed in notice, and echoed as appliedFilters.perPage, and totalPages is counted at the reduced size.`,
+        `Results per page (default: server default, max: 1000). One page holds at most ${MAX_PROJECTS_PER_PAGE} projects, or ${MAX_PROJECTS_PER_PAGE_WITH_ABSTRACT} with include_abstract, which keeps a response within about ${RESPONSE_BUDGET_KB} KB; a larger value, the server default included, is reduced to that cap and echoed as appliedFilters.perPage, and totalPages is counted at the reduced size; notice discloses the reduction whenever the result runs past one page.`,
       ),
   }),
   output: z.object({
@@ -238,7 +232,7 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
               .string()
               .nullable()
               .describe(
-                'Project abstract. Null when include_abstract was not requested and when the project publishes none — appliedFilters.includeAbstract separates the two.',
+                `Project abstract, cut at ${MAX_ABSTRACT_CHARS.toLocaleString('en-US')} characters and marked with … when longer. Null when include_abstract was not requested and when the project publishes none — appliedFilters.includeAbstract separates the two.`,
               ),
             url: z.string().describe('Project page on projects.worldbank.org.'),
           })
@@ -303,7 +297,7 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
       .string()
       .optional()
       .describe(
-        'Context for an empty result set — including whether the country filter matched anything on its own — for a page past the end of the results, or for a page size reduced to the page cap.',
+        'Context for an empty result set — including whether the country filter matched anything on its own — for a page past the end of the results, for a page size reduced to the page cap, or naming the projects whose abstracts were cut.',
       ),
   },
 
@@ -335,7 +329,7 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
     {
       reason: 'invalid_country_code',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'A countries entry resolves to no economy: it is not two or three letters or digits, no economy in the World Bank country index has that three-character code, or it is a WDI aggregate such as SSF or WLD, which the portfolio lists no operations under.',
+      when: 'A countries entry resolves to no economy: it is not two or three letters or digits, no economy in the World Bank country index has that three-character code, or it is a WDI aggregate such as SSF or WLD, which the portfolio lists no operations under. Also when countries holds only separators and so names no code at all.',
       recovery:
         'Pass each economy by an ISO3 or ISO2 code worldbank_list_countries lists, or a World Bank regional code such as 3A for multi-country operations. For every project in a region, drop the aggregate code and set the region filter instead.',
     },
@@ -377,7 +371,7 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
   ],
 
   async handler(input, ctx) {
-    const codes = collectCodes(input.countries);
+    const codes = input.countries === undefined ? [] : splitCountryCodes(input.countries);
     const statuses = input.status ?? [];
     const regions = input.region ?? [];
     const financialTypes = input.financial_type ?? [];
@@ -388,8 +382,23 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
 
     /**
      * Checked here rather than on the schema so each failure carries a reason and
-     * a recovery hint; a schema refinement would reject with neither.
+     * a recovery hint; a schema refinement would reject with neither. A blank
+     * value reads as no country filter, for form-based clients, but one made only
+     * of separators is refused: sent on as no filter it would search every country.
      */
+    const nonBlank = [input.countries ?? []].flat().filter((value) => value.trim());
+    if (codes.length === 0 && nonBlank.length > 0) {
+      throw ctx.fail(
+        'invalid_country_code',
+        `countries ${nonBlank.map((value) => `"${value}"`).join(', ')} names no country code, only separators (commas, semicolons, or pipes).`,
+        {
+          recovery: {
+            hint: 'List at least one ISO3, ISO2, or World Bank regional code, or omit countries to search every country.',
+          },
+          invalidCodes: nonBlank,
+        },
+      );
+    }
     const malformedCodes = codes.filter((code) => !COUNTRY_CODE.test(code));
     if (malformedCodes.length > 0) {
       throw ctx.fail(
@@ -599,6 +608,11 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
         );
       }
     } else {
+      const cut = result.projects.flatMap((project) =>
+        project.abstract !== null && project.abstract.length > MAX_ABSTRACT_CHARS
+          ? [project.id]
+          : [],
+      );
       const notices = [
         ...(result.projects.length === 0
           ? [
@@ -611,16 +625,37 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
               }),
             ]
           : []),
-        ...(result.perPage < perPage
+        pageSizeReducedNotice({
+          requested: perPage,
+          served: result.perPage,
+          page: result.page,
+          pages: result.pages,
+          ...(input.include_abstract && {
+            condition: `with include_abstract on (${MAX_PROJECTS_PER_PAGE} with include_abstract off)`,
+          }),
+        }),
+        ...(cut.length > 0
           ? [
-              `per_page=${perPage} was reduced to ${result.perPage}, the most one page holds${input.include_abstract ? ` with include_abstract on (${MAX_PROJECTS_PER_PAGE} with include_abstract off)` : ''}, to keep this response within about ${RESPONSE_BUDGET_KB} KB. totalPages counts pages of ${result.perPage}${result.page < result.pages ? `, so page ${result.page + 1} with the same filters continues where this page ends` : ''}.${input.include_abstract ? ' Abstracts are never shortened; the smaller page is how they fit.' : ''}`,
+              cut.length === 1
+                ? `The abstract of ${cut[0]} runs past ${MAX_ABSTRACT_CHARS.toLocaleString('en-US')} characters and is cut there, marked with …; the project page at url carries the full text.`
+                : `The abstracts of ${new Intl.ListFormat('en', { type: 'conjunction' }).format(cut)} run past ${MAX_ABSTRACT_CHARS.toLocaleString('en-US')} characters and are cut there, marked with …; each project page at url carries the full text.`,
             ]
           : []),
-      ];
+      ].filter((notice) => notice !== undefined);
       if (notices.length > 0) ctx.enrich.notice(notices.join(' '));
     }
 
-    return { projects: result.projects };
+    /**
+     * The heaviest 8-row page of whole abstracts reaches ~69 KB, and 295 of the
+     * portfolio's 14,779 published abstracts run past the ceiling (2026-09-25).
+     */
+    return {
+      projects: result.projects.map((project) =>
+        project.abstract === null
+          ? project
+          : { ...project, abstract: shorten(project.abstract, MAX_ABSTRACT_CHARS) },
+      ),
+    };
   },
 
   format: (result) => {
@@ -634,33 +669,38 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
 
     /**
      * The breakdown shares the total's line, unbolded and in the same USD, and
-     * names only the parts the project publishes. A single published part equal
-     * to the total says nothing the total does not, so it is left out. Both keep
-     * an 80-row page near the response budget; structuredContent carries every
-     * part, nulls included.
+     * names only the parts that add to it: a null or zero part is left out, and
+     * so is a single remaining part equal to the total, which says nothing the
+     * total does not. structuredContent carries every part, nulls and zeros
+     * included.
      */
     const breakdown = (project: (typeof result.projects)[number]) => {
       const parts = Object.entries({
         ibrdCommitment: project.ibrdCommitment,
         idaCommitment: project.idaCommitment,
         grantAmount: project.grantAmount,
-      }).filter(([, value]) => value !== null);
+      }).filter(([, value]) => value !== null && value !== 0);
       if (parts.length === 0) return '';
       if (parts.length === 1 && parts[0]?.[1] === project.totalCommitment) return '';
       return ` (${parts.map(([field, value]) => `${field} ${amount(value)}`).join(' · ')})`;
     };
 
+    /**
+     * Six lines a project keep an 80-row page inside the response budget. A row
+     * with no abstract gets no abstract line: format() sees only the rows, and
+     * the applied-filters trailer's include_abstract says whether abstracts were
+     * requested at all.
+     */
     for (const project of result.projects) {
       lines.push(
         `\n## ${project.name} (${project.id})`,
-        `- **status:** ${project.status || 'unknown'} | **countryName:** ${project.countryName} | **countryCodes:** ${project.countryCodes.join(', ') || 'none'}`,
-        `- **regionName:** ${project.regionName}`,
+        `- **status:** ${project.status || 'unknown'} | **countryName:** ${project.countryName} | **countryCodes:** ${project.countryCodes.join(', ') || 'none'} | **regionName:** ${project.regionName}`,
         `- **boardApprovalDate:** ${project.boardApprovalDate} | **closingDate:** ${project.closingDate}`,
         `- **totalCommitment:** ${amount(project.totalCommitment)}${project.totalCommitment === null ? '' : ' USD'}${breakdown(project)} | **financialTypes:** ${project.financialTypes.join(', ') || 'none'}`,
         `- **majorSectors:** ${project.majorSectors.join(', ') || 'none'}`,
         `- **url:** ${project.url}`,
-        `- **abstract:** ${project.abstract ?? 'null'}`,
       );
+      if (project.abstract !== null) lines.push(`- **abstract:** ${project.abstract}`);
     }
 
     return [{ type: 'text', text: lines.join('\n') }];
