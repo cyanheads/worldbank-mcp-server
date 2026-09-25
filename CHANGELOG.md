@@ -4,7 +4,7 @@ All notable changes to this project. Each entry links to its full per-version fi
 
 ## [0.5.2](changelog/0.5.x/0.5.2.md) — 2026-09-25
 
-The npm tarball no longer includes the .mcpb bundle that bun run bundle writes into dist/.
+The npm tarball excludes the .mcpb bundle that bun run bundle writes into dist/, so a bundle built before publishing is never packed.
 
 ## [0.5.1](changelog/0.5.x/0.5.1.md) — 2026-09-25
 
