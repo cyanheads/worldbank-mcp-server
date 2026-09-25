@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.5.0](changelog/0.5.x/0.5.0.md) — 2026-09-25 · ⚠️ Breaking
+
+Every paged tool keeps a response within about 50 KB: worldbank_get_data serves 200 rows a page, worldbank_list_countries 150, and indicator descriptions and long project abstracts come back shortened. Keyword search ranks World Development Indicators series ahead of regional and archived copies.
+
 ## [0.4.1](changelog/0.4.x/0.4.1.md) — 2026-09-25
 
 worldbank_search_projects takes ISO3 country codes and a financing-window filter, reports the project page's commitment amount, and keeps newest-approval order under a query; worldbank_list_countries filters by lending type.
