@@ -408,8 +408,10 @@ export class ProjectsService {
         /**
          * The search itself succeeded — an empty result is a valid answer, and a
          * failed diagnostic must not turn it into an error. Leaving the count
-         * null drops the caller back to the generic empty-result notice.
+         * null drops the caller back to the generic empty-result notice. A
+         * cancellation still propagates, so it isn't answered as a success.
          */
+        if (ctx.signal.aborted) throw error;
         ctx.log.debug('Country-filter probe failed; reporting the empty result without it', {
           error: error instanceof Error ? error.message : String(error),
         });

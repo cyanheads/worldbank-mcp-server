@@ -594,6 +594,23 @@ describe('ProjectsService', () => {
     expect(result).toMatchObject({ projects: [], total: 0, countryOnlyTotal: null });
   });
 
+  it('propagates a cancellation that lands during the probe instead of answering the search', async () => {
+    const cancelled = new AbortController();
+    const reason = new DOMException('The operation was aborted.', 'AbortError');
+    mockBody(envelope([], 0));
+    fetchWithTimeoutMock.mockImplementationOnce(async () => {
+      cancelled.abort(reason);
+      throw reason;
+    });
+
+    await expect(
+      service.searchProjects(
+        { ...baseOpts, countryCodes: ['BR'], statuses: ['Pipeline'] },
+        createMockContext({ signal: cancelled.signal }),
+      ),
+    ).rejects.toBe(reason);
+  });
+
   it('does not retry a probe whose 4xx is a settled answer', async () => {
     mockBody(envelope([], 0));
     await mockHttpError(400, '{"Debug":true,"error":"400 - Invalid"}');
