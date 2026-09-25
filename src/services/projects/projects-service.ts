@@ -20,12 +20,13 @@ import {
   validationError,
 } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
-import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
+import { defaultIsTransient, fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 import {
   MAX_PROJECTS_PER_PAGE,
   MAX_PROJECTS_PER_PAGE_WITH_ABSTRACT,
 } from '@/services/response-budget.js';
+import { toWdiIso2 } from './portfolio-country-codes.js';
 import type { ProjectSummary, RawProject, RawProjectsEnvelope } from './types.js';
 
 /** Minimal request-context shape that satisfies fetchWithTimeout and withRetry. */
@@ -70,7 +71,10 @@ const PROJECT_FIELDS = [
   'regionname',
   'boardapprovaldate',
   'closingdate',
-  'totalamt',
+  'curr_total_commitment',
+  'curr_ibrd_commitment',
+  'curr_ida_commitment',
+  'grantamt',
   'projectfinancialtype',
   'major_sectors',
   'project_abstract',
@@ -84,28 +88,43 @@ const PROJECT_PAGE_BASE = 'https://projects.worldbank.org/en/projects-operations
 /**
  * Translate a non-2xx from the Projects API into a classified domain error.
  *
- * Every status lands on the same reason. The tool schema validates each filter
- * before the request, so a 4xx is the API refusing the free-text query — its
- * search syntax rejects `[`, `{`, `"`, `/`, `\`, and a trailing AND, OR, or NOT
- * with HTTP 400 — and is settled, so it is marked not retryable; a 5xx is the
- * API failing to serve the call.
+ * An HTTP 400 on a request carrying `qterm` is the API failing to parse the
+ * free-text query — brackets, braces, an unmatched double quote, a slash between
+ * words, a trailing backslash, an AND or OR at either end, or a trailing NOT —
+ * and is reported as `invalid_query`: the caller's input, settled, never retried. The
+ * tool validates every other filter before the request, so that is the one
+ * input a 400 can blame.
+ *
+ * Every other status is `upstream_unavailable`, retried where the framework's
+ * own classification of the status says a retry can help (429, 408, 5xx) and
+ * marked not retryable where it says one cannot (403, 404, 501, a 400 with no
+ * query). A `Retry-After` the upstream sent rides along so the retry honors it.
  *
  * The upstream body is deliberately never quoted into the message. A 4xx carries
  * the hostname and index name of the search cluster behind the API, and a 5xx
  * carries a Node stack trace with absolute paths from the upstream host; neither
  * helps an agent and both are the API's internals rather than this server's.
  */
-function classifyProjectsError(error: McpError): McpError {
+function classifyProjectsError(error: McpError, query: string | undefined): McpError {
   const status = Number(error.data?.status ?? error.data?.statusCode);
   if (!Number.isFinite(status)) return error;
 
+  if (status === 400 && query !== undefined) {
+    return validationError(
+      `The World Bank Projects API could not parse the query "${query}" (HTTP 400).`,
+      { reason: 'invalid_query', status, retryable: false },
+      { cause: error },
+    );
+  }
+
+  const retryAfter = error.data?.retryAfter;
   return serviceUnavailable(
     `The World Bank Projects API answered HTTP ${status}.`,
     {
       reason: 'upstream_unavailable',
       status,
-      // A 4xx is a settled answer — retrying the identical call cannot change it.
-      ...(status < 500 && { retryable: false }),
+      ...(!defaultIsTransient(error) && { retryable: false }),
+      ...(retryAfter !== undefined && { retryAfter }),
     },
     { cause: error },
   );
@@ -150,12 +169,15 @@ function normalizeProject(raw: RawProject, includeAbstract: boolean): ProjectSum
     id,
     name: raw.project_name ?? '',
     status: raw.status ?? '',
-    countryCodes: raw.countrycode ?? [],
+    countryCodes: (raw.countrycode ?? []).map(toWdiIso2),
     countryName: raw.countryname ?? '',
     regionName: raw.regionname ?? '',
     boardApprovalDate: toCalendarDate(raw.boardapprovaldate),
     closingDate: toCalendarDate(raw.closingdate),
-    totalCommitment: toAmount(raw.totalamt),
+    totalCommitment: toAmount(raw.curr_total_commitment),
+    ibrdCommitment: toAmount(raw.curr_ibrd_commitment),
+    idaCommitment: toAmount(raw.curr_ida_commitment),
+    grantAmount: toAmount(raw.grantamt),
     // Upstream repeats a financing window once per instrument drawn on it.
     financialTypes: [...new Set(raw.projectfinancialtype ?? [])],
     majorSectors: majorSectorNames(raw),
@@ -170,6 +192,7 @@ function normalizeProject(raw: RawProject, includeAbstract: boolean): ProjectSum
 type ProjectsFilters = {
   countrycode_exact?: string;
   enddate?: string;
+  projectfinancialtype_exact?: string;
   qterm?: string;
   regionname_exact?: string;
   status_exact?: string;
@@ -180,6 +203,8 @@ export type ProjectSearchOptions = {
   approvedFrom?: string;
   approvedTo?: string;
   countryCodes: string[];
+  /** Financing windows (`IBRD`, `IDA`, `Grants`, `Other`), combined as OR. */
+  financialTypes: string[];
   includeAbstract: boolean;
   page: number;
   perPage: number;
@@ -213,12 +238,21 @@ export class ProjectsService {
     this.baseUrl = getServerConfig().projectsBaseUrl.replace(/\/$/, '');
   }
 
+  /**
+   * Every request is sorted by board approval date, newest first, so the order
+   * is this server's choice rather than an upstream default. It has to be:
+   * without `qterm` that is already what upstream returns, but with `qterm` its
+   * own order is descending project ID, which leaves the newest approvals pages
+   * deep. The sort lives here, not in the filters, so no filter can drop it.
+   */
   private buildUrl(filters: ProjectsFilters, rows: number, offset: number): string {
     const qs = new URLSearchParams({
       format: 'json',
       fl: PROJECT_FIELDS,
       rows: String(rows),
       os: String(offset),
+      srt: 'boardapprovaldate',
+      order: 'desc',
     });
     for (const [key, value] of Object.entries(filters)) {
       if (value !== undefined) qs.set(key, value);
@@ -245,7 +279,7 @@ export class ProjectsService {
           });
           text = await response.text();
         } catch (error) {
-          if (error instanceof McpError) throw classifyProjectsError(error);
+          if (error instanceof McpError) throw classifyProjectsError(error, filters.qterm);
           throw error;
         }
 
@@ -278,11 +312,24 @@ export class ProjectsService {
           );
         }
 
+        /**
+         * `total` arrives as a string, and not always a number: a `#` in `qterm`
+         * gets HTTP 200 with `"total": "undefined"` and rows unrelated to the
+         * search. A count that is not a number is a malformed response.
+         */
+        const total = Number(parsed.total ?? 0);
+        if (!Number.isFinite(total)) {
+          throw serializationError(
+            'The World Bank Projects API returned a response whose total is not a number.',
+            { url },
+          );
+        }
+
         return {
           // Results are keyed by project ID rather than listed, so the values
           // have to be collected before anything downstream can treat them as rows.
           raw: Object.values(projects),
-          total: Number(parsed.total ?? 0),
+          total,
         };
       },
       {
@@ -342,6 +389,9 @@ export class ProjectsService {
       }),
       ...(opts.regions.length > 0 && {
         regionname_exact: opts.regions.join(MULTI_VALUE_SEPARATOR),
+      }),
+      ...(opts.financialTypes.length > 0 && {
+        projectfinancialtype_exact: opts.financialTypes.join(MULTI_VALUE_SEPARATOR),
       }),
       ...(opts.approvedFrom !== undefined && { strdate: opts.approvedFrom }),
       ...(opts.approvedTo !== undefined && { enddate: opts.approvedTo }),

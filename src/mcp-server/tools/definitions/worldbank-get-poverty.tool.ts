@@ -437,7 +437,7 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
     {
       reason: 'upstream_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'PIP answered with a server error.',
+      when: 'PIP answered with a server error, or the World Bank Indicators API country listing that resolves an ISO2 code could not be loaded.',
       recovery:
         'Wait a few seconds and retry the same request; if it keeps failing, narrow it to fewer codes or a single year.',
     },
@@ -480,12 +480,30 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
      * through the World Bank country index to its three-character ID, which an
      * aggregate's ISO2 code (ZG → SSF) shares with its own code, so it routes
      * the same way. The index is read only when a two-character code is present.
+     * An index that fails to load is reported as the upstream failure it is,
+     * naming the listing; a cancellation of this call is the caller's and
+     * propagates untouched.
      */
     const lookups = await Promise.all(
       codes.map((code) =>
         code.length === 2 ? getWorldBankApiService().lookupCountry(code, ctx) : undefined,
       ),
-    );
+    ).catch((err: unknown) => {
+      if (ctx.signal.aborted) throw err;
+      throw ctx.fail(
+        'upstream_unavailable',
+        'The World Bank Indicators API country listing, which resolves an ISO2 code to the three-character code PIP takes, could not be loaded.',
+        {
+          ...(err instanceof McpError &&
+            err.data?.status !== undefined && { status: err.data.status }),
+          recovery: {
+            hint: 'Wait a few seconds and retry the same request; if it keeps failing, pass each economy by its ISO3 code, which needs no country-listing lookup.',
+          },
+          countries: codes,
+        },
+        { cause: err },
+      );
+    });
     const unmapped = codes.filter((code, index) => code.length === 2 && !lookups[index]);
     if (unmapped.length > 0) {
       throw ctx.fail(

@@ -1,6 +1,6 @@
 /**
  * @fileoverview List World Bank countries and regional aggregates with metadata.
- * Filterable by region and income level.
+ * Filterable by region, income level, and lending type.
  * @module mcp-server/tools/definitions/worldbank-list-countries.tool
  */
 
@@ -10,10 +10,13 @@ import { getServerConfig } from '@/config/server-config.js';
 import { pagePastEndNotice } from '@/mcp-server/tools/page-past-end-notice.js';
 import { getWorldBankApiService } from '@/services/worldbank/worldbank-service.js';
 
+/** The `/v2/lendingType` ids — the complete set. */
+const LENDING_TYPES = ['IBD', 'IDB', 'IDX', 'LNX'] as const;
+
 export const worldbankListCountries = tool('worldbank_list_countries', {
   title: 'List World Bank Countries',
   description:
-    'List countries and regional aggregates with metadata: ISO codes, region, income level, capital, and coordinates. Filter by region code (e.g. EAS, SSF, NAC) and income level (LIC, LMC, UMC, HIC). Aggregate entries are excluded by default, leaving individual countries only; set include_aggregates=true to also return region, income group, and world aggregate entities.',
+    'List countries and regional aggregates with metadata: ISO codes, region, income level, lending type, capital, and coordinates. Filter by region code (e.g. EAS, SSF, NAC), income level (LIC, LMC, UMC, HIC), and lending type (IDX for IDA, IBD for IBRD, IDB for Blend); filters combine by AND. Aggregate entries are excluded by default, leaving individual countries only; set include_aggregates=true to also return region, income group, and world aggregate entities.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   inputAliases: { limit: 'per_page' },
   input: z.object({
@@ -21,7 +24,7 @@ export const worldbankListCountries = tool('worldbank_list_countries', {
       .string()
       .optional()
       .describe(
-        'Filter by World Bank region code. Valid codes: EAS (East Asia & Pacific), ECS (Europe & Central Asia), LCN (Latin America & Caribbean), MEA (Middle East & North Africa), NAC (North America), SAS (South Asia), SSF (Sub-Saharan Africa).',
+        "Filter by World Bank region code. A country's region.id is one of EAS (East Asia & Pacific), ECS (Europe & Central Asia), LCN (Latin America & Caribbean), MEA (Middle East, North Africa, Afghanistan & Pakistan), NAC (North America), SAS (South Asia), or SSF (Sub-Saharan Africa). Any other World Bank region or grouping code also filters, by membership: AFE (Africa Eastern and Southern), AFW (Africa Western and Central), ARB (Arab World), EUU (European Union), LDC (Least developed countries), and the rest of the codes the World Bank publishes for regions.",
       ),
     income_level: z
       .string()
@@ -29,11 +32,22 @@ export const worldbankListCountries = tool('worldbank_list_countries', {
       .describe(
         'Filter by income group code: LIC (Low income), LMC (Lower middle income), UMC (Upper middle income), HIC (High income).',
       ),
+    lending_type: z
+      .union([
+        z.literal(''),
+        z
+          .enum(LENDING_TYPES)
+          .describe('IDX (IDA), IBD (IBRD), IDB (Blend), or LNX (Not classified).'),
+      ])
+      .optional()
+      .describe(
+        "Filter by World Bank lending type code: IDX (IDA), IBD (IBRD), IDB (Blend — eligible for both), or LNX (Not classified). IDX, IBD, and IDB are also the codes worldbank_get_poverty takes for its lending groups; a country's lendingType field reports the name (IDA, IBRD, Blend, Not classified).",
+      ),
     include_aggregates: z
       .boolean()
       .default(false)
       .describe(
-        'When true, includes regional, income-group, and world aggregate entries alongside individual countries. Default false (individual countries only).',
+        'When true, includes regional, income-group, and world aggregate entries alongside individual countries. Default false (individual countries only). No aggregate is returned under region or lending_type, whichever code is given, so this changes nothing when either is set.',
       ),
     page: z.number().int().min(1).default(1).describe('Pagination page number (1-based).'),
     per_page: z
@@ -64,7 +78,11 @@ export const worldbankListCountries = tool('worldbank_list_countries', {
                 name: z.string().describe('Income level name.'),
               })
               .describe('World Bank income classification.'),
-            lendingType: z.string().describe('World Bank lending type classification.'),
+            lendingType: z
+              .string()
+              .describe(
+                'World Bank lending type name: IDA, IBRD, Blend, or Not classified (lending_type filters by the codes IDX, IBD, IDB, LNX). Aggregates report Aggregates.',
+              ),
             capitalCity: z.string().describe('Capital city name (empty for aggregates).'),
             longitude: z.string().describe('Capital longitude (empty for aggregates).'),
             latitude: z.string().describe('Capital latitude (empty for aggregates).'),
@@ -114,17 +132,20 @@ export const worldbankListCountries = tool('worldbank_list_countries', {
     ctx.log.info('Listing countries', {
       region: input.region,
       incomeLevel: input.income_level,
+      lendingType: input.lending_type,
       includeAggregates: input.include_aggregates,
       page: input.page,
     });
     const region = input.region?.trim() || undefined;
     const incomeLevel = input.income_level?.trim() || undefined;
+    const lendingType = input.lending_type || undefined;
     let result: Awaited<ReturnType<ReturnType<typeof getWorldBankApiService>['listCountries']>>;
     try {
       result = await getWorldBankApiService().listCountries(
         {
           ...(region !== undefined && { region }),
           ...(incomeLevel !== undefined && { incomeLevel }),
+          ...(lendingType !== undefined && { lendingType }),
           includeAggregates: input.include_aggregates,
           page: input.page,
           perPage,
@@ -148,10 +169,11 @@ export const worldbankListCountries = tool('worldbank_list_countries', {
       const filters = [
         ...(region === undefined ? [] : [`region=${region}`]),
         ...(incomeLevel === undefined ? [] : [`income_level=${incomeLevel}`]),
+        ...(lendingType === undefined ? [] : [`lending_type=${lendingType}`]),
       ];
       ctx.enrich.notice(
         filters.length > 1
-          ? `No countries matched ${filters.join(', ')}. The two filters combine by AND, so no country in that region has that income level — drop one of them to widen the list.`
+          ? `No countries matched ${filters.join(', ')}. The filters combine by AND, so no country matches all of them at once — drop one of them to widen the list.`
           : filters.length === 1
             ? `No countries matched ${filters[0]}.`
             : 'The World Bank returned no countries.',

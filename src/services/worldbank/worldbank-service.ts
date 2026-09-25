@@ -393,10 +393,13 @@ function matchIndicators(indicators: readonly Indicator[], query: string): Indic
 
 // ─── Service ─────────────────────────────────────────────────────────────────
 
+/** One entity of the country listing: both identifiers, and whether it is an aggregate. */
+export type CountryEntity = { id: string; iso2: string; isAggregate: boolean };
+
 /** Every entity in the country listing, by either identifier, plus the aggregate codes. */
 type CountryIndex = {
   aggregateCodes: Set<string>;
-  entities: Map<string, { id: string; iso2: string }>;
+  entities: Map<string, CountryEntity>;
 };
 
 /** Options for {@link WorldBankApiService.getData}. */
@@ -1091,17 +1094,20 @@ export class WorldBankApiService {
     opts: {
       region?: string;
       incomeLevel?: string;
+      /** A `/v2/lendingType` id: `IBD`, `IDB`, `IDX`, or `LNX`. */
+      lendingType?: string;
       includeAggregates: boolean;
       page: number;
       perPage: number;
     },
     ctx: Context,
   ): Promise<{ countries: Country[]; total: number; page: number; pages: number }> {
-    const { region, incomeLevel, includeAggregates, page, perPage } = opts;
+    const { region, incomeLevel, lendingType, includeAggregates, page, perPage } = opts;
 
     const filterParams: Record<string, string | number | undefined> = {};
     if (region) filterParams.region = region;
     if (incomeLevel) filterParams.incomeLevel = incomeLevel;
+    if (lendingType) filterParams.lendingType = lendingType;
 
     const invalidFilter: () => never = () => {
       throw notFound(
@@ -1110,18 +1116,27 @@ export class WorldBankApiService {
       );
     };
 
-    if (!includeAggregates) {
-      // The WB API has no server-side aggregate filter, so every entity in scope
-      // has to be fetched before aggregates can be dropped and the remainder
-      // re-paginated — otherwise entities past the first upstream page are
-      // unreachable and total/pages under-report.
+    /**
+     * The WB API has no server-side aggregate filter, so excluding aggregates
+     * means fetching every entity in scope before dropping them and paginating
+     * the remainder — otherwise entities past the first upstream page are
+     * unreachable and total/pages under-report. `lendingType` takes the same
+     * path whatever `includeAggregates` says: upstream answers `IBD`, `IDB`, and
+     * `IDX` with every entry twice and counts both copies in `paging.total`
+     * (118 rows for 59 `IDX` countries), so only a deduplicated local page is
+     * right. No aggregate carries a lending type, so none survive that filter.
+     */
+    if (!includeAggregates || lendingType) {
       const raw = await this.fetchAllPages<RawCountry>(
         '/country',
         filterParams,
         ctx,
         invalidFilter,
       );
-      const countries = raw.map(normalizeCountry).filter((c) => !c.isAggregate);
+      const unique = new Map(raw.map((country) => [country.id ?? '', country]));
+      const countries = [...unique.values()]
+        .map(normalizeCountry)
+        .filter((c) => includeAggregates || !c.isAggregate);
       const start = (page - 1) * perPage;
       return {
         countries: countries.slice(start, start + perPage),
@@ -1200,10 +1215,14 @@ export class WorldBankApiService {
       });
       const index: CountryIndex = { aggregateCodes: new Set(), entities: new Map() };
       for (const country of raw) {
-        const entity = { id: country.id ?? '', iso2: country.iso2Code ?? '' };
+        const entity: CountryEntity = {
+          id: country.id ?? '',
+          iso2: country.iso2Code ?? '',
+          isAggregate: normalizeCountry(country).isAggregate,
+        };
         if (entity.id) index.entities.set(entity.id.toUpperCase(), entity);
         if (entity.iso2) index.entities.set(entity.iso2.toUpperCase(), entity);
-        if (!normalizeCountry(country).isAggregate) continue;
+        if (!entity.isAggregate) continue;
         if (entity.id) index.aggregateCodes.add(entity.id);
         if (entity.iso2) index.aggregateCodes.add(entity.iso2);
       }
@@ -1214,14 +1233,11 @@ export class WorldBankApiService {
 
   /**
    * Look a country or aggregate up by either identifier, case-insensitively, and
-   * return both — the three-character ID and the ISO2 code — or `undefined` when
-   * the country listing carries no entity under that code. Served from the
-   * cached country index.
+   * return both — the three-character ID and the ISO2 code — with whether it is
+   * an aggregate, or `undefined` when the country listing carries no entity
+   * under that code. Served from the cached country index.
    */
-  async lookupCountry(
-    code: string,
-    ctx: Context,
-  ): Promise<{ id: string; iso2: string } | undefined> {
+  async lookupCountry(code: string, ctx: Context): Promise<CountryEntity | undefined> {
     const { entities } = await this.loadCountryIndex(ctx);
     return entities.get(code.trim().toUpperCase());
   }

@@ -650,11 +650,28 @@ describe('WorldBankApiService', () => {
     mockAggregateLookup();
     const ctx = createMockContext();
 
-    await expect(service.lookupCountry('zh', ctx)).resolves.toEqual({ id: 'AFE', iso2: 'ZH' });
-    await expect(service.lookupCountry('AFE', ctx)).resolves.toEqual({ id: 'AFE', iso2: 'ZH' });
-    await expect(service.lookupCountry(' 1w ', ctx)).resolves.toEqual({ id: 'WLD', iso2: '1W' });
+    const afe = { id: 'AFE', iso2: 'ZH', isAggregate: true };
+    await expect(service.lookupCountry('zh', ctx)).resolves.toEqual(afe);
+    await expect(service.lookupCountry('AFE', ctx)).resolves.toEqual(afe);
+    await expect(service.lookupCountry(' 1w ', ctx)).resolves.toEqual({
+      id: 'WLD',
+      iso2: '1W',
+      isAggregate: true,
+    });
     // One listing request serves every lookup.
     expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('lookupCountry: reports whether the entity is an aggregate, by either identifier', async () => {
+    mockAggregateLookup();
+    const ctx = createMockContext();
+
+    await expect(service.lookupCountry('USA', ctx)).resolves.toMatchObject({
+      isAggregate: false,
+    });
+    await expect(service.lookupCountry('US', ctx)).resolves.toMatchObject({ isAggregate: false });
+    await expect(service.lookupCountry('WLD', ctx)).resolves.toMatchObject({ isAggregate: true });
+    await expect(service.lookupCountry('zh', ctx)).resolves.toMatchObject({ isAggregate: true });
   });
 
   it('lookupCountry: answers undefined for a code the listing does not carry', async () => {
@@ -695,7 +712,10 @@ describe('WorldBankApiService', () => {
 
     const [cancelledOutcome, concurrentOutcome] = await Promise.allSettled([first, second]);
 
-    expect(concurrentOutcome).toEqual({ status: 'fulfilled', value: { id: 'WLD', iso2: '1W' } });
+    expect(concurrentOutcome).toEqual({
+      status: 'fulfilled',
+      value: { id: 'WLD', iso2: '1W', isAggregate: true },
+    });
     expect(cancelledOutcome).toEqual({ status: 'rejected', reason: cancelled.signal.reason });
     expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(1);
   });
@@ -731,6 +751,7 @@ describe('WorldBankApiService', () => {
     await expect(service.lookupCountry('1W', createMockContext())).resolves.toEqual({
       id: 'WLD',
       iso2: '1W',
+      isAggregate: true,
     });
     expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(1);
   });
@@ -915,6 +936,70 @@ describe('WorldBankApiService', () => {
     expect(result.page).toBe(3);
     expect(result.pages).toBe(4);
   });
+
+  /**
+   * `/country?lendingType=IDX` as upstream answers it: every entry twice, in
+   * adjacent identical objects, and both copies counted in `paging.total`
+   * (118 rows, 59 countries on 2026-09-25).
+   */
+  function doubledLendingListing() {
+    const rows = ['AFG', 'BDI', 'BEN'].flatMap((id) => {
+      const row = { ...rawCountry(id, id), lendingType: { id: 'IDX', value: 'IDA' } };
+      return [row, { ...row }];
+    });
+    return [pagingObj({ total: rows.length, per_page: '10000' }), rows];
+  }
+
+  it.each([false, true])(
+    'listCountries: sends lendingType and counts each doubled entry once (include_aggregates=%s)',
+    async (includeAggregates) => {
+      mockResponse(doubledLendingListing());
+      const result = await service.listCountries(
+        { lendingType: 'IDX', includeAggregates, page: 2, perPage: 2 },
+        createMockContext(),
+      );
+
+      const url = new URL(String(fetchWithTimeoutMock.mock.calls[0]?.[0]));
+      expect(url.searchParams.get('lendingType')).toBe('IDX');
+      // Upstream paging double-counts, so the whole scope is fetched and paged here.
+      expect(url.searchParams.get('per_page')).toBe('10000');
+      expect(url.searchParams.get('page')).toBe('1');
+      expect(result.countries.map((c) => c.id)).toEqual(['BEN']);
+      expect(result).toMatchObject({ total: 3, page: 2, pages: 2 });
+    },
+  );
+
+  it('listCountries: combines lendingType with region and incomeLevel upstream', async () => {
+    mockResponse([pagingObj({ total: 0 }), []]);
+    const result = await service.listCountries(
+      {
+        region: 'NAC',
+        incomeLevel: 'LIC',
+        lendingType: 'IDX',
+        includeAggregates: false,
+        page: 1,
+        perPage: 50,
+      },
+      createMockContext(),
+    );
+
+    const params = new URL(String(fetchWithTimeoutMock.mock.calls[0]?.[0])).searchParams;
+    expect(params.get('region')).toBe('NAC');
+    expect(params.get('incomeLevel')).toBe('LIC');
+    expect(params.get('lendingType')).toBe('IDX');
+    expect(result).toMatchObject({ countries: [], total: 0, pages: 1 });
+  });
+
+  it.each([false, true])(
+    'listCountries: sends no lendingType when none is asked for (include_aggregates=%s)',
+    async (includeAggregates) => {
+      mockResponse([pagingObj({ total: 1 }), [rawCountry('US', 'United States')]]);
+      await service.listCountries({ includeAggregates, page: 1, perPage: 50 }, createMockContext());
+
+      const url = new URL(String(fetchWithTimeoutMock.mock.calls[0]?.[0]));
+      expect(url.searchParams.has('lendingType')).toBe(false);
+    },
+  );
 
   // ─── searchIndicators ─────────────────────────────────────────────────────
 

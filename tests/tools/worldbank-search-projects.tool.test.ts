@@ -36,6 +36,9 @@ const project = {
   boardApprovalDate: '2026-03-30',
   closingDate: '2031-12-19',
   totalCommitment: 41_800_000,
+  ibrdCommitment: 41_800_000,
+  idaCommitment: 0,
+  grantAmount: null as number | null,
   financialTypes: ['IBRD', 'Other'],
   majorSectors: ['Public Administration', 'Education'],
   abstract: null as string | null,
@@ -53,6 +56,9 @@ const sparseProject = {
   regionName: 'Other',
   closingDate: null,
   totalCommitment: null,
+  ibrdCommitment: null,
+  idaCommitment: null,
+  grantAmount: null,
   financialTypes: [] as string[],
   majorSectors: [] as string[],
   url: 'https://projects.worldbank.org/en/projects-operations/project-detail/P072339',
@@ -123,12 +129,12 @@ describe('worldbankSearchProjects', () => {
   // ─── Country codes ────────────────────────────────────────────────────────
 
   it.each([
-    ['BRA', ['BRA']],
+    ['BRAZ', ['BRAZ']],
     [
-      ['BRA', 'IND'],
-      ['BRA', 'IND'],
+      ['BRAZ', 'B'],
+      ['BRAZ', 'B'],
     ],
-    ['BR,IND', ['IND']],
+    ['BR,INDIA', ['INDIA']],
     ['B', ['B']],
     ['B-', ['B-']],
   ])(
@@ -148,14 +154,14 @@ describe('worldbankSearchProjects', () => {
           data: {
             reason: 'invalid_country_code',
             invalidCodes,
-            recovery: { hint: expect.stringContaining('worldbank_get_country') },
+            recovery: { hint: expect.stringContaining('worldbank_list_countries') },
           },
         },
       });
       const text = textOf(result);
       expect(text).toContain(`"${invalidCodes.join(', ')}"`);
-      expect(text).toMatch(/ISO2/);
-      expect(text).toMatch(/Recovery:.*worldbank_get_country/);
+      expect(text).toMatch(/two or three letters or digits/);
+      expect(text).toMatch(/Recovery:.*worldbank_list_countries/);
       expect(searchProjects).not.toHaveBeenCalled();
     },
   );
@@ -175,7 +181,7 @@ describe('worldbankSearchProjects', () => {
       tool.input.parse({ countries: '3a' }),
       createMockContext({ errors: tool.errors }),
     );
-    expect(searchProjects.mock.calls[0]?.[0]).toMatchObject({ countryCodes: ['3a'] });
+    expect(searchProjects.mock.calls[0]?.[0]).toMatchObject({ countryCodes: ['3A'] });
   });
 
   it("splits a single string on either separator this server's tools use", async () => {
@@ -187,7 +193,7 @@ describe('worldbankSearchProjects', () => {
     );
 
     expect(searchProjects.mock.calls[0]?.[0]).toMatchObject({
-      countryCodes: ['br', 'in', 'ZA'],
+      countryCodes: ['BR', 'IN', 'ZA'],
     });
   });
 
@@ -402,6 +408,57 @@ describe('worldbankSearchProjects', () => {
     const fallback = createMockContext({ errors: tool.errors });
     await tool.handler(tool.input.parse({ countries: 'BR' }), fallback);
     expect(getEnrichment(fallback)).toMatchObject({ appliedFilters: { perPage: 50, page: 1 } });
+  });
+
+  it('filters by financing window and echoes it on both surfaces', async () => {
+    const searchProjects = await stubService({
+      projects: [{ ...project, financialTypes: ['IDA', 'Other'] }],
+      total: 243,
+    });
+    const tool = await loadTool();
+    const result = await runToolContract(tool, {
+      countries: 'ET',
+      financial_type: ['IDA', 'Grants'],
+    });
+
+    expect(result.isError).toBeFalsy();
+    expect(searchProjects.mock.calls[0]?.[0]).toMatchObject({ financialTypes: ['IDA', 'Grants'] });
+    expect(result.structuredContent).toMatchObject({
+      appliedFilters: { countries: 'ET', financialType: 'IDA,Grants' },
+    });
+    expect(textOf(result)).toContain('financial_type=IDA,Grants');
+  });
+
+  it('accepts exactly the financing windows financialTypes reports, case-sensitive', async () => {
+    const tool = await loadTool();
+    expect(
+      tool.input.safeParse({ financial_type: ['IBRD', 'IDA', 'Grants', 'Other'] }).success,
+    ).toBe(true);
+    for (const value of ['ida', 'grants', 'Grant', 'Trust Funds']) {
+      expect(tool.input.safeParse({ financial_type: [value] }).success).toBe(false);
+    }
+  });
+
+  it('sends no financing-window filter when none is asked for', async () => {
+    const searchProjects = await stubService({ projects: [project], total: 1 });
+    const tool = await loadTool();
+    const ctx = createMockContext({ errors: tool.errors });
+    await tool.handler(tool.input.parse({ countries: 'BR', financial_type: [] }), ctx);
+
+    expect(searchProjects.mock.calls[0]?.[0]).toMatchObject({ financialTypes: [] });
+    const enrichment = getEnrichment(ctx) as { appliedFilters: Record<string, unknown> };
+    expect(enrichment.appliedFilters).not.toHaveProperty('financialType');
+  });
+
+  it('names financial_type among the filters that emptied a country search', async () => {
+    await stubService({ projects: [], total: 0, countryOnlyTotal: 387 });
+    const tool = await loadTool();
+    const ctx = createMockContext({ errors: tool.errors });
+    await tool.handler(tool.input.parse({ countries: 'ET', financial_type: ['IBRD'] }), ctx);
+
+    const notice = getEnrichment(ctx).notice as string;
+    expect(notice).toMatch(/ET match 387 projects with every other filter removed/);
+    expect(notice).toMatch(/so financial_type narrowed the result to nothing/);
   });
 
   it('omits filters the caller did not supply from the echo', async () => {
@@ -687,7 +744,9 @@ describe('worldbankSearchProjects', () => {
     expect(text).toContain('**countryCodes:** BR');
     expect(text).toContain('**boardApprovalDate:** 2026-03-30');
     expect(text).toContain('**closingDate:** 2031-12-19');
-    expect(text).toContain('**totalCommitment:** 41,800,000 USD');
+    expect(text).toContain(
+      '**totalCommitment:** 41,800,000 USD (ibrdCommitment 41,800,000 · idaCommitment 0)',
+    );
     expect(text).toContain('**financialTypes:** IBRD, Other');
     expect(text).toContain('**majorSectors:** Public Administration, Education');
     expect(text).toContain('projects.worldbank.org/en/projects-operations/project-detail/P513080');
@@ -695,10 +754,88 @@ describe('worldbankSearchProjects', () => {
 
     // The sparse row reports its gaps rather than rendering blanks.
     expect(text).toContain('**closingDate:** null');
-    expect(text).toContain('**totalCommitment:** null');
+    expect(text).toContain('**totalCommitment:** null | **financialTypes:** none');
     expect(text).toContain('**majorSectors:** none');
     expect(text).toContain('**countryCodes:** none');
     expect(text).toContain('**abstract:** null');
+  });
+
+  it('carries the commitment breakdown on both surfaces, a grant-only operation included', async () => {
+    const grantOnly = {
+      ...project,
+      id: 'P516289',
+      name: 'Second Kenya Social and Economic Inclusion Project',
+      totalCommitment: 22_000_000,
+      ibrdCommitment: null,
+      idaCommitment: null,
+      grantAmount: 22_000_000,
+      financialTypes: ['Grants'],
+    };
+    const blended = {
+      ...project,
+      id: 'P510631',
+      name: 'Chao Phraya Flood Management Plan 2',
+      totalCommitment: 880_000_000,
+      ibrdCommitment: 610_000_000,
+      idaCommitment: 0,
+      grantAmount: 270_000_000,
+    };
+    await stubService({ projects: [grantOnly, blended], total: 2 });
+    const tool = await loadTool();
+    const result = await runToolContract(tool, { query: 'P516289' });
+
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({
+      projects: [
+        { totalCommitment: 22_000_000, ibrdCommitment: null, idaCommitment: null },
+        { totalCommitment: 880_000_000, ibrdCommitment: 610_000_000, idaCommitment: 0 },
+      ],
+    });
+    const text = textOf(result);
+    expect(text).toContain('**totalCommitment:** 22,000,000 USD | **financialTypes:** Grants');
+    expect(text).toContain(
+      '**totalCommitment:** 880,000,000 USD (ibrdCommitment 610,000,000 · idaCommitment 0 · grantAmount 270,000,000)',
+    );
+  });
+
+  it('prints only the published breakdown parts, and none when one part is the whole total', async () => {
+    const tool = await loadTool();
+    const ibrdOnly = {
+      ...project,
+      id: 'P100001',
+      totalCommitment: 50_000_000,
+      ibrdCommitment: 50_000_000,
+      idaCommitment: null,
+      grantAmount: null,
+      financialTypes: ['IBRD'],
+    };
+    const [block] = tool.format?.({ projects: [ibrdOnly, project, sparseProject] }) ?? [];
+    const text = (block as { text: string }).text;
+
+    // One published part equal to the total adds nothing, so no parenthetical.
+    expect(text).toContain('**totalCommitment:** 50,000,000 USD | **financialTypes:** IBRD');
+    // A null part is never printed; a published zero is.
+    expect(text).toContain(
+      '**totalCommitment:** 41,800,000 USD (ibrdCommitment 41,800,000 · idaCommitment 0) |',
+    );
+    expect(text).toContain('**totalCommitment:** null | **financialTypes:** none');
+    expect(text).not.toMatch(/(ibrdCommitment|idaCommitment|grantAmount) null/);
+  });
+
+  it('describes the grant amount apart from the Grants financing window', async () => {
+    const tool = await loadTool();
+    const item = (
+      tool.output.shape.projects as unknown as {
+        element: { shape: Record<string, { description?: string }> };
+      }
+    ).element.shape;
+
+    expect(item.totalCommitment?.description).not.toMatch(/Total World Bank commitment/);
+    expect(item.totalCommitment?.description).toMatch(/35\.8%/);
+    expect(item.grantAmount?.description).toMatch(/co-financ/);
+    expect(item.grantAmount?.description).not.toMatch(/Grants window/i);
+    expect(tool.description).toMatch(/financing windows/);
+    expect(tool.description).not.toMatch(/financing instrument/);
   });
 
   it('renders an empty result without throwing', async () => {

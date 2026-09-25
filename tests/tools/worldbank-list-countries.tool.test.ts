@@ -350,6 +350,88 @@ describe('worldbankListCountries', () => {
     expect(notice).not.toMatch(/past the end/);
   });
 
+  // ─── lending_type ─────────────────────────────────────────────────────────
+
+  it('passes lending_type to the service beside the other filters, and omits it when absent', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    const listCountriesMock = vi.fn().mockResolvedValue(mockCountriesResult);
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      listCountries: listCountriesMock,
+    } as never);
+    const { worldbankListCountries } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
+    );
+
+    await runToolContract(worldbankListCountries, { lending_type: 'IDX', region: 'SSF' });
+    expect(listCountriesMock.mock.calls[0]?.[0]).toMatchObject({
+      lendingType: 'IDX',
+      region: 'SSF',
+    });
+
+    await runToolContract(worldbankListCountries, { lending_type: '' });
+    await runToolContract(worldbankListCountries, {});
+    expect(listCountriesMock.mock.calls[1]?.[0]).not.toHaveProperty('lendingType');
+    expect(listCountriesMock.mock.calls[2]?.[0]).not.toHaveProperty('lendingType');
+  });
+
+  it('accepts exactly the four lending type codes', async () => {
+    const { worldbankListCountries } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
+    );
+    for (const code of ['IBD', 'IDB', 'IDX', 'LNX']) {
+      expect(worldbankListCountries.input.safeParse({ lending_type: code }).success).toBe(true);
+    }
+    for (const code of ['IDA', 'IBRD', 'idx', 'Blend']) {
+      expect(worldbankListCountries.input.safeParse({ lending_type: code }).success).toBe(false);
+    }
+  });
+
+  it('names every filter in force when nothing matched, on both surfaces', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      listCountries: vi.fn().mockResolvedValue({ countries: [], total: 0, page: 1, pages: 1 }),
+    } as never);
+    const { worldbankListCountries } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
+    );
+
+    const pair = await runToolContract(worldbankListCountries, {
+      region: 'NAC',
+      lending_type: 'IDX',
+    });
+    const pairNotice = (pair.structuredContent as { notice: string }).notice;
+    expect(pairNotice).toMatch(/No countries matched region=NAC, lending_type=IDX/);
+    expect(pairNotice).toMatch(/combine by AND/);
+    expect(pairNotice).not.toMatch(/The two filters/);
+    expect(pair.content.map((block) => ('text' in block ? block.text : '')).join('\n')).toContain(
+      'lending_type=IDX',
+    );
+
+    const three = createMockContext({ errors: worldbankListCountries.errors });
+    await worldbankListCountries.handler(
+      worldbankListCountries.input.parse({
+        region: 'NAC',
+        income_level: 'LIC',
+        lending_type: 'IDX',
+      }),
+      three,
+    );
+    expect(getEnrichment(three).notice).toMatch(/region=NAC, income_level=LIC, lending_type=IDX/);
+  });
+
+  it('describes the current MEA name and the membership region codes', async () => {
+    const { worldbankListCountries } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
+    );
+    const shape = worldbankListCountries.input.shape as Record<string, { description?: string }>;
+    expect(shape.region?.description).toMatch(
+      /MEA \(Middle East, North Africa, Afghanistan & Pakistan\)/,
+    );
+    expect(shape.region?.description).toMatch(/AFE/);
+    expect(shape.region?.description).toMatch(/AFW/);
+    expect(shape.lending_type?.description).toMatch(/IDX/);
+  });
+
   it('raises no notice on a page with countries', async () => {
     const { worldbankListCountries } = await import(
       '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'

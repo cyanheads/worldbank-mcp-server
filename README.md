@@ -33,13 +33,13 @@ World Bank Open Data across three separate upstream APIs — development indicat
 |:---|:---|
 | `worldbank_list_topics` | List all 21 World Bank thematic topics with descriptions |
 | `worldbank_list_sources` | List 70+ World Bank data sources (datasets) with pagination |
-| `worldbank_list_countries` | List countries and regional aggregates with ISO codes, region, income level, and coordinates |
+| `worldbank_list_countries` | List countries and regional aggregates with ISO codes, region, income level, lending type, and coordinates, filterable by region, income level, and lending type |
 | `worldbank_get_country` | Fetch full metadata for a specific country or aggregate by ISO2, ISO3, or aggregate code |
 | `worldbank_search_indicators` | Search the 29,500+ indicator catalog by keyword, topic, or source |
 | `worldbank_get_indicator` | Fetch complete metadata for a single indicator: name, description, source, unit, and topics |
 | `worldbank_get_data` | Query indicator values for one or more countries across a time range or most-recent N values |
 | `worldbank_get_poverty` | Poverty headcount, gap, and severity at any poverty line for economies and PIP's regional, income-group, and lending-group aggregates, plus the Gini coefficient and decile shares, from the Poverty and Inequality Platform |
-| `worldbank_search_projects` | Search the World Bank lending portfolio by text, country, region, status, and board approval date |
+| `worldbank_search_projects` | Search the World Bank lending portfolio by text, country, region, status, financing window, and board approval date |
 
 ### Resources
 
@@ -67,9 +67,10 @@ World Bank Open Data across three separate upstream APIs — development indicat
 
 ### `worldbank_list_countries` <sub>tool</sub>
 
-- Returns ISO codes, region, income level, capital, and coordinates; up to 300 per page
-- Filterable by region code (`EAS`, `ECS`, `LCN`, `MEA`, `NAC`, `SAS`, `SSF`) and income level (`LIC`, `LMC`, `UMC`, `HIC`); an invalid code is a typed `invalid_filter` error
-- Individual countries only by default — `include_aggregates=true` adds regional, income-group, and world aggregate entries, distinguished by `isAggregate`
+- Returns ISO codes, region, income level, lending type, capital, and coordinates; up to 300 per page
+- Filterable by region code (`EAS`, `ECS`, `LCN`, `MEA`, `NAC`, `SAS`, `SSF`, plus membership groupings such as `AFE`, `AFW`, `ARB`, `EUU`, `LDC`), income level (`LIC`, `LMC`, `UMC`, `HIC`), and lending type (`IDX` IDA, `IBD` IBRD, `IDB` Blend, `LNX` not classified), combined by AND; an invalid region or income code is a typed `invalid_filter` error
+- Each country is listed once under `lending_type`, even though upstream sends every IDA, IBRD, and Blend entry twice
+- Individual countries only by default — `include_aggregates=true` adds regional, income-group, and world aggregate entries, distinguished by `isAggregate` (none match a `region` or `lending_type` filter)
 
 ---
 
@@ -123,9 +124,10 @@ World Bank Open Data across three separate upstream APIs — development indicat
 
 ### `worldbank_search_projects` <sub>tool</sub>
 
-- Free-text `query` across project names, abstracts, and objectives, combined by AND with exact filters on `countries`, `region` (World Bank operational regions), `status` (`Active`, `Closed`, `Dropped`, `Pipeline`), and a board-approval date window (`approved_from`/`approved_to`, real calendar days, earliest first)
-- **Countries are ISO2 here** (`BR`, `IN`, `ZA`) or a two-character World Bank regional code (`3A`, `4E`) — the one place this server departs from the ISO3 codes its other tools take; an ISO3 code is rejected as `invalid_country_code` rather than silently returning zero hits
-- Returns project ID, name, borrowing country/region, status, board approval and closing dates, total commitment in USD, financing windows, major sectors, and a project-page URL
+- Free-text `query` across project names, abstracts, and objectives, combined by AND with exact filters on `countries`, `region` (World Bank operational regions), `status` (`Active`, `Closed`, `Dropped`, `Pipeline`), `financial_type` (financing windows `IBRD`, `IDA`, `Grants`, `Other`, combined as OR), and a board-approval date window (`approved_from`/`approved_to`, real calendar days, earliest first)
+- Countries by ISO3 or ISO2 code (`BRA`, `BR`), resolved to the code the portfolio keys on — including the legacy codes it files Yemen, DR Congo, West Bank and Gaza, and Timor-Leste under (`RY`, `ZR`, `GZ`, `TP`) — or a World Bank regional code for multi-country operations (`3A`, `4E`); a WDI aggregate (`SSF`, `WLD`) or an unknown code is a typed `invalid_country_code` error, and each project's `countryCodes` reports the WDI ISO2 code so it chains into the other tools
+- A query the Projects API cannot parse (brackets or braces, an unmatched quote, a dangling AND/OR, a trailing NOT, `#`) is a typed `invalid_query` error, distinct from an upstream outage
+- Returns project ID, name, borrowing country/region, status, board approval and closing dates, the commitment amount in USD the project page reports with its IBRD, IDA, and grant parts, financing windows, major sectors, and a project-page URL — newest board approval first, with or without `query`
 - `include_abstract` (off by default) always returns each abstract whole, capping a page at 8 projects instead of 80 to keep responses within ~50 KB
 - An empty result names which filter emptied it — when a country filter was in force, the response reports whether the codes match anything on their own
 

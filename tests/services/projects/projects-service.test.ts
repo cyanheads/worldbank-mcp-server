@@ -6,12 +6,16 @@
  * @module tests/services/projects/projects-service.test
  */
 
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createInMemoryStorage, createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // ─── fetchWithTimeout mock ────────────────────────────────────────────────────
 // Hoisted so the mock is in place before the service module resolves the dep.
-vi.mock('@cyanheads/mcp-ts-core/utils', () => ({
+// The real status classification and retry loop are covered against a stubbed
+// global fetch in projects-service-http.test.ts.
+vi.mock('@cyanheads/mcp-ts-core/utils', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@cyanheads/mcp-ts-core/utils')>()),
   fetchWithTimeout: vi.fn(),
   withRetry: vi.fn().mockImplementation((fn: () => unknown) => fn()),
 }));
@@ -42,7 +46,10 @@ function rawProject(id: string, overrides: Record<string, unknown> = {}) {
     regionname: 'Latin America and Caribbean',
     boardapprovaldate: '2024-06-28T00:00:00Z',
     closingdate: '2029-12-31',
-    totalamt: '41800000',
+    curr_total_commitment: '41800000',
+    curr_ibrd_commitment: '41800000',
+    curr_ida_commitment: '0',
+    grantamt: '0',
     // Upstream repeats a window once per instrument, and a major sector once per
     // sector that rolls up to it.
     projectfinancialtype: ['IBRD', 'Other', 'Other'],
@@ -100,6 +107,7 @@ describe('ProjectsService', () => {
     countryCodes: [] as string[],
     statuses: [] as string[],
     regions: [] as string[],
+    financialTypes: [] as string[],
     includeAbstract: false,
     page: 1,
     perPage: 50,
@@ -155,6 +163,9 @@ describe('ProjectsService', () => {
       boardApprovalDate: '2024-06-28',
       closingDate: '2029-12-31',
       totalCommitment: 41_800_000,
+      ibrdCommitment: 41_800_000,
+      idaCommitment: 0,
+      grantAmount: 0,
       financialTypes: ['IBRD', 'Other'],
       majorSectors: ['Health', 'Education'],
       abstract: 'Rehabilitation of the dam and the associated irrigation perimeter.',
@@ -193,10 +204,10 @@ describe('ProjectsService', () => {
   it('never reads an unusable amount as a commitment of zero', async () => {
     mockBody(
       envelope([
-        rawProject('P100', { totalamt: '' }),
-        rawProject('P200', { totalamt: '   ' }),
-        rawProject('P300', { totalamt: 'n/a' }),
-        rawProject('P400', { totalamt: '0' }),
+        rawProject('P100', { curr_total_commitment: '' }),
+        rawProject('P200', { curr_total_commitment: '   ' }),
+        rawProject('P300', { curr_total_commitment: 'n/a' }),
+        rawProject('P400', { curr_total_commitment: '0' }),
       ]),
     );
 
@@ -209,6 +220,130 @@ describe('ProjectsService', () => {
       null,
       null,
       0,
+    ]);
+  });
+
+  // ─── Commitment amounts ───────────────────────────────────────────────────
+
+  /**
+   * P516289 as the endpoint returned it on 2026-09-25, trimmed to the fields
+   * requested: a trust-funded grant with no IBRD or IDA money, so no `totalamt`.
+   */
+  const grantOnlyRecord = {
+    id: 'P516289',
+    proj_id: 'P516289',
+    project_name: 'Second Kenya Social and Economic Inclusion Project',
+    status: 'Active',
+    countryname: 'Republic of Kenya',
+    countrycode: ['KE'],
+    regionname: 'Eastern and Southern Africa',
+    boardapprovaldate: '2026-07-22T00:00:00Z',
+    grantamt: '22000000',
+    curr_total_commitment: '22000000',
+    projectfinancialtype: ['Grants'],
+  };
+
+  /**
+   * P510631 (Thailand, pipeline) as returned on 2026-09-25: IBRD lending plus
+   * 270,000,000 of Asian Development Bank and AIIB co-financing in `grantamt`.
+   */
+  const blendedRecord = {
+    id: 'P510631',
+    proj_id: 'P510631',
+    project_name: 'Chao Phraya Flood Management Plan 2',
+    status: 'Pipeline',
+    countryname: 'Kingdom of Thailand',
+    countrycode: ['TH'],
+    regionname: 'East Asia and Pacific',
+    boardapprovaldate: '2027-09-21T00:00:00Z',
+    totalamt: '610000000',
+    grantamt: '270000000',
+    curr_total_commitment: '880000000',
+    curr_ibrd_commitment: '610000000',
+    curr_ida_commitment: '0',
+    projectfinancialtype: ['IBRD', 'Other'],
+  };
+
+  it('reads the commitment the project page reports, so a grant-only operation is not null', async () => {
+    mockBody(envelope([grantOnlyRecord as never]));
+    const result = await service.searchProjects(baseOpts, createMockContext());
+
+    expect(result.projects[0]).toMatchObject({
+      totalCommitment: 22_000_000,
+      grantAmount: 22_000_000,
+      ibrdCommitment: null,
+      idaCommitment: null,
+    });
+  });
+
+  it('splits a blended commitment into IBRD, IDA, and grant amounts beside the total', async () => {
+    mockBody(envelope([blendedRecord as never]));
+    const result = await service.searchProjects(baseOpts, createMockContext());
+
+    expect(result.projects[0]).toMatchObject({
+      totalCommitment: 880_000_000,
+      ibrdCommitment: 610_000_000,
+      // A published zero is a real zero, not a missing amount.
+      idaCommitment: 0,
+      grantAmount: 270_000_000,
+    });
+  });
+
+  it('reports every amount as null, never zero, on a record that publishes none', async () => {
+    mockBody(
+      envelope([
+        rawProject('P900', {
+          grantamt: undefined,
+          curr_total_commitment: undefined,
+          curr_ibrd_commitment: undefined,
+          curr_ida_commitment: undefined,
+        }),
+      ]),
+    );
+    const result = await service.searchProjects(baseOpts, createMockContext());
+
+    expect(result.projects[0]).toMatchObject({
+      totalCommitment: null,
+      ibrdCommitment: null,
+      idaCommitment: null,
+      grantAmount: null,
+    });
+  });
+
+  it('requests the commitment breakdown fields', async () => {
+    mockBody(envelope([rawProject('P100')]));
+    await service.searchProjects(baseOpts, createMockContext());
+
+    expect(requestedUrl().searchParams.get('fl')?.split(',')).toEqual(
+      expect.arrayContaining([
+        'curr_total_commitment',
+        'curr_ibrd_commitment',
+        'curr_ida_commitment',
+        'grantamt',
+      ]),
+    );
+  });
+
+  it('reports the four legacy portfolio codes as their WDI ISO2 codes, leaving every other code alone', async () => {
+    mockBody(
+      envelope([
+        rawProject('P101', { countrycode: ['RY'] }),
+        rawProject('P102', { countrycode: ['ZR'] }),
+        rawProject('P103', { countrycode: ['GZ'] }),
+        rawProject('P104', { countrycode: ['TP'] }),
+        rawProject('P105', { countrycode: ['BR'] }),
+        rawProject('P106', { countrycode: ['3A'] }),
+      ]),
+    );
+    const result = await service.searchProjects(baseOpts, createMockContext());
+
+    expect(result.projects.map((row) => row.countryCodes)).toEqual([
+      ['YE'],
+      ['CD'],
+      ['PS'],
+      ['TL'],
+      ['BR'],
+      ['3A'],
     ]);
   });
 
@@ -280,6 +415,44 @@ describe('ProjectsService', () => {
     ]) {
       expect(params.has(key)).toBe(false);
     }
+  });
+
+  it('sends financing windows as one caret-joined OR filter, and none when none are asked for', async () => {
+    mockBody(envelope([rawProject('P100')]));
+    mockBody(envelope([rawProject('P100')]));
+
+    await service.searchProjects(
+      { ...baseOpts, countryCodes: ['ET'], financialTypes: ['IDA', 'Grants'] },
+      createMockContext(),
+    );
+    await service.searchProjects({ ...baseOpts, financialTypes: [] }, createMockContext());
+
+    expect(requestedUrl(0).searchParams.get('projectfinancialtype_exact')).toBe('IDA^Grants');
+    expect(requestedUrl(0).searchParams.get('countrycode_exact')).toBe('ET');
+    expect(requestedUrl(1).searchParams.has('projectfinancialtype_exact')).toBe(false);
+  });
+
+  it('orders every request by board approval date, newest first, with or without query', async () => {
+    // With qterm, upstream's own order is descending project ID, not board date.
+    mockBody(envelope([], 0));
+    mockBody(envelope([], 12));
+    mockBody(envelope([rawProject('P100')]));
+
+    await service.searchProjects(
+      { ...baseOpts, query: 'climate adaptation', countryCodes: ['BR'] },
+      createMockContext(),
+    );
+    await service.searchProjects(baseOpts, createMockContext());
+
+    // The search with query, the country-only probe behind its empty result, and a browse.
+    expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(3);
+    for (const index of [0, 1, 2]) {
+      const params = requestedUrl(index).searchParams;
+      expect(params.get('srt')).toBe('boardapprovaldate');
+      expect(params.get('order')).toBe('desc');
+    }
+    expect(requestedUrl(0).searchParams.get('qterm')).toBe('climate adaptation');
+    expect(requestedUrl(1).searchParams.has('qterm')).toBe(false);
   });
 
   // ─── Offset pagination ────────────────────────────────────────────────────
@@ -510,4 +683,18 @@ describe('ProjectsService', () => {
       /without the expected projects object/,
     );
   });
+
+  it.each(['undefined', 'many'])(
+    'throws a serialization error rather than count a total of "%s"',
+    async (total) => {
+      // The API answers a # in qterm with HTTP 200 and `"total": "undefined"`.
+      mockBody(JSON.stringify({ rows: 0, os: '0', page: '1', total, projects: {} }));
+      await expect(
+        service.searchProjects({ ...baseOpts, query: 'water' }, createMockContext()),
+      ).rejects.toMatchObject({
+        code: JsonRpcErrorCode.SerializationError,
+        message: expect.stringMatching(/total/),
+      });
+    },
+  );
 });
