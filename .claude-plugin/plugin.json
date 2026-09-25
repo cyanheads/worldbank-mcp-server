@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "worldbank-mcp-server",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "Query 29,500+ World Bank development indicators for 200+ countries across 60+ years via MCP. STDIO or Streamable HTTP.",
   "author": {
     "name": "cyanheads",

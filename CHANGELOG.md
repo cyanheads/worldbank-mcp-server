@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.5.2](changelog/0.5.x/0.5.2.md) — 2026-09-25
+
+The npm tarball no longer includes the .mcpb bundle that bun run bundle writes into dist/.
+
 ## [0.5.1](changelog/0.5.x/0.5.1.md) — 2026-09-25
 
 worldbank_get_data adds mrnev for each country's latest non-empty values, frequency for quarterly and monthly series, and lastUpdated. Latest values are selected locally from date reads checked against the API's response cache, and a transient HTTP 400 is retried.
