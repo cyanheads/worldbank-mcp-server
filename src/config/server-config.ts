@@ -29,7 +29,7 @@ const ServerConfigSchema = z.object({
     .min(0)
     .default(3_600_000)
     .describe(
-      "Lifetime in ms of the in-process reference caches: the indicator catalog behind keyword-only search, the country index behind isAggregate and source-scoped country codes, each source-scoped dataset's concept, country, period, and dimension listings, and the PIP versions listing behind ppp_version. 0 disables caching.",
+      "Lifetime in ms of the in-process reference caches: the indicator catalog behind keyword-only search, the country index behind isAggregate, source-scoped country codes, and poverty ISO2 codes, each source-scoped dataset's concept, country, period, and dimension listings, and PIP's versions listing behind ppp_version, regions table behind aggregate codes, and economy list behind model-estimate-only economies. 0 disables caching.",
     ),
 });
 

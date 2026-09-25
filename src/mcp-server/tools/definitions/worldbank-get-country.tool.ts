@@ -80,15 +80,16 @@ export const worldbankGetCountry = tool('worldbank_get_country', {
     } catch (err) {
       if (err instanceof McpError && err.data?.reason === 'country_not_found') {
         throw ctx.fail('country_not_found', err.message, {
+          ...err.data,
           ...ctx.recoveryFor('country_not_found'),
           countryCode: input.country_code,
         });
       }
       if (err instanceof McpError && err.data?.reason === 'multiple_countries') {
         throw ctx.fail('multiple_countries', err.message, {
+          ...err.data,
           ...ctx.recoveryFor('multiple_countries'),
           countryCode: input.country_code,
-          matchedIds: err.data.matchedIds,
         });
       }
       throw err;

@@ -15,6 +15,7 @@ export const worldbankListCountries = tool('worldbank_list_countries', {
   description:
     'List countries and regional aggregates with metadata: ISO codes, region, income level, capital, and coordinates. Filter by region code (e.g. EAS, SSF, NAC) and income level (LIC, LMC, UMC, HIC). Aggregate entries are excluded by default, leaving individual countries only; set include_aggregates=true to also return region, income group, and world aggregate entities.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
+  inputAliases: { limit: 'per_page' },
   input: z.object({
     region: z
       .string()
@@ -133,6 +134,7 @@ export const worldbankListCountries = tool('worldbank_list_countries', {
     } catch (err) {
       if (err instanceof McpError && err.data?.reason === 'invalid_filter') {
         throw ctx.fail('invalid_filter', err.message, {
+          ...err.data,
           ...ctx.recoveryFor('invalid_filter'),
           region: input.region,
           incomeLevel: input.income_level,

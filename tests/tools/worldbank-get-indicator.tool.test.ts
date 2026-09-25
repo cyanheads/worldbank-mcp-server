@@ -35,6 +35,42 @@ describe('worldbankGetIndicator', () => {
     } as never);
   });
 
+  it.each([
+    ['indicator_not_found', JsonRpcErrorCode.NotFound],
+    ['multiple_indicators', JsonRpcErrorCode.ValidationError],
+  ] as const)("forwards the service's data on a %s re-throw", async (reason, code) => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      getIndicator: vi.fn().mockRejectedValue(
+        new McpError(code, `Rejected: ${reason}.`, {
+          reason,
+          indicatorId: 'NY.GDP.PCAP.CD',
+          detail: 'upstream detail',
+          retryable: false,
+        }),
+      ),
+    } as never);
+    const { worldbankGetIndicator } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-indicator.tool.js'
+    );
+    const result = await runToolContract(worldbankGetIndicator, { indicator_id: 'NY.GDP.PCAP.CD' });
+
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code,
+        data: {
+          reason,
+          indicatorId: 'NY.GDP.PCAP.CD',
+          detail: 'upstream detail',
+          retryable: false,
+          recovery: { hint: expect.stringContaining('worldbank_search_indicators') },
+        },
+      },
+    });
+    const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+    expect(text.trimEnd()).toMatch(new RegExp(`\\(reason ${reason} · not retryable\\)$`));
+  });
+
   it('returns indicator metadata', async () => {
     const { worldbankGetIndicator } = await import(
       '@/mcp-server/tools/definitions/worldbank-get-indicator.tool.js'

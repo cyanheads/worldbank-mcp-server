@@ -134,6 +134,24 @@ const WB_ERROR_BODY = [
   },
 ];
 
+/**
+ * Resolve after `ms`, or reject first if `signal` aborts, as the framework's
+ * fetch does with the signal it is handed.
+ */
+function settleAfter(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      'abort',
+      () => {
+        clearTimeout(timer);
+        reject(new Error('fetch was aborted'));
+      },
+      { once: true },
+    );
+  });
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 describe('WorldBankApiService', () => {
@@ -624,6 +642,97 @@ describe('WorldBankApiService', () => {
     expect(result.lendingType).toBe('');
     expect(result.capitalCity).toBe('');
     expect(result.isAggregate).toBe(false); // neither id = "NA"
+  });
+
+  // ─── lookupCountry ────────────────────────────────────────────────────────
+
+  it('lookupCountry: resolves either identifier, in any case, to both', async () => {
+    mockAggregateLookup();
+    const ctx = createMockContext();
+
+    await expect(service.lookupCountry('zh', ctx)).resolves.toEqual({ id: 'AFE', iso2: 'ZH' });
+    await expect(service.lookupCountry('AFE', ctx)).resolves.toEqual({ id: 'AFE', iso2: 'ZH' });
+    await expect(service.lookupCountry(' 1w ', ctx)).resolves.toEqual({ id: 'WLD', iso2: '1W' });
+    // One listing request serves every lookup.
+    expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('lookupCountry: answers undefined for a code the listing does not carry', async () => {
+    mockAggregateLookup();
+    await expect(service.lookupCountry('QQ', createMockContext())).resolves.toBeUndefined();
+  });
+
+  // ─── Shared reference loads ───────────────────────────────────────────────
+
+  /**
+   * Answer every request with `body`, `ms` late, failing early the way the
+   * framework's fetch does when the signal it was handed aborts first.
+   */
+  function slowResponse(body: unknown, ms: number) {
+    fetchWithTimeoutMock.mockImplementation(
+      async (_url: string, _timeout: number, _ctx: unknown, options?: { signal?: AbortSignal }) => {
+        await settleAfter(ms, options?.signal);
+        return { text: async () => JSON.stringify(body) };
+      },
+    );
+  }
+
+  const COUNTRY_LISTING = [
+    pagingObj({ total: 2 }),
+    [rawCountry('USA', 'United States'), rawAggregate('WLD', '1W', 'World')],
+  ];
+  const CATALOG = [pagingObj(), [rawIndicator('NY.GDP.PCAP.CD', 'GDP per capita')]];
+
+  it('fails only the caller that cancels while a concurrent caller shares the country index load', async () => {
+    slowResponse(COUNTRY_LISTING, 60);
+    const cancelled = new AbortController();
+
+    const first = service.lookupCountry('1W', createMockContext({ signal: cancelled.signal }));
+    await settleAfter(10);
+    const second = service.lookupCountry('1W', createMockContext());
+    await settleAfter(10);
+    cancelled.abort();
+
+    const [cancelledOutcome, concurrentOutcome] = await Promise.allSettled([first, second]);
+
+    expect(concurrentOutcome).toEqual({ status: 'fulfilled', value: { id: 'WLD', iso2: '1W' } });
+    expect(cancelledOutcome).toEqual({ status: 'rejected', reason: cancelled.signal.reason });
+    expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('fails only the caller that cancels while a concurrent caller shares the indicator catalog load', async () => {
+    slowResponse(CATALOG, 60);
+    const cancelled = new AbortController();
+    const search = { query: 'gdp', page: 1, perPage: 10 };
+
+    const first = service.searchIndicators(search, createMockContext({ signal: cancelled.signal }));
+    await settleAfter(10);
+    const second = service.searchIndicators(search, createMockContext());
+    await settleAfter(10);
+    cancelled.abort();
+
+    const [cancelledOutcome, concurrentOutcome] = await Promise.allSettled([first, second]);
+
+    expect(concurrentOutcome).toMatchObject({ status: 'fulfilled', value: { total: 1 } });
+    expect(cancelledOutcome).toEqual({ status: 'rejected', reason: cancelled.signal.reason });
+    expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps a reference load every caller abandoned, and serves the next caller from it', async () => {
+    slowResponse(COUNTRY_LISTING, 40);
+    const cancelled = new AbortController();
+
+    const abandoned = service.lookupCountry('1W', createMockContext({ signal: cancelled.signal }));
+    await settleAfter(10);
+    cancelled.abort();
+    await expect(abandoned).rejects.toThrow();
+
+    await settleAfter(60);
+    await expect(service.lookupCountry('1W', createMockContext())).resolves.toEqual({
+      id: 'WLD',
+      iso2: '1W',
+    });
+    expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(1);
   });
 
   // ─── listCountries ────────────────────────────────────────────────────────

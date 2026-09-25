@@ -34,6 +34,42 @@ describe('worldbankGetCountry', () => {
     } as never);
   });
 
+  it.each([
+    ['country_not_found', JsonRpcErrorCode.NotFound],
+    ['multiple_countries', JsonRpcErrorCode.ValidationError],
+  ] as const)("forwards the service's data on a %s re-throw", async (reason, code) => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      getCountry: vi.fn().mockRejectedValue(
+        new McpError(code, `Rejected: ${reason}.`, {
+          reason,
+          countryCode: 'ZZ',
+          detail: 'upstream detail',
+          retryable: false,
+        }),
+      ),
+    } as never);
+    const { worldbankGetCountry } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-country.tool.js'
+    );
+    const result = await runToolContract(worldbankGetCountry, { country_code: 'ZZ' });
+
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code,
+        data: {
+          reason,
+          countryCode: 'ZZ',
+          detail: 'upstream detail',
+          retryable: false,
+          recovery: { hint: expect.stringContaining('worldbank_list_countries') },
+        },
+      },
+    });
+    const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+    expect(text.trimEnd()).toMatch(new RegExp(`\\(reason ${reason} · not retryable\\)$`));
+  });
+
   it('returns country metadata', async () => {
     const { worldbankGetCountry } = await import(
       '@/mcp-server/tools/definitions/worldbank-get-country.tool.js'

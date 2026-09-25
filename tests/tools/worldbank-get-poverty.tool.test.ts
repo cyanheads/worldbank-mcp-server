@@ -50,6 +50,8 @@ const surveyRow = {
   comparableSpell: '2019 - 2023',
   estimationType: 'survey',
   isInterpolated: false,
+  isAggregate: false,
+  popInPoverty: null,
 };
 
 /** A gap-filled row: poverty measures present, distributional block absent. */
@@ -73,27 +75,37 @@ const gapFilledRow = {
 /** Stub the service with a fixed result and hand back the spy for assertions. */
 async function stubService(result: Record<string, unknown>) {
   const { getPipService } = await import('@/services/pip/pip-service.js');
-  // The service echoes the page size it served; a stub that doesn't cap echoes the request.
-  const getPoverty = vi.fn().mockImplementation(async (opts: { perPage: number }) => ({
-    rows: [],
-    total: 0,
-    page: 1,
-    pages: 1,
-    perPage: opts.perPage,
-    gapFilled: false,
-    pppVersion: '2021',
-    releaseVersion: '20260324',
-    ...result,
-  }));
+  // The service echoes the page size it served and the codes it queried; a stub
+  // that neither caps nor respells echoes the request, uppercased.
+  const getPoverty = vi
+    .fn()
+    .mockImplementation(async (opts: { perPage: number; countries: string[] }) => ({
+      rows: [],
+      total: 0,
+      page: 1,
+      pages: 1,
+      perPage: opts.perPage,
+      countries: opts.countries.map((code) => code.toUpperCase()),
+      gapFilled: false,
+      modelOnly: [],
+      pppVersion: '2021',
+      releaseVersion: '20260324',
+      ...result,
+    }));
   vi.mocked(getPipService).mockReturnValue({ getPoverty } as never);
   return getPoverty;
 }
 
-/** Stub the service to reject with an McpError carrying a service-layer reason. */
-async function stubServiceError(code: JsonRpcErrorCode, message: string, reason: string) {
+/** Stub the service to reject with an McpError carrying a service-layer reason and data. */
+async function stubServiceError(
+  code: JsonRpcErrorCode,
+  message: string,
+  reason: string,
+  data: Record<string, unknown> = {},
+) {
   const { getPipService } = await import('@/services/pip/pip-service.js');
   vi.mocked(getPipService).mockReturnValue({
-    getPoverty: vi.fn().mockRejectedValue(new McpError(code, message, { reason })),
+    getPoverty: vi.fn().mockRejectedValue(new McpError(code, message, { reason, ...data })),
   } as never);
 }
 
@@ -349,6 +361,65 @@ describe('worldbankGetPoverty', () => {
     expect(tool.input.safeParse({ countries: 'all', per_page: 1000 }).success).toBe(true);
   });
 
+  it('reads limit as per_page, on both surfaces', async () => {
+    const getPoverty = await stubService({ rows: [surveyRow], total: 1 });
+    const tool = await loadTool();
+    const result = await runToolContract(tool, { countries: 'USA', limit: 5 } as never);
+
+    expect(result.isError).toBeFalsy();
+    expect(getPoverty.mock.calls[0]?.[0]).toMatchObject({ perPage: 5 });
+    expect(result.structuredContent).toMatchObject({ appliedFilters: { perPage: 5 } });
+    expect(textOf(result)).toContain('per_page=5');
+  });
+
+  it('holds limit to the page cap exactly as per_page, disclosing the reduction', async () => {
+    await stubService({ rows: [surveyRow], total: 200, page: 1, pages: 3, perPage: 70 });
+    const tool = await loadTool();
+    const result = await runToolContract(tool, { countries: 'all', limit: 1000 } as never);
+
+    expect(result.structuredContent).toMatchObject({
+      appliedFilters: { perPage: 70, requestedPerPage: 1000 },
+    });
+    expect(textOf(result)).toContain('per_page=1000 was reduced to 70');
+  });
+
+  it('rejects a limit past the per_page maximum under the per_page bound', async () => {
+    const tool = await loadTool();
+    const result = await runToolContract(tool, { countries: 'USA', limit: 5000 } as never);
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      error: { code: JsonRpcErrorCode.InvalidParams },
+    });
+    expect(textOf(result)).toContain('per_page');
+  });
+
+  it('flags a page past the end at the page size limit asked for', async () => {
+    await stubService({ rows: [], total: 1, page: 2, pages: 1 });
+    const tool = await loadTool();
+    const result = await runToolContract(tool, { countries: 'IND', page: 2, limit: 1 } as never);
+
+    expect((result.structuredContent as { notice: string }).notice).toMatch(
+      /Page 2 is past the end of the results — 1 estimate spans 1 page at per_page=1\./,
+    );
+  });
+
+  it('still rejects limit sent alongside per_page', async () => {
+    await stubService({ rows: [surveyRow], total: 1 });
+    const tool = await loadTool();
+    const result = await runToolContract(tool, {
+      countries: 'USA',
+      per_page: 10,
+      limit: 5,
+    } as never);
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      error: { code: JsonRpcErrorCode.InvalidParams },
+    });
+    expect(textOf(result)).toContain('limit');
+  });
+
   // ─── Input validation ─────────────────────────────────────────────────────
 
   it('rejects malformed input at the schema, before any request goes out', async () => {
@@ -423,17 +494,76 @@ describe('worldbankGetPoverty', () => {
   it('maps a PIP server error to upstream_unavailable', async () => {
     await stubServiceError(
       JsonRpcErrorCode.ServiceUnavailable,
-      'PIP returned HTTP 500 for country code(s) "WLD".',
+      'PIP returned HTTP 500 for country code(s) "KEN", with no detail on the cause.',
       'upstream_unavailable',
     );
     const tool = await loadTool();
     const ctx = createMockContext({ errors: tool.errors });
-    await expect(tool.handler(tool.input.parse({ countries: 'WLD' }), ctx)).rejects.toMatchObject({
+    await expect(tool.handler(tool.input.parse({ countries: 'KEN' }), ctx)).rejects.toMatchObject({
       data: {
         reason: 'upstream_unavailable',
-        recovery: { hint: expect.stringContaining('individual economy codes') },
+        recovery: { hint: expect.stringContaining('retry the same request') },
       },
     });
+  });
+
+  it.each([
+    ['country_not_found', JsonRpcErrorCode.NotFound],
+    ['invalid_parameter', JsonRpcErrorCode.ValidationError],
+    ['ppp_version_unavailable', JsonRpcErrorCode.ValidationError],
+    ['upstream_unavailable', JsonRpcErrorCode.ServiceUnavailable],
+  ] as const)(
+    'keeps the reason, its recovery, and the queried countries on a %s re-throw',
+    async (reason, code) => {
+      await stubServiceError(code, `PIP failed with ${reason}.`, reason);
+      const tool = await loadTool();
+      const result = await runToolContract(tool, { countries: 'KEN;UGA' });
+
+      const error = (result.structuredContent as { error: { code: number; data: object } }).error;
+      expect(error.code).toBe(code);
+      expect(error.data).toMatchObject({
+        reason,
+        countries: ['KEN', 'UGA'],
+        recovery: { hint: expect.any(String) },
+      });
+      expect(textOf(result)).toContain(`(reason ${reason}`);
+    },
+  );
+
+  it('forwards the status of a PIP server error and leaves it retryable', async () => {
+    await stubServiceError(
+      JsonRpcErrorCode.ServiceUnavailable,
+      'PIP returned HTTP 503 for country code(s) "KEN".',
+      'upstream_unavailable',
+      { countryCodes: 'KEN', status: 503 },
+    );
+    const tool = await loadTool();
+    const result = await runToolContract(tool, { countries: 'KEN' });
+
+    const data = (result.structuredContent as { error: { data: Record<string, unknown> } }).error
+      .data;
+    expect(data).toMatchObject({
+      reason: 'upstream_unavailable',
+      status: 503,
+      countryCodes: 'KEN',
+    });
+    expect(data).not.toHaveProperty('retryable');
+    expect(textOf(result).trimEnd()).toMatch(/\(reason upstream_unavailable\)$/);
+  });
+
+  it('lets the recovery the tool chooses win over any recovery in the service data', async () => {
+    await stubServiceError(
+      JsonRpcErrorCode.ValidationError,
+      'PIP rejected the value supplied for year.',
+      'invalid_parameter',
+      { parameters: ['year'], recovery: { hint: 'stale service hint' } },
+    );
+    const tool = await loadTool();
+    const result = await runToolContract(tool, { countries: 'KEN', year: '1950' });
+
+    const hint = (result.structuredContent as { error: { data: { recovery: { hint: string } } } })
+      .error.data.recovery.hint;
+    expect(hint).not.toBe('stale service hint');
   });
 
   it('rethrows an unrecognized upstream error untouched', async () => {

@@ -60,6 +60,33 @@ describe('worldbankListSources', () => {
     expect(result.sources[0]?.id).toBe('2');
   });
 
+  it('reads limit as per_page', async () => {
+    const listSources = vi.fn().mockResolvedValue(mockSourcesResult);
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({ listSources } as never);
+    const { worldbankListSources } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-sources.tool.js'
+    );
+    const result = await runToolContract(worldbankListSources, { page: 2, limit: 5 } as never);
+
+    expect(result.isError).toBeFalsy();
+    expect(listSources.mock.calls[0]?.slice(0, 2)).toEqual([2, 5]);
+  });
+
+  it('still rejects limit sent alongside per_page', async () => {
+    const { worldbankListSources } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-sources.tool.js'
+    );
+    const result = await runToolContract(worldbankListSources, {
+      per_page: 10,
+      limit: 5,
+    } as never);
+
+    expect(result.isError).toBe(true);
+    const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+    expect(text).toContain('limit');
+  });
+
   it('populates enrichment with totalCount and pagination', async () => {
     const { worldbankListSources } = await import(
       '@/mcp-server/tools/definitions/worldbank-list-sources.tool.js'

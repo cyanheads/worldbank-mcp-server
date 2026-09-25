@@ -63,6 +63,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
   description:
     'Query World Bank indicator values for one or more countries across a time range — the primary data-access tool; find indicator_id values with worldbank_search_indicators. Observations carry a null value where data is not available for a country×year cell, which is common for sparse series. Set either date_range (historical analysis) or mrv (most recent N values), not both. For "all" countries, page through the results (per_page up to 1000), since the API returns several hundred entries per indicator. Indicators the standard data endpoint does not serve — WDI Database Archives, PEFA, ICP, GDLD, International Debt Statistics: DSSI, Food Prices for Nutrition — are answered from their own dataset instead; the response then carries sourceScoped, naming that dataset and the release, classification, sector, or counterpart area applied (see dimension_value), because those values can be archived or superseded figures rather than current ones.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
+  inputAliases: { limit: 'per_page' },
   input: z.object({
     indicator_id: z
       .string()
@@ -448,25 +449,28 @@ export const worldbankGetData = tool('worldbank_get_data', {
         const reason = err.data?.reason as string | undefined;
         if (reason === 'indicator_not_found') {
           throw ctx.fail('indicator_not_found', err.message, {
+            ...err.data,
             ...ctx.recoveryFor('indicator_not_found'),
             indicatorId: input.indicator_id,
           });
         }
         if (reason === 'indicator_not_queryable') {
           throw ctx.fail('indicator_not_queryable', err.message, {
+            ...err.data,
             ...ctx.recoveryFor('indicator_not_queryable'),
             indicatorId: input.indicator_id,
-            ...(err.data?.sourceNames !== undefined && { sourceNames: err.data.sourceNames }),
           });
         }
         if (reason === 'country_not_found') {
           throw ctx.fail('country_not_found', err.message, {
+            ...err.data,
             ...ctx.recoveryFor('country_not_found'),
             countries: countryCodes,
           });
         }
         if (reason === 'indicator_and_country_not_found') {
           throw ctx.fail('indicator_and_country_not_found', err.message, {
+            ...err.data,
             ...ctx.recoveryFor('indicator_and_country_not_found'),
             indicatorId: input.indicator_id,
             countries: countryCodes,
@@ -474,14 +478,15 @@ export const worldbankGetData = tool('worldbank_get_data', {
         }
         if (reason === 'unknown_dimension_value') {
           throw ctx.fail('unknown_dimension_value', err.message, {
+            ...err.data,
             ...ctx.recoveryFor('unknown_dimension_value'),
             indicatorId: input.indicator_id,
             dimensionValue,
-            validValues: err.data?.validValues,
           });
         }
         if (reason === 'dimension_not_applicable') {
           throw ctx.fail('dimension_not_applicable', err.message, {
+            ...err.data,
             ...ctx.recoveryFor('dimension_not_applicable'),
             indicatorId: input.indicator_id,
             dimensionValue,
@@ -489,10 +494,9 @@ export const worldbankGetData = tool('worldbank_get_data', {
         }
         if (reason === 'source_scope_too_large') {
           throw ctx.fail('source_scope_too_large', err.message, {
+            ...err.data,
             ...ctx.recoveryFor('source_scope_too_large'),
             indicatorId: input.indicator_id,
-            sourceId: err.data?.sourceId,
-            estimatedRows: err.data?.estimatedRows,
           });
         }
       }

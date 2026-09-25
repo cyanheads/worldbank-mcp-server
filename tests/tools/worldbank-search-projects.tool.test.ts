@@ -75,11 +75,16 @@ async function stubService(result: Record<string, unknown>) {
   return searchProjects;
 }
 
-/** Stub the service to reject with an McpError carrying a service-layer reason. */
-async function stubServiceError(code: JsonRpcErrorCode, message: string, reason: string) {
+/** Stub the service to reject with an McpError carrying a service-layer reason and data. */
+async function stubServiceError(
+  code: JsonRpcErrorCode,
+  message: string,
+  reason: string,
+  data: Record<string, unknown> = {},
+) {
   const { getProjectsService } = await import('@/services/projects/projects-service.js');
   vi.mocked(getProjectsService).mockReturnValue({
-    searchProjects: vi.fn().mockRejectedValue(new McpError(code, message, { reason })),
+    searchProjects: vi.fn().mockRejectedValue(new McpError(code, message, { reason, ...data })),
   } as never);
 }
 
@@ -578,6 +583,17 @@ describe('worldbankSearchProjects', () => {
     expect(tool.input.safeParse({ per_page: 1000 }).success).toBe(true);
   });
 
+  it('reads limit as per_page, on both surfaces', async () => {
+    const searchProjects = await stubService({ projects: [project], total: 1 });
+    const tool = await loadTool();
+    const result = await runToolContract(tool, { countries: 'BR', limit: 5 } as never);
+
+    expect(result.isError).toBeFalsy();
+    expect(searchProjects.mock.calls[0]?.[0]).toMatchObject({ perPage: 5 });
+    expect(result.structuredContent).toMatchObject({ appliedFilters: { perPage: 5 } });
+    expect(textOf(result)).toContain('per_page=5');
+  });
+
   it('raises no notice when the search returned results', async () => {
     await stubService({ projects: [project], total: 1 });
     const tool = await loadTool();
@@ -623,6 +639,27 @@ describe('worldbankSearchProjects', () => {
         recovery: { hint: expect.stringContaining('Retry the same search once') },
       },
     });
+  });
+
+  it('forwards the status of an upstream 5xx and leaves it retryable', async () => {
+    await stubServiceError(
+      JsonRpcErrorCode.ServiceUnavailable,
+      'The World Bank Projects API answered HTTP 503.',
+      'upstream_unavailable',
+      { status: 503 },
+    );
+    const tool = await loadTool();
+    const result = await runToolContract(tool, { countries: 'BR' });
+
+    const data = (result.structuredContent as { error: { data: Record<string, unknown> } }).error
+      .data;
+    expect(data).toMatchObject({
+      reason: 'upstream_unavailable',
+      status: 503,
+      recovery: { hint: expect.stringContaining('Retry the same search once') },
+    });
+    expect(data).not.toHaveProperty('retryable');
+    expect(textOf(result).trimEnd()).toMatch(/\(reason upstream_unavailable\)$/);
   });
 
   it('rethrows an unrecognized upstream error untouched', async () => {

@@ -38,7 +38,7 @@ World Bank Open Data across three separate upstream APIs — development indicat
 | `worldbank_search_indicators` | Search the 29,500+ indicator catalog by keyword, topic, or source |
 | `worldbank_get_indicator` | Fetch complete metadata for a single indicator: name, description, source, unit, and topics |
 | `worldbank_get_data` | Query indicator values for one or more countries across a time range or most-recent N values |
-| `worldbank_get_poverty` | Poverty headcount, gap, and severity at any poverty line, plus the Gini coefficient and decile shares, from the Poverty and Inequality Platform |
+| `worldbank_get_poverty` | Poverty headcount, gap, and severity at any poverty line for economies and PIP's regional, income-group, and lending-group aggregates, plus the Gini coefficient and decile shares, from the Poverty and Inequality Platform |
 | `worldbank_search_projects` | Search the World Bank lending portfolio by text, country, region, status, and board approval date |
 
 ### Resources
@@ -111,11 +111,12 @@ World Bank Open Data across three separate upstream APIs — development indicat
 
 ### `worldbank_get_poverty` <sub>tool</sub>
 
-- Individual economies only, by ISO3 code, from the Poverty and Inequality Platform (PIP) — a separate dataset from the WDI series the other tools read; regional and aggregate codes are rejected
-- Headcount ratio, poverty gap, severity, and the Watts index at any `poverty_line` (defaults to the international line of the applied PPP vintage); the same row carries the Gini coefficient, mean log deviation, polarization, and ten decile shares
-- `estimationType: "survey"` rows carry the full inequality block; `interpolation`/`extrapolation`/`CMD estimation` rows are gap-filled and null out `gini`, `mld`, `polarization`, and `decileShares` — `fill_gaps` (default `true`) controls whether gap-filled years are returned at all
-- `welfare_type` (income/consumption) and `reporting_level` (national/urban/rural) narrow results; `ppp_version` picks the PPP vintage, defaulting to the newest
-- `year` accepts a four-digit year, `all`, or `MRV`; coverage starts in 1963
+- Economies by ISO3 or ISO2 code, from the Poverty and Inequality Platform (PIP) — a separate dataset from the WDI series the other tools read — including the economies PIP publishes only as model estimates (`AFG`, `GUM`)
+- PIP's own aggregates at any poverty line, in the same list: `WLD`, the World Bank regions (`SSF`, `EAS`, `AFE`, …), income groups (`HIC`, `LIC`, `LMIC`/`LMC`, `UMIC`/`UMC`), and lending groups (`IDX` for IDA only, `IDB`/`BLND` for IDA blend, `IBD`/`IBRD` for IBRD only, `REST`); aggregate rows are flagged `isAggregate` and carry `popInPoverty`. Income groups follow the fiscal-year classification PIP's release was built with (FY2026 for release 20260922) in every year. WDI's `IDA` (IDA total, ISO2 `XG`) is rejected — PIP computes no IDA total, so ask for `IDX` and `IDB` — as are FCV and PovcalNet groupings (`FCVY`, `SSA`) and WDI's `MIC`/`LMY`
+- Headcount ratio, poverty gap, severity, and the Watts index at any `poverty_line` (defaults to the international line of the applied PPP vintage); the same economy row carries the Gini coefficient, mean log deviation, polarization, and ten decile shares
+- `estimationType: "survey"` rows carry the full inequality block; `interpolation`/`extrapolation`/`CMD estimation` rows are gap-filled and null out `gini`, `mld`, `polarization`, and `decileShares` — `fill_gaps` (default `true`) controls whether gap-filled years are returned at all; aggregate rows are `actual`, `nowcast`, or `projection` and carry no inequality block
+- `welfare_type` (income/consumption) and `reporting_level` (national/urban/rural) narrow economy results and are rejected alongside an aggregate; `ppp_version` picks the PPP vintage, defaulting to the newest
+- `year` accepts a four-digit year, `all`, or `MRV`; `MRV` follows `fill_gaps` — each economy's latest estimate year when on, its latest survey year when off — and gives each aggregate its newest year. Coverage runs from 1963 to the last year of the current data release, and a year outside it fails with the accepted span named
 - Paginated locally, capped at 70 estimates per page (~50 KB) regardless of the requested `per_page`, since PIP itself has no pagination
 
 ---
@@ -292,7 +293,7 @@ All configuration is validated at startup via Zod schemas in `src/config/server-
 | `WORLDBANK_PIP_BASE_URL` | Poverty and Inequality Platform API base URL override | `https://api.worldbank.org/pip/v1` |
 | `WORLDBANK_PROJECTS_BASE_URL` | Projects API base URL override | `https://search.worldbank.org/api/v3` |
 | `WORLDBANK_DEFAULT_PER_PAGE` | Default page size for list/search/data operations; `worldbank_search_projects` and `worldbank_get_poverty` still cap it at their own page limits | `50` |
-| `WORLDBANK_CATALOG_CACHE_TTL_MS` | Lifetime of the in-process reference caches — the indicator catalog behind keyword-only search, the country index behind `isAggregate` and source-scoped country codes, each source-scoped dataset's concept/country/period/dimension listings, and the PIP versions listing behind `ppp_version`; `0` disables them all | `3600000` |
+| `WORLDBANK_CATALOG_CACHE_TTL_MS` | Lifetime of the in-process reference caches — the indicator catalog behind keyword-only search, the country index behind `isAggregate`, source-scoped country codes, and poverty ISO2 codes, each source-scoped dataset's concept/country/period/dimension listings, and PIP's versions listing behind `ppp_version`, regions table behind aggregate codes, and economy list behind model-estimate-only economies; `0` disables them all | `3600000` |
 
 See [`.env.example`](./.env.example) for the full list of optional overrides.
 

@@ -99,6 +99,41 @@ describe('worldbankCountryResource', () => {
     expect(result.id).toBe('EAS');
   });
 
+  it.each([
+    ['country_not_found', notFound],
+    ['multiple_countries', validationError],
+  ] as const)("forwards the service's data on a %s re-throw", async (reason, factory) => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      getCountry: vi.fn().mockRejectedValue(
+        factory(`Rejected: ${reason}.`, {
+          reason,
+          countryCode: 'ZZ',
+          detail: 'upstream detail',
+          retryable: false,
+        }),
+      ),
+    } as never);
+    const { worldbankCountryResource } = await import(
+      '@/mcp-server/resources/definitions/worldbank-country.resource.js'
+    );
+    const ctx = createMockContext({ errors: worldbankCountryResource.errors });
+    const params = paramsOf(worldbankCountryResource).parse({ countryCode: 'ZZ' });
+    const err = await Promise.resolve(worldbankCountryResource.handler(params, ctx)).catch(
+      (e: unknown) => e,
+    );
+
+    expect(err).toMatchObject({
+      data: {
+        reason,
+        countryCode: 'ZZ',
+        detail: 'upstream detail',
+        retryable: false,
+        recovery: { hint: expect.stringContaining('worldbank_list_countries') },
+      },
+    });
+  });
+
   it('throws notFound with a recovery hint when the country code is unknown', async () => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
     vi.mocked(getWorldBankApiService).mockReturnValue({

@@ -75,15 +75,16 @@ export const worldbankGetIndicator = tool('worldbank_get_indicator', {
     } catch (err) {
       if (err instanceof McpError && err.data?.reason === 'indicator_not_found') {
         throw ctx.fail('indicator_not_found', err.message, {
+          ...err.data,
           ...ctx.recoveryFor('indicator_not_found'),
           indicatorId: input.indicator_id,
         });
       }
       if (err instanceof McpError && err.data?.reason === 'multiple_indicators') {
         throw ctx.fail('multiple_indicators', err.message, {
+          ...err.data,
           ...ctx.recoveryFor('multiple_indicators'),
           indicatorId: input.indicator_id,
-          matchedIds: err.data.matchedIds,
         });
       }
       throw err;

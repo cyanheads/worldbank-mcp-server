@@ -84,10 +84,11 @@ const PROJECT_PAGE_BASE = 'https://projects.worldbank.org/en/projects-operations
 /**
  * Translate a non-2xx from the Projects API into a classified domain error.
  *
- * Every status lands on the same reason, because none of them is something the
- * caller can fix by changing the search: the tool schema validates each filter
- * before the request, so a rejection here is the API's own state — a 4xx means
- * the endpoint would not accept the call at all, a 5xx that it failed serving it.
+ * Every status lands on the same reason. The tool schema validates each filter
+ * before the request, so a 4xx is the API refusing the free-text query — its
+ * search syntax rejects `[`, `{`, `"`, `/`, `\`, and a trailing AND, OR, or NOT
+ * with HTTP 400 — and is settled, so it is marked not retryable; a 5xx is the
+ * API failing to serve the call.
  *
  * The upstream body is deliberately never quoted into the message. A 4xx carries
  * the hostname and index name of the search cluster behind the API, and a 5xx

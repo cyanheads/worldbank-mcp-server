@@ -1,8 +1,9 @@
 /**
  * @fileoverview Types for the World Bank Poverty and Inequality Platform (PIP)
- * API: the raw `/pip` row as the endpoint returns it, the structured body PIP
- * sends with an HTTP 404 for a rejected query parameter, and the normalized
- * row the service hands to the tool layer.
+ * API: the raw `/pip` and `/pip-grp` rows as the endpoints return them, the two
+ * `/aux` reference tables the service reads, the structured body PIP sends with
+ * an HTTP 404 for a rejected query parameter, and the normalized row the
+ * service hands to the tool layer.
  * @module services/pip/types
  */
 
@@ -63,51 +64,110 @@ export interface RawPipVersion {
 }
 
 /**
+ * One row of `/pip-grp`: a regional, income-group, or lending-group aggregate
+ * for one year. It carries the poverty measures, mean, and population, but no
+ * median, distributional block, survey fields, welfare type, or reporting level.
+ */
+export interface RawPipGroupRow {
+  estimate_type?: string | null;
+  headcount?: number | null;
+  mean?: number | null;
+  pop_in_poverty?: number | null;
+  poverty_gap?: number | null;
+  poverty_line?: number | null;
+  poverty_severity?: number | null;
+  region_code?: string | null;
+  region_name?: string | null;
+  reporting_pop?: number | null;
+  reporting_year?: number | null;
+  watts?: number | null;
+}
+
+/**
+ * One entry of `/aux?table=regions`: an aggregate code and the grouping it
+ * belongs to — `region`, `africa_split`, `world`, `incgroup`, `ida`, `fcv`, or
+ * `regionpcn`.
+ */
+export interface RawPipRegion {
+  grouping_type?: string | null;
+  region?: string | null;
+  region_code?: string | null;
+}
+
+/**
+ * One entry of `/aux?table=country_list`: an economy PIP publishes estimates
+ * for, including those it publishes only as model estimates.
+ */
+export interface RawPipEconomy {
+  country_code?: string | null;
+  country_name?: string | null;
+}
+
+/** One rejected parameter's entry in a PIP 404 body. */
+interface PipRejectedValue {
+  msg?: string[];
+  valid?: unknown[];
+}
+
+/**
  * Body PIP returns with HTTP 404 when a query parameter carries a value it
  * rejects. `details` is keyed by parameter name — one entry per rejected
- * parameter — and each entry's `valid` enumerates the accepted values, which
- * for `country` and `year` runs to hundreds of entries.
+ * parameter — and each entry's `valid` enumerates the accepted values: 200
+ * codes for `country`, 66 for `year`. A rejected `version` breaks the shape and
+ * answers with a single unkeyed entry that names no parameter.
  */
 export interface PipValidationBody {
-  details?: Record<string, { msg?: string[]; valid?: unknown[] }>;
+  details?: Record<string, PipRejectedValue> | PipRejectedValue;
   error?: string[];
 }
 
-/** A single country × year × reporting-level poverty and inequality estimate. */
+/**
+ * A single poverty and inequality estimate: one economy × year × reporting
+ * level × welfare type, or one aggregate × year.
+ */
 export interface PovertyRow {
   /**
    * The span of years the row's comparable series covers, as PIP labels it
    * (`"2022"`, `"2011 - 2022"`). Null on a gap-filled row.
    */
   comparableSpell: string | null;
+  /** The economy's ISO3 code, or the aggregate's code on an aggregate row. */
   countryCode: string;
   countryName: string;
   /** Ten income/consumption shares, poorest decile first, or null when absent. */
   decileShares: number[] | null;
   /**
-   * How PIP produced the row: `survey` carries the distributional block;
-   * `interpolation`, `extrapolation`, and `CMD estimation` are gap-filled and
-   * carry none. The last covers economies PIP has no survey for at all.
+   * How PIP produced the row. On an economy: `survey` carries the
+   * distributional block; `interpolation`, `extrapolation`, and `CMD estimation`
+   * are gap-filled and carry none, the last covering economies PIP has no
+   * survey for at all. On an aggregate: `actual`, `nowcast`, or `projection`.
    */
   estimationType: string;
   gini: number | null;
   headcount: number | null;
-  isInterpolated: boolean;
+  /** True on an aggregate row from `/pip-grp`, false on an economy row. */
+  isAggregate: boolean;
+  /** Null on an aggregate row, which publishes no such flag. */
+  isInterpolated: boolean | null;
   mean: number | null;
   median: number | null;
   mld: number | null;
   polarization: number | null;
+  /** People below the line, as PIP publishes it on aggregate rows; null on economy rows. */
+  popInPoverty: number | null;
   population: number | null;
   povertyGap: number | null;
   povertyLine: number;
   povertySeverity: number | null;
-  regionCode: string;
-  regionName: string;
+  /** The economy's PIP region; null on an aggregate row. */
+  regionCode: string | null;
+  regionName: string | null;
   /**
    * `national`, `urban`, or `rural`. Ten economies publish a split; only China
    * publishes all three, the rest pair `national` with one of the other two.
+   * Null on an aggregate row.
    */
-  reportingLevel: string;
+  reportingLevel: string | null;
   reportingYear: number;
   surveyAcronym: string;
   /**
@@ -124,6 +184,6 @@ export interface PovertyRow {
    */
   surveyYear: number | null;
   watts: number | null;
-  /** `income` or `consumption`, whichever the underlying survey measures. */
-  welfareType: string;
+  /** `income` or `consumption`, whichever the underlying survey measures; null on an aggregate row. */
+  welfareType: string | null;
 }

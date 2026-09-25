@@ -149,6 +149,54 @@ describe('worldbankListCountries', () => {
     });
   });
 
+  it("forwards the service's data on an invalid_filter re-throw, keeping the tool's own fields", async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      listCountries: vi.fn().mockRejectedValue(
+        new McpError(JsonRpcErrorCode.NotFound, 'Invalid region or income_level code.', {
+          reason: 'invalid_filter',
+          region: 'service-side',
+          detail: 'upstream detail',
+          retryable: false,
+        }),
+      ),
+    } as never);
+    const { worldbankListCountries } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
+    );
+    const result = await runToolContract(worldbankListCountries, { region: 'BADCODE' });
+
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.NotFound,
+        data: {
+          reason: 'invalid_filter',
+          region: 'BADCODE',
+          detail: 'upstream detail',
+          retryable: false,
+          recovery: { hint: expect.stringContaining('worldbank_list_countries') },
+        },
+      },
+    });
+    const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+    expect(text.trimEnd()).toMatch(/\(reason invalid_filter · not retryable\)$/);
+  });
+
+  it('reads limit as per_page', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    const listCountriesMock = vi.fn().mockResolvedValue(mockCountriesResult);
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      listCountries: listCountriesMock,
+    } as never);
+    const { worldbankListCountries } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
+    );
+    const result = await runToolContract(worldbankListCountries, { limit: 5 } as never);
+
+    expect(result.isError).toBeFalsy();
+    expect(listCountriesMock.mock.calls[0]?.[0]).toMatchObject({ perPage: 5 });
+  });
+
   // ─── Zod input validation ─────────────────────────────────────────────────
 
   it('rejects page below minimum (0)', async () => {

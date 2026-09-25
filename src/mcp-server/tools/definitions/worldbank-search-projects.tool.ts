@@ -16,6 +16,16 @@ import {
   RESPONSE_BUDGET_KB,
 } from '@/services/response-budget.js';
 
+/**
+ * Recovery for a Projects API 4xx, which the service marks not retryable. The
+ * filters are validated before the request, so a refusal comes from query text
+ * the API's search syntax cannot parse — `[`, `]`, `{`, `"`, `/`, `\`, and a
+ * trailing AND, OR, or NOT each answer HTTP 400 — and the same call is refused
+ * every time.
+ */
+const REFUSED_SEARCH_HINT =
+  'The Projects API refuses this search as sent, every time it is sent. Remove brackets, braces, double quotes, slashes, backslashes, and a trailing AND, OR, or NOT from query, then search again.';
+
 /** Split a caller-supplied country string on either separator this server's tools use. */
 function splitCodes(value: string): string[] {
   return value
@@ -84,6 +94,7 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
   description:
     'Search the World Bank lending portfolio — the individual loans, credits, and grants the Bank finances — by free text, country, region, status, and board approval date. Returns the project ID, name, borrowing country, region, status, board approval and closing dates, total commitment in USD, financing instrument, major sectors, and a link to the project page. This is the operations catalogue, not the statistics catalogue: use it for "what is the World Bank funding in Kenya", "which climate adaptation projects are active", or "how much was committed to education in South Asia since 2020". For development statistics and time series, use worldbank_search_indicators and worldbank_get_data instead. Countries are identified by ISO2 code here (BR, IN, ZA), which is the one place this server departs from the ISO3 codes its other tools take — worldbank_get_country reports a country\'s iso2 field for either form, and multi-country operations carry a World Bank regional code such as 3A instead. Every filter is an exact match upstream and combines with the others by AND, so a narrow search can legitimately return nothing; when it does, the response says whether the country codes matched anything on their own.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
+  inputAliases: { limit: 'per_page' },
   input: z.object({
     query: z
       .string()
@@ -324,7 +335,7 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
     {
       reason: 'upstream_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'The Projects API answered with a non-success status or an HTML error page.',
+      when: 'The Projects API answered with a non-success status or an HTML error page: a 4xx when it refuses the query text, a 5xx or an error page when it cannot serve the search.',
       recovery:
         'Retry the same search once; if it keeps failing, the Projects API is down or has moved, and no change to the search will help.',
     },
@@ -399,14 +410,19 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
       if (err instanceof McpError) {
         const reason = err.data?.reason;
         if (reason === 'page_out_of_range') {
-          throw ctx.fail('page_out_of_range', err.message, ctx.recoveryFor('page_out_of_range'));
+          throw ctx.fail('page_out_of_range', err.message, {
+            ...err.data,
+            ...ctx.recoveryFor('page_out_of_range'),
+          });
         }
         if (reason === 'upstream_unavailable') {
-          throw ctx.fail(
-            'upstream_unavailable',
-            err.message,
-            ctx.recoveryFor('upstream_unavailable'),
-          );
+          throw ctx.fail('upstream_unavailable', err.message, {
+            ...err.data,
+            recovery:
+              Number(err.data?.status) < 500
+                ? { hint: REFUSED_SEARCH_HINT }
+                : ctx.recoveryFor('upstream_unavailable').recovery,
+          });
         }
       }
       throw err;

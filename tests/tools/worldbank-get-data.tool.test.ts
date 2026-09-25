@@ -1351,4 +1351,66 @@ describe('worldbankGetData', () => {
       expect(text).toMatch(recovery);
     },
   );
+
+  it.each([
+    'indicator_not_found',
+    'indicator_not_queryable',
+    'country_not_found',
+    'indicator_and_country_not_found',
+  ])(
+    "forwards the service's upstream detail on %s, alongside the tool's own fields",
+    async (reason) => {
+      const detail = 'The indicator was not found. It may have been deleted or archived.';
+      const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+      vi.mocked(getWorldBankApiService).mockReturnValue({
+        getData: vi.fn().mockRejectedValue(
+          new McpError(JsonRpcErrorCode.NotFound, `Rejected: ${reason}.`, {
+            reason,
+            indicatorId: 'NY.GDP.PCAP.CD',
+            countryCodes: 'ZZ',
+            detail,
+            retryable: false,
+          }),
+        ),
+      } as never);
+      const { worldbankGetData } = await import(
+        '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+      );
+      const result = await runToolContract(worldbankGetData, {
+        indicator_id: 'NY.GDP.PCAP.CD',
+        countries: ['ZZ'],
+      });
+
+      expect(result.isError).toBe(true);
+      const data = (result.structuredContent as { error: { data: Record<string, unknown> } }).error
+        .data;
+      expect(data).toMatchObject({
+        reason,
+        detail,
+        retryable: false,
+        indicatorId: 'NY.GDP.PCAP.CD',
+        recovery: { hint: expect.any(String) },
+      });
+      const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+      expect(text.trimEnd()).toMatch(new RegExp(`\\(reason ${reason} · not retryable\\)$`));
+    },
+  );
+
+  it('reads limit as per_page, on both surfaces', async () => {
+    const getData = vi.fn().mockResolvedValue(mockDataResult);
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({ getData } as never);
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const result = await runToolContract(worldbankGetData, {
+      indicator_id: 'NY.GDP.PCAP.CD',
+      countries: 'US',
+      limit: 5,
+    } as never);
+
+    expect(result.isError).toBeFalsy();
+    expect(getData.mock.calls[0]?.[0]).toMatchObject({ perPage: 5 });
+    expect(result.structuredContent).toMatchObject({ appliedFilters: { perPage: 5 } });
+  });
 });

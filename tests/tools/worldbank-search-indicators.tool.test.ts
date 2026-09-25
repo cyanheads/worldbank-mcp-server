@@ -334,6 +334,56 @@ describe('worldbankSearchIndicators', () => {
     expect(text).toContain('GDP per capita description.');
   });
 
+  it.each([
+    ['invalid_filter', JsonRpcErrorCode.NotFound, { topic_id: '999' }],
+    ['empty_query', JsonRpcErrorCode.ValidationError, { query: '!!!' }],
+  ] as const)("forwards the service's data on a %s re-throw", async (reason, code, input) => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      searchIndicators: vi.fn().mockRejectedValue(
+        new McpError(code, `Rejected: ${reason}.`, {
+          reason,
+          detail: 'upstream detail',
+          retryable: false,
+        }),
+      ),
+    } as never);
+    const { worldbankSearchIndicators } = await import(
+      '@/mcp-server/tools/definitions/worldbank-search-indicators.tool.js'
+    );
+    const result = await runToolContract(worldbankSearchIndicators, input);
+
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code,
+        data: {
+          reason,
+          detail: 'upstream detail',
+          retryable: false,
+          recovery: { hint: expect.any(String) },
+        },
+      },
+    });
+    const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+    expect(text.trimEnd()).toMatch(new RegExp(`\\(reason ${reason} · not retryable\\)$`));
+  });
+
+  it('reads limit as per_page', async () => {
+    const searchIndicators = vi.fn().mockResolvedValue(mockSearchResult);
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({ searchIndicators } as never);
+    const { worldbankSearchIndicators } = await import(
+      '@/mcp-server/tools/definitions/worldbank-search-indicators.tool.js'
+    );
+    const result = await runToolContract(worldbankSearchIndicators, {
+      query: 'gdp',
+      limit: 5,
+    } as never);
+
+    expect(result.isError).toBeFalsy();
+    expect(searchIndicators.mock.calls[0]?.[0]).toMatchObject({ query: 'gdp', perPage: 5 });
+  });
+
   // ─── Zod input validation ─────────────────────────────────────────────────
 
   it('rejects page below minimum (0)', async () => {

@@ -22,6 +22,7 @@ import {
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
+import { sharedLoadContext, untilAborted } from '@/services/shared-load.js';
 import { isWithinWindow, monthSpan, parseDateWindow, periodFromToken } from './periods.js';
 import {
   defaultSelection,
@@ -89,6 +90,13 @@ const REQUEST_TIMEOUT_MS = 15_000;
  * than the small requests {@link REQUEST_TIMEOUT_MS} was sized for.
  */
 const BULK_TIMEOUT_MS = 60_000;
+
+/**
+ * Bound on a reference load shared by concurrent callers, which runs under no
+ * caller's signal: a bulk request's own timeout across the framework's default
+ * retry budget of four attempts, with room for the backoff between them.
+ */
+const REFERENCE_LOAD_TIMEOUT_MS = 4 * BULK_TIMEOUT_MS + 15_000;
 
 /**
  * Stand-in for the invalid-value envelope when upstream answers a lookup with a
@@ -442,14 +450,24 @@ export class WorldBankApiService {
   /**
    * Serve `key` from the reference cache, loading it once per TTL window. A TTL
    * of 0 disables retention, though concurrent callers still share one load.
+   *
+   * `load` receives the context to fetch with: a signal of its own
+   * ({@link sharedLoadContext}), not the first caller's, because every
+   * concurrent caller waits on the same load. Each caller waits only until its
+   * own signal aborts, so one caller cancelling fails that caller alone, and a
+   * load every caller abandoned still completes and caches for the next one.
    */
-  private cachedReference<T>(key: string, load: () => Promise<T>): Promise<T> {
+  private cachedReference<T>(
+    key: string,
+    ctx: Context,
+    load: (shared: Context) => Promise<T>,
+  ): Promise<T> {
     const cached = this.referenceCache.get(key);
     if (cached && cached.expiresAt > Date.now()) return Promise.resolve(cached.value as T);
 
     let pending = this.referenceInFlight.get(key) as Promise<T> | undefined;
     if (!pending) {
-      pending = load()
+      pending = load(sharedLoadContext(ctx, REFERENCE_LOAD_TIMEOUT_MS))
         .then((value) => {
           if (this.catalogCacheTtlMs > 0) {
             this.referenceCache.set(key, { value, expiresAt: Date.now() + this.catalogCacheTtlMs });
@@ -459,7 +477,7 @@ export class WorldBankApiService {
         .finally(() => this.referenceInFlight.delete(key));
       this.referenceInFlight.set(key, pending);
     }
-    return pending;
+    return untilAborted(pending, ctx.signal);
   }
 
   /** Build a fully-qualified URL with format=json always appended. */
@@ -616,14 +634,14 @@ export class WorldBankApiService {
    * Concurrent callers share one in-flight fetch instead of each pulling ~15 MB.
    */
   private loadIndicatorCatalog(ctx: Context): Promise<Indicator[]> {
-    return this.cachedReference('indicator-catalog', async () => {
-      const raw = await this.fetchAllPages<RawIndicator>('/indicator', {}, ctx, () => {
+    return this.cachedReference('indicator-catalog', ctx, async (shared) => {
+      const raw = await this.fetchAllPages<RawIndicator>('/indicator', {}, shared, () => {
         throw serviceUnavailable(
           'World Bank returned an error response for the indicator catalog listing.',
         );
       });
       const indicators = raw.map(normalizeIndicator);
-      ctx.log.debug('Indicator catalog loaded', { count: indicators.length });
+      shared.log.debug('Indicator catalog loaded', { count: indicators.length });
       return indicators;
     });
   }
@@ -828,9 +846,9 @@ export class WorldBankApiService {
 
   /** A source's concept layout, or `undefined` when the tool can't address its data. */
   private sourceLayout(sourceId: string, ctx: Context): Promise<SourceLayout | undefined> {
-    return this.cachedReference(`source/${sourceId}/concepts`, async () => {
+    return this.cachedReference(`source/${sourceId}/concepts`, ctx, async (shared) => {
       const url = this.buildUrl(`/sources/${encodeURIComponent(sourceId)}/concepts`);
-      const listing = await this.fetchWithRetry<RawSourceListing | WbErrorEnvelope>(url, ctx);
+      const listing = await this.fetchWithRetry<RawSourceListing | WbErrorEnvelope>(url, shared);
       return isWbErrorEnvelope(listing) ? undefined : layoutFromConcepts(sourceId, listing);
     });
   }
@@ -838,8 +856,8 @@ export class WorldBankApiService {
   /** One of a source's value listings: `country`, `time`, or its extra dimension. */
   private sourceValues(sourceId: string, concept: string, ctx: Context): Promise<DimensionValue[]> {
     const path = `/sources/${encodeURIComponent(sourceId)}/${encodeURIComponent(concept.toLowerCase())}`;
-    return this.cachedReference(`source/${sourceId}/${concept.toLowerCase()}`, () =>
-      this.fetchSourcePages<RawSourceListing, DimensionValue>(path, ctx, valuesFromListing),
+    return this.cachedReference(`source/${sourceId}/${concept.toLowerCase()}`, ctx, (shared) =>
+      this.fetchSourcePages<RawSourceListing, DimensionValue>(path, shared, valuesFromListing),
     );
   }
 
@@ -1171,11 +1189,11 @@ export class WorldBankApiService {
    * Both identifiers go in `aggregateCodes`: a data row names an aggregate by ISO2
    * in `country.id` (`ZH`) and by its aggregate code in `countryiso3code` (`AFE`).
    * `entities` maps either identifier, uppercased, to both — the source-scoped
-   * API takes only the three-character code, where callers may pass ISO2.
+   * API and PIP take only the three-character code, where callers may pass ISO2.
    */
   private loadCountryIndex(ctx: Context): Promise<CountryIndex> {
-    return this.cachedReference('country-index', async () => {
-      const raw = await this.fetchAllPages<RawCountry>('/country', {}, ctx, () => {
+    return this.cachedReference('country-index', ctx, async (shared) => {
+      const raw = await this.fetchAllPages<RawCountry>('/country', {}, shared, () => {
         throw serviceUnavailable(
           'World Bank returned an error response for the country listing used to classify aggregates.',
         );
@@ -1189,9 +1207,23 @@ export class WorldBankApiService {
         if (entity.id) index.aggregateCodes.add(entity.id);
         if (entity.iso2) index.aggregateCodes.add(entity.iso2);
       }
-      ctx.log.debug('Country index loaded', { aggregates: index.aggregateCodes.size });
+      shared.log.debug('Country index loaded', { aggregates: index.aggregateCodes.size });
       return index;
     });
+  }
+
+  /**
+   * Look a country or aggregate up by either identifier, case-insensitively, and
+   * return both — the three-character ID and the ISO2 code — or `undefined` when
+   * the country listing carries no entity under that code. Served from the
+   * cached country index.
+   */
+  async lookupCountry(
+    code: string,
+    ctx: Context,
+  ): Promise<{ id: string; iso2: string } | undefined> {
+    const { entities } = await this.loadCountryIndex(ctx);
+    return entities.get(code.trim().toUpperCase());
   }
 
   // ─── Data ─────────────────────────────────────────────────────────────────

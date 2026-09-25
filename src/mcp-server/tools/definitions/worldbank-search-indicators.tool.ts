@@ -19,6 +19,7 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
   description:
     'Search the 29,500+ World Bank indicator catalog by keyword, topic, or source, returning indicator IDs and metadata for worldbank_get_data. Provide at least one of query, topic_id, or source_id; a topic and a source together narrow to indicators in both. A keyword query matches every term against indicator ID, name, and description, in any word order, across the whole catalog or the whole selected topic or source; punctuation is ignored, so the query needs at least one letter or digit. Exact ID or name matches rank first, then whole-phrase matches, then other ID/name matches, then description-only matches. Each indicator ID appears once, even where the catalog publishes it under two sources. Find topic IDs with worldbank_list_topics and source IDs with worldbank_list_sources.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
+  inputAliases: { limit: 'per_page' },
   input: z.object({
     query: z
       .string()
@@ -186,6 +187,7 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
     } catch (err) {
       if (err instanceof McpError && err.data?.reason === 'invalid_filter') {
         throw ctx.fail('invalid_filter', err.message, {
+          ...err.data,
           ...ctx.recoveryFor('invalid_filter'),
           topicId: input.topic_id,
           sourceId: input.source_id,
@@ -193,6 +195,7 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
       }
       if (err instanceof McpError && err.data?.reason === 'empty_query') {
         throw ctx.fail('empty_query', err.message, {
+          ...err.data,
           ...ctx.recoveryFor('empty_query'),
           query,
         });

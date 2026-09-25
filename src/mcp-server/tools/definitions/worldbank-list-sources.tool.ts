@@ -14,6 +14,7 @@ export const worldbankListSources = tool('worldbank_list_sources', {
   description:
     'List the 70+ World Bank data sources (datasets), such as World Development Indicators, International Debt Statistics, and Doing Business. Returns source IDs and names for use as source_id in worldbank_search_indicators, one page at a time.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
+  inputAliases: { limit: 'per_page' },
   input: z.object({
     page: z.number().int().min(1).default(1).describe('Pagination page number (1-based).'),
     per_page: z

@@ -70,6 +70,41 @@ describe('worldbankIndicatorResource', () => {
     expect(result.topics).toHaveLength(2);
   });
 
+  it.each([
+    ['indicator_not_found', notFound],
+    ['multiple_indicators', validationError],
+  ] as const)("forwards the service's data on a %s re-throw", async (reason, factory) => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      getIndicator: vi.fn().mockRejectedValue(
+        factory(`Rejected: ${reason}.`, {
+          reason,
+          indicatorId: 'NY.GDP.PCAP.CD',
+          detail: 'upstream detail',
+          retryable: false,
+        }),
+      ),
+    } as never);
+    const { worldbankIndicatorResource } = await import(
+      '@/mcp-server/resources/definitions/worldbank-indicator.resource.js'
+    );
+    const ctx = createMockContext({ errors: worldbankIndicatorResource.errors });
+    const params = paramsOf(worldbankIndicatorResource).parse({ indicatorId: 'NY.GDP.PCAP.CD' });
+    const err = await Promise.resolve(worldbankIndicatorResource.handler(params, ctx)).catch(
+      (e: unknown) => e,
+    );
+
+    expect(err).toMatchObject({
+      data: {
+        reason,
+        indicatorId: 'NY.GDP.PCAP.CD',
+        detail: 'upstream detail',
+        retryable: false,
+        recovery: { hint: expect.stringContaining('worldbank_search_indicators') },
+      },
+    });
+  });
+
   it('throws notFound with a recovery hint when the indicator ID is unknown', async () => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
     vi.mocked(getWorldBankApiService).mockReturnValue({

@@ -151,6 +151,41 @@ const VERSIONS = [
   },
 ];
 
+/** `/aux?table=regions`: one aggregate code per grouping this service routes or rejects. */
+const REGIONS = [
+  { region_code: 'SSF', region: 'Sub-Saharan Africa', grouping_type: 'region' },
+  { region_code: 'WLD', region: 'World', grouping_type: 'world' },
+  { region_code: 'LIC', region: 'Low income', grouping_type: 'incgroup' },
+  { region_code: 'LMIC', region: 'Lower middle income', grouping_type: 'incgroup' },
+  { region_code: 'IDA', region: 'IDA', grouping_type: 'ida' },
+  { region_code: 'SSA', region: 'Sub-Saharan Africa', grouping_type: 'regionpcn' },
+];
+
+/** `/aux?table=country_list`: the economies PIP publishes, model-estimate-only ones included. */
+const ECONOMIES = ['USA', 'IND', 'BRA', 'CHN', 'ABW', 'AFG'].map((country_code) => ({
+  country_code,
+  country_name: `Economy ${country_code}`,
+}));
+
+/** A `/pip-grp` aggregate row. */
+function groupRow(code: string, reportingYear: number, overrides = {}) {
+  return {
+    region_code: code,
+    region_name: `Aggregate ${code}`,
+    reporting_year: reportingYear,
+    poverty_line: 3,
+    reporting_pop: 1_229_000_000,
+    headcount: 0.4562,
+    poverty_gap: 0.19,
+    poverty_severity: 0.1,
+    watts: 0.29,
+    mean: 4.8,
+    pop_in_poverty: 560_000_000,
+    estimate_type: 'actual',
+    ...overrides,
+  };
+}
+
 /** PIP's HTTP-404 body for a rejected parameter value, as an McpError's captured body. */
 function validationBody(parameter: string, valid: unknown[]) {
   return JSON.stringify({
@@ -163,6 +198,24 @@ function validationBody(parameter: string, valid: unknown[]) {
         valid,
       },
     },
+  });
+}
+
+/**
+ * Resolve after `ms`, or reject first if `signal` aborts, as the framework's
+ * fetch does with the signal it is handed.
+ */
+function settleAfter(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      'abort',
+      () => {
+        clearTimeout(timer);
+        reject(new Error('fetch was aborted'));
+      },
+      { once: true },
+    );
   });
 }
 
@@ -212,11 +265,19 @@ describe('PipService', () => {
     });
   }
 
+  /** URLs of every request made so far, in order. */
+  function fetchCalls(): string[] {
+    return fetchWithTimeoutMock.mock.calls.map((call) => String(call[0]));
+  }
+
   /** URLs of the `/pip` data requests made so far, in order. */
   function pipCalls(): string[] {
-    return fetchWithTimeoutMock.mock.calls
-      .map((call) => String(call[0]))
-      .filter((url) => url.includes('/pip?'));
+    return fetchCalls().filter((url) => url.includes('/pip?'));
+  }
+
+  /** URLs of the `/pip-grp` aggregate requests made so far, in order. */
+  function groupCalls(): string[] {
+    return fetchCalls().filter((url) => url.includes('/pip-grp?'));
   }
 
   const baseOpts = { countries: ['USA'], year: '2022', fillGaps: true, page: 1, perPage: 50 };
@@ -229,6 +290,12 @@ describe('PipService', () => {
     fetchWithTimeoutMock.mockImplementation(async (url: string) => {
       if (url.includes('/versions')) {
         return { text: async () => JSON.stringify(versionsListing) };
+      }
+      if (url.includes('/aux?table=regions')) {
+        return { text: async () => JSON.stringify(REGIONS) };
+      }
+      if (url.includes('/aux?table=country_list')) {
+        return { text: async () => JSON.stringify(ECONOMIES) };
       }
       const next = pipQueue.shift();
       if (!next) throw new Error(`No response queued for ${url}`);
@@ -435,32 +502,51 @@ describe('PipService', () => {
     ]);
   });
 
-  it('resolves MRV to one row per economy rather than a survey year and a projected one', async () => {
+  it('resolves MRV to the newest year either pass answers, one year per economy', async () => {
     mockRows([surveyRow('USA', 2024)]);
-
-    const result = await service.getPoverty({ ...baseOpts, year: 'MRV' }, createMockContext());
-
-    // MRV is the most recent survey year in one mode and the last projected year
-    // in the other; a second request would answer "most recent value" twice.
-    expect(pipCalls()).toHaveLength(1);
-    expect(result.rows.map((row) => row.reportingYear)).toEqual([2024]);
-  });
-
-  it('still gap-fills a single year for the economies the surveys missed', async () => {
-    mockRows([surveyRow('USA', 2024)]);
-    mockRows([gapFilledRow('USA', 2026), gapFilledRow('ABW', 2026)]);
+    mockRows([
+      gapFilledRow('USA', 2026, { estimation_type: 'extrapolation' }),
+      gapFilledRow('ABW', 2026, { estimation_type: 'CMD estimation', is_interpolated: false }),
+    ]);
 
     const result = await service.getPoverty(
       { ...baseOpts, countries: ['USA', 'ABW'], year: 'MRV' },
       createMockContext(),
     );
 
+    // Every economy answered the survey pass or not, MRV still asks for estimates:
+    // PIP's latest estimate year is the most recent year available.
     expect(pipCalls()).toHaveLength(2);
-    // USA answered at its survey year; the gap-filled USA row is not a second answer.
-    expect(result.rows.map((row) => [row.countryCode, row.reportingYear])).toEqual([
-      ['ABW', 2026],
-      ['USA', 2024],
+    expect(result.gapFilled).toBe(true);
+    expect(
+      result.rows.map((row) => [row.countryCode, row.reportingYear, row.estimationType]),
+    ).toEqual([
+      ['ABW', 2026, 'CMD estimation'],
+      ['USA', 2026, 'extrapolation'],
     ]);
+  });
+
+  it('keeps MRV at the latest survey year, from one request, when fillGaps is false', async () => {
+    mockRows([surveyRow('USA', 2024)]);
+    const result = await service.getPoverty(
+      { ...baseOpts, year: 'MRV', fillGaps: false },
+      createMockContext(),
+    );
+
+    expect(pipCalls()).toHaveLength(1);
+    expect(result.rows.map((row) => [row.reportingYear, row.gini])).toEqual([[2024, 0.417]]);
+  });
+
+  it('answers MRV from the survey row when the estimate pass has nothing newer at any grain', async () => {
+    mockRows([surveyRow('USA', 2024)]);
+    mockRows([]);
+
+    const result = await service.getPoverty({ ...baseOpts, year: 'mrv' }, createMockContext());
+
+    expect(result.rows.map((row) => [row.reportingYear, row.estimationType])).toEqual([
+      [2024, 'survey'],
+    ]);
+    expect(result.gapFilled).toBe(false);
   });
 
   // ─── Empty results ────────────────────────────────────────────────────────
@@ -562,13 +648,83 @@ describe('PipService', () => {
   });
 
   it('names a rejected parameter without reciting a long list of accepted values', async () => {
-    const years = Array.from({ length: 66 }, (_, index) => String(1963 + index));
+    const codes = Array.from({ length: 40 }, (_, index) => `V${String.fromCharCode(65 + index)}`);
+    await mockHttpError(404, validationBody('year', codes));
+    const promise = service.getPoverty(baseOpts, createMockContext());
+
+    // The recovery hint is what resolves the call; 40 values in front of it is noise.
+    await expect(promise).rejects.toThrow(/rejected the value supplied for year\.$/);
+    await expect(promise).rejects.not.toThrow(/VA/);
+    const error = await promise.catch((e: unknown) => e);
+    expect((error as { data: Record<string, unknown> }).data).not.toHaveProperty('acceptedValues');
+  });
+
+  it("summarizes year's accepted values as a span rather than listing 66 of them", async () => {
+    const years = Array.from({ length: 64 }, (_, index) => String(1963 + index));
     await mockHttpError(404, validationBody('year', ['all', 'MRV', ...years]));
     const promise = service.getPoverty(baseOpts, createMockContext());
 
-    // The recovery hint is what resolves the call; 68 years in front of it is noise.
-    await expect(promise).rejects.toThrow(/rejected the value supplied for year\.$/);
-    await expect(promise).rejects.not.toThrow(/1963/);
+    await expect(promise).rejects.toThrow(
+      'PIP rejected the value supplied for year. Accepted values: year accepts all, MRV, 1963–2026.',
+    );
+    await expect(promise).rejects.toMatchObject({
+      data: {
+        reason: 'invalid_parameter',
+        parameters: ['year'],
+        acceptedValues: { year: ['all', 'MRV', '1963–2026'] },
+        retryable: false,
+      },
+    });
+  });
+
+  it.each([
+    [['2000', '2001', '2002', '2005'], 'year accepts 2000–2002, 2005'],
+    [['1990', '1991'], 'year accepts 1990, 1991'],
+    [['2010', '2008', '2009'], 'year accepts 2010, 2008, 2009'],
+    [[0, 2700], 'year accepts 0, 2700'],
+  ])('collapses only a run of consecutive values into a range: %j', async (valid, expected) => {
+    await mockHttpError(404, validationBody('year', valid));
+    await expect(service.getPoverty(baseOpts, createMockContext())).rejects.toThrow(
+      `Accepted values: ${expected}.`,
+    );
+  });
+
+  it.each([
+    [12, true],
+    [13, false],
+  ])('quotes a list that summarizes to %i entries: %s', async (count, quoted) => {
+    const values = Array.from({ length: count }, (_, index) => `v${index}`);
+    await mockHttpError(404, validationBody('year', values));
+    const error = (await service
+      .getPoverty(baseOpts, createMockContext())
+      .catch((e: unknown) => e)) as { message: string; data: Record<string, unknown> };
+
+    expect(error.message.includes('Accepted values: year accepts v0,')).toBe(quoted);
+    expect('acceptedValues' in error.data).toBe(quoted);
+  });
+
+  it('quotes nothing for a rejected parameter PIP sent an empty list for', async () => {
+    await mockHttpError(404, validationBody('year', []));
+    const promise = service.getPoverty(baseOpts, createMockContext());
+
+    await expect(promise).rejects.toThrow(/^PIP rejected the value supplied for year\.$/);
+    await expect(promise).rejects.toMatchObject({ data: { parameters: ['year'] } });
+  });
+
+  it('reads an unkeyed rejection as naming no parameter, rather than one called details', async () => {
+    await mockHttpError(
+      404,
+      JSON.stringify({
+        error: ['Invalid query arguments have been submitted.'],
+        details: { msg: ['The selected value is not available.'], valid: VERSIONS },
+      }),
+    );
+    const promise = service.getPoverty(baseOpts, createMockContext());
+
+    await expect(promise).rejects.toThrow('PIP rejected the value supplied for a query parameter.');
+    await expect(promise).rejects.toMatchObject({
+      data: { reason: 'invalid_parameter', parameters: [] },
+    });
   });
 
   it('names the rejected parameter even when the 404 body was truncated mid-list', async () => {
@@ -583,18 +739,169 @@ describe('PipService', () => {
     await expect(promise).rejects.toThrow(/rejected the value supplied for year\.$/);
   });
 
-  it('maps a 5xx to upstream_unavailable and offers both causes without asserting either', async () => {
+  it('maps a 5xx to upstream_unavailable, stating the status and no cause it cannot see', async () => {
     await mockHttpError(500, '{"error":["Error in /api/v1/pip"]}');
-    const promise = service.getPoverty({ ...baseOpts, countries: ['WLD'] }, createMockContext());
+    const promise = service.getPoverty(baseOpts, createMockContext());
 
     await expect(promise).rejects.toMatchObject({
-      data: { reason: 'upstream_unavailable', countryCodes: 'WLD', status: 500 },
+      data: { reason: 'upstream_unavailable', countryCodes: 'USA', status: 500 },
     });
-    // PIP's 500 body says only "Internal Server Error", so neither cause may be
-    // stated as the diagnosis — an outage reported as a bad country code, or the
-    // reverse, sends the agent after the wrong fix.
-    await expect(promise).rejects.toThrow(/temporarily unavailable/);
-    await expect(promise).rejects.toThrow(/regional or income-group aggregate/);
+    await expect(promise).rejects.toThrow(
+      'PIP returned HTTP 500 for country code(s) "USA", with no detail on the cause.',
+    );
+  });
+
+  // ─── Aggregates ───────────────────────────────────────────────────────────
+
+  it('sends an aggregate to /pip-grp alone, never to /pip', async () => {
+    mockRows([groupRow('WLD', 2022)]);
+    const result = await service.getPoverty(
+      { ...baseOpts, countries: ['wld'], year: '2022' },
+      createMockContext(),
+    );
+
+    expect(pipCalls()).toHaveLength(0);
+    const [url] = groupCalls();
+    expect(new URL(String(url)).searchParams.get('group_by')).toBe('wb');
+    expect(result.countries).toEqual(['WLD']);
+    expect(result.rows[0]).toMatchObject({ countryCode: 'WLD', isAggregate: true });
+  });
+
+  it("reads WDI's LMC as PIP's LMIC and asks for it once", async () => {
+    mockRows([groupRow('LMIC', 2022)]);
+    const result = await service.getPoverty(
+      { ...baseOpts, countries: ['LMC', 'lmic'], year: '2022' },
+      createMockContext(),
+    );
+
+    expect(new URL(String(groupCalls()[0])).searchParams.get('country')).toBe('LMIC');
+    expect(result.countries).toEqual(['LMIC']);
+  });
+
+  it('keeps an aggregate row honest about the fields /pip-grp does not publish', async () => {
+    const { pop_in_poverty: _omitted, ...sparse } = groupRow('SSF', 2022);
+    mockRows([sparse]);
+    const result = await service.getPoverty(
+      { ...baseOpts, countries: ['SSF'], year: '2022' },
+      createMockContext(),
+    );
+
+    expect(result.rows[0]).toMatchObject({
+      countryCode: 'SSF',
+      popInPoverty: null,
+      median: null,
+      reportingLevel: null,
+      welfareType: null,
+      isInterpolated: null,
+      regionCode: null,
+      estimationType: 'actual',
+    });
+  });
+
+  it('skips the regions table for a request of all alone', async () => {
+    mockRows([surveyRow('USA', 2022)]);
+    mockRows([]);
+    await service.getPoverty({ ...baseOpts, countries: ['all'] }, createMockContext());
+    expect(fetchCalls().some((url) => url.includes('/aux'))).toBe(false);
+  });
+
+  // ─── Shared reference loads ───────────────────────────────────────────────
+
+  /**
+   * Answer `/versions` and the `/aux` tables `ms` late, failing early the way
+   * the framework's fetch does when the signal it was handed aborts first.
+   */
+  function slowReferenceListings(ms: number) {
+    const serve = fetchWithTimeoutMock.getMockImplementation() as
+      | ((...args: unknown[]) => unknown)
+      | undefined;
+    fetchWithTimeoutMock.mockImplementation(
+      async (url: string, timeout: number, ctx: unknown, options?: { signal?: AbortSignal }) => {
+        if (url.includes('/versions') || url.includes('/aux?')) {
+          await settleAfter(ms, options?.signal);
+        }
+        return serve?.(url, timeout, ctx, options);
+      },
+    );
+  }
+
+  it('fails only the caller that cancels while a concurrent caller shares the reference loads', async () => {
+    slowReferenceListings(60);
+    mockRows([surveyRow('USA', 2022)]);
+    const cancelled = new AbortController();
+
+    const first = service.getPoverty(baseOpts, createMockContext({ signal: cancelled.signal }));
+    await settleAfter(10);
+    const second = service.getPoverty(baseOpts, createMockContext());
+    await settleAfter(10);
+    cancelled.abort();
+
+    const [cancelledOutcome, concurrentOutcome] = await Promise.allSettled([first, second]);
+
+    expect(concurrentOutcome).toMatchObject({ status: 'fulfilled', value: { total: 1 } });
+    expect(cancelledOutcome).toEqual({ status: 'rejected', reason: cancelled.signal.reason });
+    expect(versionsCalls()).toHaveLength(1);
+  });
+
+  it('keeps a reference load every caller abandoned, and serves the next caller from it', async () => {
+    slowReferenceListings(40);
+    mockRows([surveyRow('USA', 2022)]);
+    const cancelled = new AbortController();
+
+    const abandoned = service.getPoverty(baseOpts, createMockContext({ signal: cancelled.signal }));
+    await settleAfter(10);
+    cancelled.abort();
+    await expect(abandoned).rejects.toThrow();
+
+    await settleAfter(60);
+    await expect(service.getPoverty(baseOpts, createMockContext())).resolves.toMatchObject({
+      total: 1,
+    });
+    expect(versionsCalls()).toHaveLength(1);
+  });
+
+  it("still throws a caller's own cancellation during the regions-table load rather than degrading", async () => {
+    slowReferenceListings(40);
+    const cancelled = new AbortController();
+
+    const request = service.getPoverty(
+      { ...baseOpts, countries: ['SSF'] },
+      createMockContext({ signal: cancelled.signal }),
+    );
+    await settleAfter(10);
+    cancelled.abort();
+
+    await expect(request).rejects.toThrow();
+    expect(pipCalls()).toHaveLength(0);
+    expect(groupCalls()).toHaveLength(0);
+  });
+
+  // ─── Model-estimate-only economies ────────────────────────────────────────
+
+  it('names only the codes neither list carries, and asks for no all-economy response', async () => {
+    await mockHttpError(404, validationBody('country', ['USA', 'IND']));
+    await expect(
+      service.getPoverty({ ...baseOpts, countries: ['USA', 'ZZZ'] }, createMockContext()),
+    ).rejects.toMatchObject({ data: { reason: 'country_not_found', countryCodes: 'ZZZ' } });
+    expect(pipCalls()).toHaveLength(1);
+  });
+
+  it('keeps country_not_found for the whole batch when the rejection carries no list', async () => {
+    await mockHttpError(404, validationBody('country', []).replace(',"valid":[]', ''));
+    await expect(
+      service.getPoverty({ ...baseOpts, countries: ['AFG'] }, createMockContext()),
+    ).rejects.toMatchObject({ data: { reason: 'country_not_found', countryCodes: 'AFG' } });
+    expect(fetchCalls().some((url) => url.includes('country_list'))).toBe(false);
+  });
+
+  it('reports a model-estimate-only economy it left out under fillGaps false', async () => {
+    await mockHttpError(404, validationBody('country', ['USA', 'IND']));
+    const result = await service.getPoverty(
+      { ...baseOpts, countries: ['AFG'], fillGaps: false },
+      createMockContext(),
+    );
+    expect(result).toMatchObject({ rows: [], total: 0, modelOnly: ['AFG'] });
+    expect(pipCalls()).toHaveLength(1);
   });
 
   it('throws serviceUnavailable when the gateway returns an HTML error page', async () => {
