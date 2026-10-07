@@ -12,14 +12,14 @@
       "url": "https://worldbank.caseyjhand.com/mcp"
     }
   ],
-  "version": "0.5.2",
+  "version": "0.5.3",
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/worldbank-mcp-server",
       "runtimeHint": "npx",
-      "version": "0.5.2",
+      "version": "0.5.3",
       "environmentVariables": [
         {
           "name": "MCP_LOG_LEVEL",
@@ -73,7 +73,7 @@
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/worldbank-mcp-server",
       "runtimeHint": "npx",
-      "version": "0.5.2",
+      "version": "0.5.3",
       "environmentVariables": [
         {
           "name": "MCP_TRANSPORT_TYPE",
