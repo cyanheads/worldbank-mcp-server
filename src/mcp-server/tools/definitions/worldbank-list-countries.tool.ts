@@ -208,7 +208,6 @@ export const worldbankListCountries = tool('worldbank_list_countries', {
       if (err instanceof McpError && err.data?.reason === 'invalid_filter') {
         throw ctx.fail('invalid_filter', err.message, {
           ...err.data,
-          ...ctx.recoveryFor('invalid_filter'),
           region: input.region,
           incomeLevel: input.income_level,
         });

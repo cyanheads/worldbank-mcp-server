@@ -144,12 +144,9 @@ describe('worldbankSearchIndicators', () => {
     const { worldbankSearchIndicators } = await import(
       '@/mcp-server/tools/definitions/worldbank-search-indicators.tool.js'
     );
-    const ctx = createMockContext({ errors: worldbankSearchIndicators.errors });
-    const input = worldbankSearchIndicators.input.parse({ topic_id: '999' });
-    const err = await Promise.resolve(worldbankSearchIndicators.handler(input, ctx)).catch(
-      (e: unknown) => e,
-    );
-    expect(err).toMatchObject({
+    const result = await runToolContract(worldbankSearchIndicators, { topic_id: '999' });
+    const error = (result.structuredContent as { error: { message: string } }).error;
+    expect(error).toMatchObject({
       code: JsonRpcErrorCode.NotFound,
       data: {
         reason: 'invalid_filter',
@@ -157,7 +154,7 @@ describe('worldbankSearchIndicators', () => {
       },
     });
     // The caller must never see internal output-schema field names.
-    expect((err as McpError).message).not.toMatch(/totalCount|currentPage|totalPages/);
+    expect(error.message).not.toMatch(/totalCount|currentPage|totalPages/);
   });
 
   it('declares no error contract entry that the handler cannot reach', async () => {
@@ -195,11 +192,7 @@ describe('worldbankSearchIndicators', () => {
     const input = worldbankSearchIndicators.input.parse({ query: '!!!', source_id: '2' });
     await expect(worldbankSearchIndicators.handler(input, ctx)).rejects.toMatchObject({
       code: JsonRpcErrorCode.ValidationError,
-      data: {
-        reason: 'empty_query',
-        query: '!!!',
-        recovery: { hint: expect.stringMatching(/keyword.*omit query/) },
-      },
+      data: { reason: 'empty_query', query: '!!!' },
     });
     expect(getEnrichment(ctx).totalCount).toBeUndefined();
   });

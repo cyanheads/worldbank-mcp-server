@@ -67,7 +67,7 @@ export const worldbankIndicatorResource = resource('worldbank://indicator/{indic
       throw ctx.fail(
         'multiple_indicators',
         `Indicator ID "${params.indicatorId}" selects the whole catalog rather than one indicator.`,
-        { ...ctx.recoveryFor('multiple_indicators'), indicatorId: params.indicatorId },
+        { indicatorId: params.indicatorId },
       );
     }
     try {
@@ -79,14 +79,12 @@ export const worldbankIndicatorResource = resource('worldbank://indicator/{indic
       if (err instanceof McpError && err.data?.reason === 'indicator_not_found') {
         throw ctx.fail('indicator_not_found', err.message, {
           ...err.data,
-          ...ctx.recoveryFor('indicator_not_found'),
           indicatorId: params.indicatorId,
         });
       }
       if (err instanceof McpError && err.data?.reason === 'multiple_indicators') {
         throw ctx.fail('multiple_indicators', err.message, {
           ...err.data,
-          ...ctx.recoveryFor('multiple_indicators'),
           indicatorId: params.indicatorId,
         });
       }

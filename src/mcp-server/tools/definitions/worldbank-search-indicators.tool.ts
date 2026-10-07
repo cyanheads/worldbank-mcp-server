@@ -171,7 +171,6 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
       throw ctx.fail(
         'missing_filter',
         'At least one of query, topic_id, or source_id must be provided.',
-        ctx.recoveryFor('missing_filter'),
       );
     }
 
@@ -195,7 +194,6 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
       if (err instanceof McpError && err.data?.reason === 'invalid_filter') {
         throw ctx.fail('invalid_filter', err.message, {
           ...err.data,
-          ...ctx.recoveryFor('invalid_filter'),
           topicId: input.topic_id,
           sourceId: input.source_id,
         });
@@ -203,7 +201,6 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
       if (err instanceof McpError && err.data?.reason === 'empty_query') {
         throw ctx.fail('empty_query', err.message, {
           ...err.data,
-          ...ctx.recoveryFor('empty_query'),
           query,
         });
       }

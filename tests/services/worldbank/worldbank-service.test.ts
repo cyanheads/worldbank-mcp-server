@@ -3056,7 +3056,8 @@ describe('upstream 404 on a lookup path, end to end', () => {
     expect(JSON.stringify(result)).not.toMatch(/XHTML|Fetch failed/);
   });
 
-  it('the worldbank://indicator resource carries indicator_not_found with its recovery', async () => {
+  /** The framework's resource handler fills the recovery hint from the declared reason. */
+  it('the worldbank://indicator resource carries indicator_not_found', async () => {
     await rejectNextFetch(404, '/indicator/NOPE.NOT.SERVED');
     const { worldbankIndicatorResource } = await import(
       '@/mcp-server/resources/definitions/worldbank-indicator.resource.js'
@@ -3067,10 +3068,7 @@ describe('upstream 404 on a lookup path, end to end', () => {
     ).catch((e: unknown) => e);
     expect(err).toMatchObject({
       code: JsonRpcErrorCode.NotFound,
-      data: {
-        reason: 'indicator_not_found',
-        recovery: { hint: expect.stringContaining('worldbank_search_indicators') },
-      },
+      data: { reason: 'indicator_not_found' },
     });
     expect(JSON.stringify(err)).not.toMatch(/XHTML|Fetch failed/);
   });

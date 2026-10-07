@@ -828,15 +828,11 @@ describe('worldbankSearchProjects', () => {
       'page_out_of_range',
     );
     const tool = await loadTool();
-    const ctx = createMockContext({ errors: tool.errors });
+    const result = await runToolContract(tool, { page: 200, per_page: 1000 });
 
-    await expect(
-      tool.handler(tool.input.parse({ page: 200, per_page: 1000 }), ctx),
-    ).rejects.toMatchObject({
-      data: {
-        reason: 'page_out_of_range',
-        recovery: { hint: expect.stringContaining('Lower the page number') },
-      },
+    expect((result.structuredContent as { error: { data: object } }).error.data).toMatchObject({
+      reason: 'page_out_of_range',
+      recovery: { hint: expect.stringContaining('Lower the page number') },
     });
   });
 
@@ -847,13 +843,11 @@ describe('worldbankSearchProjects', () => {
       'upstream_unavailable',
     );
     const tool = await loadTool();
-    const ctx = createMockContext({ errors: tool.errors });
+    const result = await runToolContract(tool, { countries: 'BR' });
 
-    await expect(tool.handler(tool.input.parse({ countries: 'BR' }), ctx)).rejects.toMatchObject({
-      data: {
-        reason: 'upstream_unavailable',
-        recovery: { hint: expect.stringContaining('Retry the same search once') },
-      },
+    expect((result.structuredContent as { error: { data: object } }).error.data).toMatchObject({
+      reason: 'upstream_unavailable',
+      recovery: { hint: expect.stringContaining('Retry the same search once') },
     });
   });
 

@@ -147,16 +147,10 @@ describe('worldbankListCountries', () => {
     const { worldbankListCountries } = await import(
       '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
     );
-    const ctx = createMockContext({ errors: worldbankListCountries.errors });
-    const input = worldbankListCountries.input.parse({ region: 'BADCODE' });
-    const err = await Promise.resolve(worldbankListCountries.handler(input, ctx)).catch(
-      (e: unknown) => e,
-    );
-    expect(err).toMatchObject({
-      data: {
-        reason: 'invalid_filter',
-        recovery: { hint: expect.stringContaining('worldbank_list_countries') },
-      },
+    const result = await runToolContract(worldbankListCountries, { region: 'BADCODE' });
+    expect((result.structuredContent as { error: { data: object } }).error.data).toMatchObject({
+      reason: 'invalid_filter',
+      recovery: { hint: expect.stringContaining('worldbank_list_countries') },
     });
   });
 

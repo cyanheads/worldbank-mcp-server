@@ -129,12 +129,26 @@ describe('worldbankCountryResource', () => {
         countryCode: 'ZZ',
         detail: 'upstream detail',
         retryable: false,
-        recovery: { hint: expect.stringContaining('worldbank_list_countries') },
       },
     });
   });
 
-  it('throws notFound with a recovery hint when the country code is unknown', async () => {
+  /**
+   * The handler throws each declared reason bare; the framework's resource
+   * handler fills `data.recovery.hint` from the matching `errors[]` entry.
+   */
+  it.each(['country_not_found', 'multiple_countries'])(
+    'declares the list-tool recovery the framework fills for %s',
+    async (reason) => {
+      const { worldbankCountryResource } = await import(
+        '@/mcp-server/resources/definitions/worldbank-country.resource.js'
+      );
+      const entry = worldbankCountryResource.errors?.find((e) => e.reason === reason);
+      expect(entry?.recovery).toContain('worldbank_list_countries');
+    },
+  );
+
+  it('throws notFound when the country code is unknown', async () => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
     vi.mocked(getWorldBankApiService).mockReturnValue({
       getCountry: vi.fn().mockRejectedValue(unknownCountry('ZZZ')),
@@ -152,9 +166,6 @@ describe('worldbankCountryResource', () => {
       code: JsonRpcErrorCode.NotFound,
       data: { reason: 'country_not_found', countryCode: 'ZZZ' },
     });
-    expect((err as { data: { recovery: { hint: string } } }).data.recovery.hint).toMatch(
-      /worldbank_list_countries/,
-    );
   });
 
   /**
@@ -244,7 +255,7 @@ describe('worldbankCountryResource', () => {
   );
 
   it.each([['all'], ['ALL']])(
-    'rejects %j through its error path as multiple_countries with the list-tool recovery',
+    'rejects %j through its error path as multiple_countries',
     async (countryCode) => {
       const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
       const getCountry = vi.fn().mockResolvedValue(mockCountry);
@@ -258,11 +269,7 @@ describe('worldbankCountryResource', () => {
       await expect(worldbankCountryResource.handler(params, ctx)).rejects.toMatchObject({
         code: JsonRpcErrorCode.ValidationError,
         message: expect.stringContaining(`"${countryCode}"`),
-        data: {
-          reason: 'multiple_countries',
-          countryCode,
-          recovery: { hint: expect.stringContaining('worldbank_list_countries') },
-        },
+        data: { reason: 'multiple_countries', countryCode },
       });
       expect(getCountry).not.toHaveBeenCalled();
     },
@@ -291,7 +298,6 @@ describe('worldbankCountryResource', () => {
         reason: 'multiple_countries',
         countryCode: 'XYZ',
         matchedIds: ['CAN', 'USA'],
-        recovery: { hint: expect.stringContaining('worldbank_list_countries') },
       },
     });
   });

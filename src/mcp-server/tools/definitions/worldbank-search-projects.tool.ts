@@ -404,7 +404,7 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
       throw ctx.fail(
         'invalid_country_code',
         `Country code(s) "${malformedCodes.join(', ')}" must be two or three letters or digits: an economy's ISO3 or ISO2 code (BRA, BR) or a World Bank regional code for a multi-country operation (3A, 4E).`,
-        { ...ctx.recoveryFor('invalid_country_code'), invalidCodes: malformedCodes },
+        { invalidCodes: malformedCodes },
       );
     }
     for (const [field, value] of [
@@ -415,7 +415,7 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
         throw ctx.fail(
           'invalid_date',
           `${field} "${value}" is not a real calendar date: the month must be 01–12 and the day must fall inside that month, with February 29 only in a leap year.`,
-          { ...ctx.recoveryFor('invalid_date'), field, value },
+          { field, value },
         );
       }
     }
@@ -423,7 +423,7 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
       throw ctx.fail(
         'reversed_date_range',
         `approved_from "${approvedFrom}" is after approved_to "${approvedTo}", so no project can match the window.`,
-        { ...ctx.recoveryFor('reversed_date_range'), approvedFrom, approvedTo },
+        { approvedFrom, approvedTo },
       );
     }
     /**
@@ -435,7 +435,7 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
       throw ctx.fail(
         'invalid_query',
         `query "${query}" contains #, which the World Bank Projects API cannot search on — it answers with rows unrelated to the query rather than an error.`,
-        { ...ctx.recoveryFor('invalid_query'), retryable: false },
+        { retryable: false },
       );
     }
 
@@ -486,7 +486,6 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
           : []),
       ];
       throw ctx.fail('invalid_country_code', causes.join(' '), {
-        ...ctx.recoveryFor('invalid_country_code'),
         invalidCodes: [...unknownCodes, ...aggregateCodes],
       });
     }
@@ -529,19 +528,16 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
         if (reason === 'page_out_of_range') {
           throw ctx.fail('page_out_of_range', err.message, {
             ...err.data,
-            ...ctx.recoveryFor('page_out_of_range'),
           });
         }
         if (reason === 'invalid_query') {
           throw ctx.fail('invalid_query', err.message, {
             ...err.data,
-            ...ctx.recoveryFor('invalid_query'),
           });
         }
         if (reason === 'upstream_unavailable') {
           throw ctx.fail('upstream_unavailable', err.message, {
             ...err.data,
-            ...ctx.recoveryFor('upstream_unavailable'),
           });
         }
       }

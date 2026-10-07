@@ -478,7 +478,6 @@ export const worldbankGetData = tool('worldbank_get_data', {
       throw ctx.fail(
         'invalid_params',
         `Provide at most one of date_range, mrv, and mrnev; this call sets ${scopes.join(' and ')}.`,
-        ctx.recoveryFor('invalid_params'),
       );
     }
     const frequency = input.frequency || undefined;
@@ -486,7 +485,6 @@ export const worldbankGetData = tool('worldbank_get_data', {
       throw ctx.fail(
         'invalid_params',
         `frequency "${frequency}" cannot be combined with date_range "${dateRange}": the window's own period form picks its periods.`,
-        ctx.recoveryFor('invalid_params'),
       );
     }
 
@@ -499,7 +497,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
       throw ctx.fail(
         'multiple_indicators',
         `indicator_id "${input.indicator_id}" selects every indicator; the data endpoint serves one indicator per call.`,
-        { ...ctx.recoveryFor('multiple_indicators'), indicatorId: input.indicator_id },
+        { indicatorId: input.indicator_id },
       );
     }
 
@@ -512,7 +510,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
       throw ctx.fail(
         'mixed_all_selector',
         `"all" cannot be combined with other country codes (${codes.join(', ')}): it already selects every entry.`,
-        { ...ctx.recoveryFor('mixed_all_selector'), countries: codes },
+        { countries: codes },
       );
     }
 
@@ -527,7 +525,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
         throw ctx.fail(
           'reversed_date_range',
           `date_range "${dateRange}" runs backwards: ${start} comes after ${end}.`,
-          { ...ctx.recoveryFor('reversed_date_range'), dateRange },
+          { dateRange },
         );
       }
     }
@@ -565,28 +563,24 @@ export const worldbankGetData = tool('worldbank_get_data', {
         if (reason === 'indicator_not_found') {
           throw ctx.fail('indicator_not_found', err.message, {
             ...err.data,
-            ...ctx.recoveryFor('indicator_not_found'),
             indicatorId: input.indicator_id,
           });
         }
         if (reason === 'indicator_not_queryable') {
           throw ctx.fail('indicator_not_queryable', err.message, {
             ...err.data,
-            ...ctx.recoveryFor('indicator_not_queryable'),
             indicatorId: input.indicator_id,
           });
         }
         if (reason === 'country_not_found') {
           throw ctx.fail('country_not_found', err.message, {
             ...err.data,
-            ...ctx.recoveryFor('country_not_found'),
             countries: codes,
           });
         }
         if (reason === 'indicator_and_country_not_found') {
           throw ctx.fail('indicator_and_country_not_found', err.message, {
             ...err.data,
-            ...ctx.recoveryFor('indicator_and_country_not_found'),
             indicatorId: input.indicator_id,
             countries: codes,
           });
@@ -594,7 +588,6 @@ export const worldbankGetData = tool('worldbank_get_data', {
         if (reason === 'unknown_dimension_value') {
           throw ctx.fail('unknown_dimension_value', err.message, {
             ...err.data,
-            ...ctx.recoveryFor('unknown_dimension_value'),
             indicatorId: input.indicator_id,
             dimensionValue,
           });
@@ -602,7 +595,6 @@ export const worldbankGetData = tool('worldbank_get_data', {
         if (reason === 'dimension_not_applicable') {
           throw ctx.fail('dimension_not_applicable', err.message, {
             ...err.data,
-            ...ctx.recoveryFor('dimension_not_applicable'),
             indicatorId: input.indicator_id,
             dimensionValue,
           });
@@ -610,14 +602,12 @@ export const worldbankGetData = tool('worldbank_get_data', {
         if (reason === 'source_scope_too_large') {
           throw ctx.fail('source_scope_too_large', err.message, {
             ...err.data,
-            ...ctx.recoveryFor('source_scope_too_large'),
             indicatorId: input.indicator_id,
           });
         }
         if (reason === 'upstream_inconsistent') {
           throw ctx.fail('upstream_inconsistent', err.message, {
             ...err.data,
-            ...ctx.recoveryFor('upstream_inconsistent'),
             indicatorId: input.indicator_id,
           });
         }

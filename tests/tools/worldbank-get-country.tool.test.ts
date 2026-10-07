@@ -121,16 +121,10 @@ describe('worldbankGetCountry', () => {
     const { worldbankGetCountry } = await import(
       '@/mcp-server/tools/definitions/worldbank-get-country.tool.js'
     );
-    const ctx = createMockContext({ errors: worldbankGetCountry.errors });
-    const input = worldbankGetCountry.input.parse({ country_code: 'ZZ' });
-    const err = await Promise.resolve(worldbankGetCountry.handler(input, ctx)).catch(
-      (e: unknown) => e,
-    );
-    expect(err).toMatchObject({
-      data: {
-        reason: 'country_not_found',
-        recovery: { hint: expect.stringContaining('worldbank_list_countries') },
-      },
+    const result = await runToolContract(worldbankGetCountry, { country_code: 'ZZ' });
+    expect((result.structuredContent as { error: { data: object } }).error.data).toMatchObject({
+      reason: 'country_not_found',
+      recovery: { hint: expect.stringContaining('worldbank_list_countries') },
     });
   });
 

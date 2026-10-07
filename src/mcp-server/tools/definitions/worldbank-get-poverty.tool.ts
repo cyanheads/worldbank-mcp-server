@@ -468,7 +468,6 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
         {
           countryCodes: idaTotal.join(','),
           retryable: false,
-          ...ctx.recoveryFor('ambiguous_aggregate'),
           countries: codes,
         },
       );
@@ -511,7 +510,6 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
         {
           countryCodes: unmapped.join(','),
           retryable: false,
-          ...ctx.recoveryFor('country_not_found'),
           countries: codes,
         },
       );
@@ -556,20 +554,18 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
             sentAs.length > 0
               ? `${err.message} Queried ${listCodes(sentAs)}, resolved from the two-character code sent.`
               : err.message,
-            { ...err.data, ...ctx.recoveryFor('country_not_found'), countries: codes },
+            { ...err.data, countries: codes },
           );
         }
         if (reason === 'unserved_aggregate') {
           throw ctx.fail('unserved_aggregate', err.message, {
             ...err.data,
-            ...ctx.recoveryFor('unserved_aggregate'),
             countries: codes,
           });
         }
         if (reason === 'aggregate_filter_conflict') {
           throw ctx.fail('aggregate_filter_conflict', err.message, {
             ...err.data,
-            ...ctx.recoveryFor('aggregate_filter_conflict'),
             countries: codes,
           });
         }
@@ -587,14 +583,12 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
         if (reason === 'ppp_version_unavailable') {
           throw ctx.fail('ppp_version_unavailable', err.message, {
             ...err.data,
-            ...ctx.recoveryFor('ppp_version_unavailable'),
             countries: codes,
           });
         }
         if (reason === 'upstream_unavailable') {
           throw ctx.fail('upstream_unavailable', err.message, {
             ...err.data,
-            ...ctx.recoveryFor('upstream_unavailable'),
             countries: codes,
           });
         }

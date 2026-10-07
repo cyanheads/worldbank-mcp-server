@@ -227,19 +227,13 @@ describe('worldbankGetData', () => {
     const { worldbankGetData } = await import(
       '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
     );
-    const ctx = createMockContext({ errors: worldbankGetData.errors });
-    const input = worldbankGetData.input.parse({
+    const result = await runToolContract(worldbankGetData, {
       indicator_id: 'INVALID.ID',
       countries: 'US',
     });
-    const err = await Promise.resolve(worldbankGetData.handler(input, ctx)).catch(
-      (e: unknown) => e,
-    );
-    expect(err).toMatchObject({
-      data: {
-        reason: 'indicator_not_found',
-        recovery: { hint: expect.stringContaining('worldbank_search_indicators') },
-      },
+    expect((result.structuredContent as { error: { data: object } }).error.data).toMatchObject({
+      reason: 'indicator_not_found',
+      recovery: { hint: expect.stringContaining('worldbank_search_indicators') },
     });
   });
 
@@ -257,19 +251,13 @@ describe('worldbankGetData', () => {
     const { worldbankGetData } = await import(
       '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
     );
-    const ctx = createMockContext({ errors: worldbankGetData.errors });
-    const input = worldbankGetData.input.parse({
+    const result = await runToolContract(worldbankGetData, {
       indicator_id: 'NY.GDP.PCAP.CD',
       countries: 'ZZ',
     });
-    const err = await Promise.resolve(worldbankGetData.handler(input, ctx)).catch(
-      (e: unknown) => e,
-    );
-    expect(err).toMatchObject({
-      data: {
-        reason: 'country_not_found',
-        recovery: { hint: expect.stringContaining('worldbank_list_countries') },
-      },
+    expect((result.structuredContent as { error: { data: object } }).error.data).toMatchObject({
+      reason: 'country_not_found',
+      recovery: { hint: expect.stringContaining('worldbank_list_countries') },
     });
   });
 
@@ -288,22 +276,19 @@ describe('worldbankGetData', () => {
     const { worldbankGetData } = await import(
       '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
     );
-    const ctx = createMockContext({ errors: worldbankGetData.errors });
-    const input = worldbankGetData.input.parse({
+    const result = await runToolContract(worldbankGetData, {
       indicator_id: 'NOT.A.REAL.CODE',
       countries: 'ZZZ',
     });
-    const err = await Promise.resolve(worldbankGetData.handler(input, ctx)).catch(
-      (e: unknown) => e,
-    );
-    expect(err).toMatchObject({
+    const error = (result.structuredContent as { error: { data: { recovery?: object } } }).error;
+    expect(error).toMatchObject({
       code: JsonRpcErrorCode.NotFound,
       data: {
         reason: 'indicator_and_country_not_found',
         recovery: { hint: expect.stringContaining('worldbank_list_countries') },
       },
     });
-    expect((err as McpError).data?.recovery).toMatchObject({
+    expect(error.data.recovery).toMatchObject({
       hint: expect.stringContaining('worldbank_search_indicators'),
     });
   });
@@ -353,16 +338,13 @@ describe('worldbankGetData', () => {
     const { worldbankGetData } = await import(
       '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
     );
-    const ctx = createMockContext({ errors: worldbankGetData.errors });
-    const input = worldbankGetData.input.parse({
+    const result = await runToolContract(worldbankGetData, {
       indicator_id: 'SM.POP.REFG.OR',
       countries: 'SDN',
       mrv: 3,
     });
-    const err = await Promise.resolve(worldbankGetData.handler(input, ctx)).catch(
-      (e: unknown) => e,
-    );
-    expect(err).toMatchObject({
+    const error = (result.structuredContent as { error: { data: { recovery?: object } } }).error;
+    expect(error).toMatchObject({
       code: JsonRpcErrorCode.NotFound,
       data: {
         reason: 'indicator_not_queryable',
@@ -371,9 +353,8 @@ describe('worldbankGetData', () => {
         recovery: { hint: expect.stringContaining('worldbank_search_indicators') },
       },
     });
-    const data = (err as McpError).data ?? {};
-    expect(data).not.toHaveProperty('countries');
-    expect(JSON.stringify(data.recovery)).not.toContain('worldbank_list_countries');
+    expect(error.data).not.toHaveProperty('countries');
+    expect(JSON.stringify(error.data.recovery)).not.toContain('worldbank_list_countries');
   });
 
   it('delivers indicator_not_queryable on both error surfaces through the tool contract', async () => {

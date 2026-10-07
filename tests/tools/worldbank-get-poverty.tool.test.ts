@@ -532,12 +532,10 @@ describe('worldbankGetPoverty', () => {
       'country_not_found',
     );
     const tool = await loadTool();
-    const ctx = createMockContext({ errors: tool.errors });
-    await expect(tool.handler(tool.input.parse({ countries: 'ZZZ' }), ctx)).rejects.toMatchObject({
-      data: {
-        reason: 'country_not_found',
-        recovery: { hint: expect.stringContaining('worldbank_list_countries') },
-      },
+    const result = await runToolContract(tool, { countries: 'ZZZ' });
+    expect((result.structuredContent as { error: { data: object } }).error.data).toMatchObject({
+      reason: 'country_not_found',
+      recovery: { hint: expect.stringContaining('worldbank_list_countries') },
     });
   });
 
@@ -561,12 +559,10 @@ describe('worldbankGetPoverty', () => {
       'upstream_unavailable',
     );
     const tool = await loadTool();
-    const ctx = createMockContext({ errors: tool.errors });
-    await expect(tool.handler(tool.input.parse({ countries: 'KEN' }), ctx)).rejects.toMatchObject({
-      data: {
-        reason: 'upstream_unavailable',
-        recovery: { hint: expect.stringContaining('retry the same request') },
-      },
+    const result = await runToolContract(tool, { countries: 'KEN' });
+    expect((result.structuredContent as { error: { data: object } }).error.data).toMatchObject({
+      reason: 'upstream_unavailable',
+      recovery: { hint: expect.stringContaining('retry the same request') },
     });
   });
 

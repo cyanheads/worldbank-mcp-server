@@ -121,16 +121,10 @@ describe('worldbankGetIndicator', () => {
     const { worldbankGetIndicator } = await import(
       '@/mcp-server/tools/definitions/worldbank-get-indicator.tool.js'
     );
-    const ctx = createMockContext({ errors: worldbankGetIndicator.errors });
-    const input = worldbankGetIndicator.input.parse({ indicator_id: 'INVALID.ID' });
-    const err = await Promise.resolve(worldbankGetIndicator.handler(input, ctx)).catch(
-      (e: unknown) => e,
-    );
-    expect(err).toMatchObject({
-      data: {
-        reason: 'indicator_not_found',
-        recovery: { hint: expect.stringContaining('worldbank_search_indicators') },
-      },
+    const result = await runToolContract(worldbankGetIndicator, { indicator_id: 'INVALID.ID' });
+    expect((result.structuredContent as { error: { data: object } }).error.data).toMatchObject({
+      reason: 'indicator_not_found',
+      recovery: { hint: expect.stringContaining('worldbank_search_indicators') },
     });
   });
 

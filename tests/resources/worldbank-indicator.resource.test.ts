@@ -100,12 +100,26 @@ describe('worldbankIndicatorResource', () => {
         indicatorId: 'NY.GDP.PCAP.CD',
         detail: 'upstream detail',
         retryable: false,
-        recovery: { hint: expect.stringContaining('worldbank_search_indicators') },
       },
     });
   });
 
-  it('throws notFound with a recovery hint when the indicator ID is unknown', async () => {
+  /**
+   * The handler throws each declared reason bare; the framework's resource
+   * handler fills `data.recovery.hint` from the matching `errors[]` entry.
+   */
+  it.each(['indicator_not_found', 'multiple_indicators'])(
+    'declares the search-tool recovery the framework fills for %s',
+    async (reason) => {
+      const { worldbankIndicatorResource } = await import(
+        '@/mcp-server/resources/definitions/worldbank-indicator.resource.js'
+      );
+      const entry = worldbankIndicatorResource.errors?.find((e) => e.reason === reason);
+      expect(entry?.recovery).toContain('worldbank_search_indicators');
+    },
+  );
+
+  it('throws notFound when the indicator ID is unknown', async () => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
     vi.mocked(getWorldBankApiService).mockReturnValue({
       getIndicator: vi.fn().mockRejectedValue(unknownIndicator('INVALID.ID')),
@@ -123,9 +137,6 @@ describe('worldbankIndicatorResource', () => {
       code: JsonRpcErrorCode.NotFound,
       data: { reason: 'indicator_not_found', indicatorId: 'INVALID.ID' },
     });
-    expect((err as { data: { recovery: { hint: string } } }).data.recovery.hint).toMatch(
-      /worldbank_search_indicators/,
-    );
   });
 
   /**
@@ -214,7 +225,7 @@ describe('worldbankIndicatorResource', () => {
   );
 
   it.each([['all'], ['All']])(
-    'rejects %j through its error path as multiple_indicators with the search-tool recovery',
+    'rejects %j through its error path as multiple_indicators',
     async (indicatorId) => {
       const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
       const getIndicator = vi.fn().mockResolvedValue(mockIndicator);
@@ -228,11 +239,7 @@ describe('worldbankIndicatorResource', () => {
       await expect(worldbankIndicatorResource.handler(params, ctx)).rejects.toMatchObject({
         code: JsonRpcErrorCode.ValidationError,
         message: expect.stringContaining(`"${indicatorId}"`),
-        data: {
-          reason: 'multiple_indicators',
-          indicatorId,
-          recovery: { hint: expect.stringContaining('worldbank_search_indicators') },
-        },
+        data: { reason: 'multiple_indicators', indicatorId },
       });
       expect(getIndicator).not.toHaveBeenCalled();
     },
@@ -261,7 +268,6 @@ describe('worldbankIndicatorResource', () => {
         reason: 'multiple_indicators',
         indicatorId: 'XYZ',
         matchedIds: ['A.B', 'C.D'],
-        recovery: { hint: expect.stringContaining('worldbank_search_indicators') },
       },
     });
   });
