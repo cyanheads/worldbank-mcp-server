@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.5.4](changelog/0.5.x/0.5.4.md) — 2026-10-18
+
+Compact whole-scope data reads and correct aggregate routing.
+
 ## [0.5.3](changelog/0.5.x/0.5.3.md) — 2026-10-07
 
 Framework @cyanheads/mcp-ts-core ^0.13.7 → ^0.13.13: tool error results close with their request id and carry data.requestId, data.rootCause no longer reaches error envelopes, and the Docker image installs its production dependencies in a native-platform deps stage.
