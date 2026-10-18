@@ -1968,6 +1968,87 @@ describe('WorldBankApiService', () => {
     ]);
   });
 
+  it.each([undefined, '2'])(
+    'getData: leaves unindexed GEM-looking codes unchanged outside source 15 (%s)',
+    async (sourceid) => {
+      mockResponse([
+        pagingObj({ total: 2, ...(sourceid && { sourceid }) }),
+        [
+          rawDataPoint('AME', '', 'Advanced Economies', '2024'),
+          rawDataPoint('ANT', '', 'Netherlands Antilles', '2024'),
+        ],
+      ]);
+      mockAggregateLookup();
+      const result = await service.getData(
+        { indicatorId: 'CPTOTSAXN', countries: 'all', page: 1, perPage: 50 },
+        createMockContext(),
+      );
+      expect(result.data.map((row) => [row.countryCode, row.countryIso3, row.isAggregate])).toEqual(
+        [
+          ['AME', '', false],
+          ['ANT', '', false],
+        ],
+      );
+    },
+  );
+
+  it.each([undefined, '2024'])(
+    'getData: supplements only verified GEM aggregates on both surfaces (date %s)',
+    async (dateRange) => {
+      const groups = [
+        'AME',
+        'DEV',
+        'EMD',
+        'EDE',
+        'EDI',
+        'EDX',
+        'EAA',
+        'ECH',
+        'LAP',
+        'MNH',
+        'SAP',
+        'SSP',
+        'HIY',
+        'WLT',
+      ];
+      const controls = ['ANT', 'YUG', 'TWN', 'QQQ'];
+      mockResponse([
+        pagingObj({ sourceid: '15', total: 19 }),
+        [...groups, ...controls, 'USA'].map((code) => rawDataPoint(code, '', code, '2024')),
+      ]);
+      mockAggregateLookup();
+      const { worldbankGetData } = await import(
+        '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+      );
+      const { initWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+      initWorldBankApiService(makeConfig() as never, createInMemoryStorage());
+      const result = await runToolContract(worldbankGetData, {
+        indicator_id: 'CPTOTSAXN',
+        countries: 'all',
+        ...(dateRange && { date_range: dateRange }),
+      });
+      expect(result.isError).toBeFalsy();
+      const structured = result.structuredContent as {
+        data: Array<{ countryCode: string; countryIso3: string; isAggregate: boolean }>;
+      };
+      expect(
+        structured.data.filter((row) => row.isAggregate).map((row) => row.countryCode),
+      ).toEqual(groups);
+      expect(
+        structured.data.filter((row) => !row.isAggregate).map((row) => row.countryCode),
+      ).toEqual([...controls, 'US']);
+      expect(structured.data.slice(0, 18).every((row) => row.countryIso3 === '')).toBe(true);
+      expect(structured.data.at(-1)?.countryIso3).toBe('USA');
+      const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+      for (const code of groups) expect(text).toContain(`${code} (${code}) [Aggregate]`);
+      for (const code of controls) {
+        expect(text).toContain(`## ${code} (${code})`);
+        expect(text).not.toContain(`${code} (${code}) [Aggregate]`);
+      }
+      expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(2);
+    },
+  );
+
   it('getData: refetches the aggregate lookup once its TTL lapses', async () => {
     const { getServerConfig } = await import('@/config/server-config.js');
     vi.mocked(getServerConfig).mockReturnValue({
@@ -2020,6 +2101,258 @@ describe('WorldBankApiService', () => {
     expect(second.data[0]?.isAggregate).toBe(true);
     // Two data requests plus one country listing — the listing is not refetched.
     expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(3);
+  });
+
+  it('getData: waits for each whole-scope page before requesting the next', async () => {
+    const started = Promise.withResolvers<void>();
+    const held = Promise.withResolvers<void>();
+    const requested: number[] = [];
+    fetchWithTimeoutMock.mockImplementation(async (url: string) => {
+      const parsed = new URL(url);
+      if (parsed.pathname.endsWith('/country')) {
+        return {
+          text: async () => JSON.stringify([pagingObj(), [rawCountry('USA', 'United States')]]),
+        };
+      }
+      const page = Number(parsed.searchParams.get('page'));
+      requested.push(page);
+      if (page === 2) {
+        started.resolve();
+        await held.promise;
+      }
+      return {
+        text: async () =>
+          JSON.stringify([
+            pagingObj({ page, pages: 3, total: 3 }),
+            [rawDataPoint('US', 'USA', 'United States', String(2023 - page))],
+          ]),
+      };
+    });
+    const pending = service.getData(
+      { indicatorId: 'SP.POP.TOTL', countries: 'US', dateRange: '2020:2022', page: 1, perPage: 50 },
+      createMockContext(),
+    );
+    await started.promise;
+    try {
+      expect(requested).toEqual([1, 2]);
+    } finally {
+      held.resolve();
+      await pending;
+    }
+    expect(requested).toEqual([1, 2, 3]);
+  });
+
+  it('getData: keeps same-code entities distinct across whole-scope pages', async () => {
+    for (const [page, date] of [
+      [1, '2022'],
+      [2, '2021'],
+    ] as const) {
+      mockResponse([
+        pagingObj({ page, pages: 2, total: 8 }),
+        [
+          rawDataPoint('CHN', 'CHN', 'China', date, page),
+          rawDataPoint('CHN', 'CHN', 'Beijing', date, page + 10),
+          rawDataPoint('', '', 'Codeless A', date, page + 20),
+          rawDataPoint('', '', 'Codeless B', date, page + 30),
+        ],
+      ]);
+    }
+    mockAggregateLookup();
+    const result = await service.getData(
+      {
+        indicatorId: 'SP.POP.TOTL',
+        countries: 'all',
+        dateRange: '2021:2022',
+        page: 1,
+        perPage: 50,
+      },
+      createMockContext(),
+    );
+    expect(result.data.map((row) => [row.countryName, row.date, row.value])).toEqual([
+      ['China', '2022', 1],
+      ['Beijing', '2022', 11],
+      ['Codeless A', '2022', 21],
+      ['Codeless B', '2022', 31],
+      ['China', '2021', 2],
+      ['Beijing', '2021', 12],
+      ['Codeless A', '2021', 22],
+      ['Codeless B', '2021', 32],
+    ]);
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const text = worldbankGetData.format!(result)
+      .map((block) => (block.type === 'text' ? block.text : ''))
+      .join('\n');
+    for (const name of ['China', 'Beijing', 'Codeless A', 'Codeless B'])
+      expect(text).toContain(`## ${name}`);
+    expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(3);
+  });
+
+  it('whole-scope reads preserve sparse and delimiter-containing country identities', async () => {
+    const countries = [
+      undefined,
+      {},
+      { id: '' },
+      { value: '' },
+      { id: '', value: '' },
+      { id: 'a|b', value: 'c' },
+      { id: 'a', value: 'b|c' },
+      { id: 'CHN', value: 'China' },
+      { id: 'CHN', value: 'Beijing' },
+    ];
+    for (const page of [1, 2])
+      mockResponse([
+        pagingObj({ page, pages: 2, total: countries.length * 2 }),
+        countries.map((country) => ({
+          country,
+          date: String(2023 - page),
+          value: page,
+          indicator: { id: 'SP.POP.TOTL', value: 'Population, total' },
+          unit: 'people',
+          decimal: 0,
+        })),
+      ]);
+    const read = await service['readSeries'](
+      '/country/all/indicator/SP.POP.TOTL',
+      '2021:2022',
+      20000,
+      createMockContext(),
+    );
+    if (!('items' in read)) throw new Error('Expected observations');
+    expect(read.indicator).toEqual({ id: 'SP.POP.TOTL', value: 'Population, total' });
+    for (const row of read.items) {
+      expect(row).not.toHaveProperty('indicator');
+      expect(row).not.toHaveProperty('unit');
+      expect(row).not.toHaveProperty('decimal');
+    }
+    expect(read.items.map((row) => row.country)).toEqual([...countries, ...countries]);
+    expect(
+      read.items.slice(0, countries.length).map((row) => row.country && Object.keys(row.country)),
+    ).toEqual(countries.map((country) => country && Object.keys(country)));
+    for (let index = 1; index < countries.length; index++) {
+      expect(read.items[index]?.country).toBe(read.items[index + countries.length]?.country);
+      for (let other = index + 1; other < countries.length; other++) {
+        expect(read.items[index]?.country).not.toBe(read.items[other]?.country);
+      }
+    }
+    mockResponse([pagingObj(), [{ country: {}, date: '2022', value: 3 }]]);
+    const separate = await service['readSeries'](
+      '/country/all/indicator/SP.POP.TOTL',
+      '2022',
+      20000,
+      createMockContext(),
+    );
+    if (!('items' in separate)) throw new Error('Expected observations');
+    expect(separate.items[0]?.country).toEqual({});
+    expect(separate.items[0]?.country).not.toBe(read.items[1]?.country);
+  });
+
+  it('getData: stops sequential paging when a later page is cancelled', async () => {
+    const controller = new AbortController();
+    mockResponse([
+      pagingObj({ pages: 3, total: 3 }),
+      [rawDataPoint('US', 'USA', 'United States', '2022')],
+    ]);
+    const abort = abortOnNextFetch(controller);
+    await expect(
+      service.getData(
+        {
+          indicatorId: 'SP.POP.TOTL',
+          countries: 'US',
+          dateRange: '2020:2022',
+          page: 1,
+          perPage: 50,
+        },
+        createMockContext({ signal: controller.signal }),
+      ),
+    ).rejects.toBe(abort);
+    expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('getData: keeps metadata from a widen when its confirmed window is empty', async () => {
+    mockResponse([pagingObj({ total: 0 }), null]);
+    mockResponse([pagingObj({ total: 0 }), null]);
+    mockResponse([
+      pagingObj({ lastupdated: '2026-10-01' }),
+      [{ ...rawDataPoint('US', 'USA', 'United States', '2022', 42), obs_status: 'F' }],
+    ]);
+    mockAggregateLookup();
+    const result = await service.getData(
+      { indicatorId: 'SP.POP.TOTL', countries: 'US', mrnev: 1, page: 1, perPage: 50 },
+      createMockContext(),
+    );
+    expect(result).toMatchObject({
+      indicator: { name: 'Population, total' },
+      lastUpdated: '2026-10-01',
+    });
+    expect(result.data[0]).toMatchObject({ countryIso3: 'USA', obsStatus: 'F', value: 42 });
+  });
+
+  it('getData: does not substitute later metadata for a sparse first observation', async () => {
+    mockResponse([
+      pagingObj({ total: 2 }),
+      [
+        { country: { id: 'US', value: 'United States' }, countryiso3code: 'USA', date: '2022' },
+        rawDataPoint('US', 'USA', 'United States', '2021', 42),
+      ],
+    ]);
+    mockAggregateLookup();
+    const result = await service.getData(
+      { indicatorId: 'SP.POP.TOTL', countries: 'US', dateRange: '2021:2022', page: 2, perPage: 1 },
+      createMockContext(),
+    );
+    expect(result.indicator).toEqual({ id: 'SP.POP.TOTL', name: '' });
+    expect(result.data[0]).toMatchObject({ date: '2021', value: 42, countryIso3: 'USA' });
+  });
+
+  it('getData: preserves whole-scope metadata and nonempty observation fields across pages', async () => {
+    for (const [page, date] of [
+      [1, '2022'],
+      [2, '2021'],
+      [3, '2020'],
+    ] as const) {
+      mockResponse([
+        pagingObj({ page, pages: 3, total: 3, lastupdated: '2026-10-01' }),
+        [{ ...rawDataPoint('US', 'USA', 'United States', date, page), obs_status: 'F' }],
+      ]);
+    }
+    mockAggregateLookup();
+    const result = await service.getData(
+      { indicatorId: 'SP.POP.TOTL', countries: 'US', dateRange: '2020:2022', page: 1, perPage: 50 },
+      createMockContext(),
+    );
+    expect(result).toMatchObject({
+      indicator: { id: 'SP.POP.TOTL', name: 'Population, total' },
+      lastUpdated: '2026-10-01',
+      total: 3,
+      pages: 1,
+      periodForms: ['year'],
+    });
+    expect(
+      result.data.map((row) => [
+        row.countryCode,
+        row.countryIso3,
+        row.countryName,
+        row.date,
+        row.value,
+        row.obsStatus,
+      ]),
+    ).toEqual([
+      ['US', 'USA', 'United States', '2022', 1, 'F'],
+      ['US', 'USA', 'United States', '2021', 2, 'F'],
+      ['US', 'USA', 'United States', '2020', 3, 'F'],
+    ]);
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const text = worldbankGetData.format!(result)
+      .map((block) => (block.type === 'text' ? block.text : ''))
+      .join('\n');
+    expect(text).toContain('Population, total');
+    expect(text).toContain('US / USA');
+    for (const date of ['2022', '2021', '2020']) expect(text).toContain(`**${date}:**`);
+    expect(text).toContain('[obs_status: F]');
   });
 
   it('getData: returns empty data (no throw) once the re-read an empty envelope gets matches it', async () => {

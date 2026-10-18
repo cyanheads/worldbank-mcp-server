@@ -172,6 +172,7 @@ export const worldbankListCountries = tool('worldbank_list_countries', {
   errors: [
     {
       reason: 'invalid_filter',
+      severity: 'notice',
       code: JsonRpcErrorCode.NotFound,
       when: 'An invalid region or income_level code was provided.',
       recovery:

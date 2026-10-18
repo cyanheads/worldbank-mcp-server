@@ -286,6 +286,24 @@ function normalizeCountry(raw: RawCountry): Country {
   };
 }
 
+/** Verified source-15 groupings absent from the global country index; historical economies are excluded. */
+const GEM_AGGREGATES: ReadonlySet<string> = new Set([
+  'AME',
+  'DEV',
+  'EMD',
+  'EDE',
+  'EDI',
+  'EDX',
+  'EAA',
+  'ECH',
+  'LAP',
+  'MNH',
+  'SAP',
+  'SSP',
+  'HIY',
+  'WLT',
+]);
+
 /**
  * Normalize one data-endpoint row, completing its two codes from the country
  * index. `country.id` is normally ISO2 and `countryiso3code` the three-character
@@ -294,7 +312,7 @@ function normalizeCountry(raw: RawCountry): Country {
  * `country.id` (`KEN`) with `countryiso3code` empty. An entity the index does not
  * carry keeps what upstream sent.
  */
-function normalizeDataPoint(raw: RawDataPoint, index: CountryIndex): DataPoint {
+function normalizeDataPoint(raw: Observation, index: CountryIndex, sourceId?: string): DataPoint {
   const entity = index.entities.get((raw.country?.id ?? '').toUpperCase());
   const countryCode = entity?.iso2 || (raw.country?.id ?? '');
   const countryIso3 = raw.countryiso3code || entity?.id || '';
@@ -305,7 +323,10 @@ function normalizeDataPoint(raw: RawDataPoint, index: CountryIndex): DataPoint {
     date: raw.date ?? '',
     value: raw.value ?? null,
     obsStatus: raw.obs_status ?? '',
-    isAggregate: index.aggregateCodes.has(countryIso3) || index.aggregateCodes.has(countryCode),
+    isAggregate:
+      index.aggregateCodes.has(countryIso3) ||
+      index.aggregateCodes.has(countryCode) ||
+      (sourceId === '15' && GEM_AGGREGATES.has(raw.country?.id ?? '')),
   };
 }
 
@@ -525,8 +546,20 @@ function matchIndicators(indicators: readonly Indicator[], query: string): Indic
 
 // ─── Observation reads ───────────────────────────────────────────────────────
 
-/** One complete standard-endpoint read: every page's rows, under the first page's envelope. */
-type SeriesRead = { paging: WbPage; items: RawDataPoint[] };
+/** Fields needed for selection, cache checks, country resolution, and output. */
+type Observation = Pick<
+  RawDataPoint,
+  'country' | 'countryiso3code' | 'date' | 'value' | 'obs_status'
+>;
+
+/** One standard-endpoint read, with indicator metadata shared across its rows. */
+type SeriesRead = { paging: WbPage; items: Observation[]; indicator?: RawDataPoint['indicator'] };
+
+/** Exact country identities shared only within one complete standard data read. */
+type ObservationCountries = Map<
+  string | undefined,
+  Map<string | undefined, NonNullable<RawDataPoint['country']>>
+>;
 
 /**
  * The code a request path names a data row's entity by: the three-character
@@ -535,7 +568,7 @@ type SeriesRead = { paging: WbPage; items: RawDataPoint[] };
  * with neither, such as Gibraltar in Human Capital Index or "IDA total" in Global
  * Financial Development.
  */
-function observationCode(raw: RawDataPoint): string {
+function observationCode(raw: Observation): string {
   return raw.countryiso3code || raw.country?.id || '';
 }
 
@@ -544,12 +577,12 @@ function observationCode(raw: RawDataPoint): string {
  * identify an entity — Doing Business answers `CHN` for China, Beijing, and
  * Shanghai alike, and some sources send several entities with no code at all.
  */
-function observationSeries(raw: RawDataPoint): string {
+function observationSeries(raw: Observation): string {
   return `${observationCode(raw)}|${raw.country?.value ?? ''}`;
 }
 
 /** How the latest-value selection reads a standard-endpoint row. */
-const OBSERVATION_READER: RowReader<RawDataPoint> = {
+const OBSERVATION_READER: RowReader<Observation> = {
   series: observationSeries,
   period: (raw) => raw.date ?? '',
   hasValue: (raw) => raw.value !== null && raw.value !== undefined,
@@ -574,7 +607,7 @@ const OBSERVATION_READER: RowReader<RawDataPoint> = {
  * drops and answers with the whole series — and its re-read then matches it.
  */
 function suspectRead(
-  items: readonly RawDataPoint[],
+  items: readonly Observation[],
   date: string,
   required?: ReadonlySet<string>,
 ): string | undefined {
@@ -611,8 +644,8 @@ function formsOf(periods: readonly string[]): PeriodForm[] {
 }
 
 /** Whether two reads carry the same rows, in any order. */
-function sameRows(a: readonly RawDataPoint[], b: readonly RawDataPoint[]): boolean {
-  const cells = (items: readonly RawDataPoint[]) =>
+function sameRows(a: readonly Observation[], b: readonly Observation[]): boolean {
+  const cells = (items: readonly Observation[]) =>
     items
       .map((raw) => `${observationSeries(raw)}|${raw.date}|${raw.value}`)
       .sort()
@@ -1597,20 +1630,31 @@ export class WorldBankApiService {
    * of every entry can run to megabytes a page and gets the bulk timeout. A read
    * of listed countries is small and gets the ordinary one: the origin sometimes
    * holds a request for about a minute before answering, and a retry after the
-   * ordinary timeout answers it sooner.
+   * ordinary timeout answers it sooner. Pages are fetched sequentially and each
+   * is reduced to observations before the next request; repeated indicator,
+   * unit, and decimal fields do not accumulate with the scope.
    */
-  private readSeries(
+  private async readSeries(
     path: string,
     date: string,
     perPage: number,
     ctx: Context,
   ): Promise<SeriesRead | WbErrorEnvelope> {
     const timeoutMs = /^\/country\/all\//i.test(path) ? BULK_TIMEOUT_MS : REQUEST_TIMEOUT_MS;
-    return this.readAllPages<RawDataPoint>(path, { date }, ctx, {
-      perPage,
-      idInPath: true,
-      timeoutMs,
-    });
+    const items: Observation[] = [];
+    const countries: ObservationCountries = new Map();
+    let paging: WbPage | undefined;
+    let indicator: RawDataPoint['indicator'];
+    let page = 1;
+    while (true) {
+      const next = await this.readSeriesPage(path, date, page, perPage, ctx, timeoutMs, countries);
+      if (isWbErrorEnvelope(next)) return next;
+      paging ??= next.paging;
+      if (items.length === 0) indicator = next.indicator;
+      for (const row of next.items) items.push(row);
+      if (page >= Number(paging.pages)) return { paging, items, indicator };
+      page++;
+    }
   }
 
   /** Upstream page `page` of one data request over `date`, at `perPage` rows a page. */
@@ -1620,13 +1664,35 @@ export class WorldBankApiService {
     page: number,
     perPage: number,
     ctx: Context,
+    timeoutMs = REQUEST_TIMEOUT_MS,
+    countries?: ObservationCountries,
   ): Promise<SeriesRead | WbErrorEnvelope> {
     const url = this.buildUrl(path, { date, page, per_page: perPage });
     ctx.log.debug('Fetching upstream page', { url });
-    const body = await this.fetchLookup<RawDataPoint>(url, ctx);
+    const body = await this.fetchLookup<RawDataPoint>(url, ctx, timeoutMs);
     if (isWbErrorEnvelope(body)) return body;
     const [paging, items] = body;
-    return { paging, items: items ?? [] };
+    const indicator = items?.[0]?.indicator;
+    const observations = items ?? [];
+    for (const raw of observations) {
+      let country = raw.country;
+      if (country && countries) {
+        let names = countries.get(country.id);
+        if (!names) {
+          names = new Map();
+          countries.set(country.id, names);
+        }
+        const shared = names.get(country.value);
+        if (shared) country = shared;
+        else names.set(country.value, country);
+      }
+      if (country) raw.country = country;
+      // Parsed rows belong to this read; compact them without allocating replacement rows.
+      delete raw.indicator;
+      delete raw.unit;
+      delete raw.decimal;
+    }
+    return { paging, items: observations, indicator };
   }
 
   /**
@@ -1667,8 +1733,10 @@ export class WorldBankApiService {
     }
 
     const index = items.length > 0 ? await this.loadCountryIndex(ctx) : undefined;
-    const data = index ? items.map((raw) => normalizeDataPoint(raw, index)) : [];
-    const indicatorMeta = items[0]?.indicator;
+    const data = index
+      ? items.map((raw) => normalizeDataPoint(raw, index, read.paging.sourceid))
+      : [];
+    const indicatorMeta = items.length > 0 ? read.indicator : undefined;
     const lastUpdated = read.paging.lastupdated;
 
     return {
@@ -1746,7 +1814,12 @@ export class WorldBankApiService {
     latest: LatestSelection,
     frequency: PeriodForm | undefined,
     ctx: Context,
-  ): Promise<{ rows: RawDataPoint[]; lastUpdated: string | undefined; periodForms: PeriodForm[] }> {
+  ): Promise<{
+    rows: Observation[];
+    lastUpdated: string | undefined;
+    periodForms: PeriodForm[];
+    indicator?: RawDataPoint['indicator'];
+  }> {
     const form = frequency ?? selectionForm(read.items.map(OBSERVATION_READER.period));
     const inWindow = selectLatest(read.items, latest, form, OBSERVATION_READER);
     if (inWindow.complete) {
@@ -1790,11 +1863,17 @@ export class WorldBankApiService {
     ).rows;
     const lastUpdated = read.paging.lastupdated || whole.paging.lastupdated;
     const periodForms = formsOf([...read.items, ...whole.items].map(OBSERVATION_READER.period));
-    if (everyCountry) return { rows: selected, lastUpdated, periodForms };
+    if (everyCountry)
+      return {
+        rows: selected,
+        lastUpdated,
+        periodForms,
+        indicator: selected.length > 0 ? whole.indicator : undefined,
+      };
 
     const short = new Set(inWindow.short);
     const order = new Map([...codes.keys()].map((s, i) => [s, i]));
-    const position = (raw: RawDataPoint) => order.get(observationSeries(raw)) ?? order.size;
+    const position = (raw: Observation) => order.get(observationSeries(raw)) ?? order.size;
     const rows = [
       ...inWindow.rows.filter((raw) => !short.has(observationSeries(raw))),
       ...selected,
@@ -1895,29 +1974,30 @@ export class WorldBankApiService {
     const read = await this.confirmRead(path, date, first, ctx);
 
     let rows = read.items;
+    let selectedIndicator: RawDataPoint['indicator'];
     let lastUpdated = read.paging.lastupdated;
     let periodForms = formsOf(read.items.map(OBSERVATION_READER.period));
     let dateFilterDropped = false;
     const dateWindow = parseDateWindow(dateRange);
     if (latest) {
-      ({ rows, lastUpdated, periodForms } = await this.latestRows(
-        path,
-        indicatorId,
-        read,
-        latest,
-        frequency,
-        ctx,
-      ));
+      ({
+        rows,
+        lastUpdated,
+        periodForms,
+        indicator: selectedIndicator,
+      } = await this.latestRows(path, indicatorId, read, latest, frequency, ctx));
     } else if (dateWindow) {
       rows = read.items.filter((raw) => isWithinWindow(raw.date ?? '', dateWindow));
       dateFilterDropped = rows.length < read.items.length;
     }
 
-    const indicatorMeta = (read.items[0] ?? rows[0])?.indicator;
+    const indicatorMeta = read.items.length > 0 ? read.indicator : selectedIndicator;
     const start = (page - 1) * perPage;
     const pageRows = rows.slice(start, start + perPage);
     const index = pageRows.length > 0 ? await this.loadCountryIndex(ctx) : undefined;
-    const data = index ? pageRows.map((raw) => normalizeDataPoint(raw, index)) : [];
+    const data = index
+      ? pageRows.map((raw) => normalizeDataPoint(raw, index, read.paging.sourceid))
+      : [];
 
     return {
       data,

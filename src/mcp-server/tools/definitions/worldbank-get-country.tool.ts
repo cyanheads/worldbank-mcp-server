@@ -53,12 +53,14 @@ export const worldbankGetCountry = tool('worldbank_get_country', {
   errors: [
     {
       reason: 'country_not_found',
+      severity: 'notice',
       code: JsonRpcErrorCode.NotFound,
       when: 'The country code does not exist in the World Bank API.',
       recovery: 'Use worldbank_list_countries to browse valid ISO2, ISO3, and aggregate codes.',
     },
     {
       reason: 'multiple_countries',
+      severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
       when: 'The code is "all", or another selector the World Bank resolves to more than one country.',
       recovery:

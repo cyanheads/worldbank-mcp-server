@@ -676,7 +676,103 @@ describe('worldbank_get_poverty routing', () => {
     expect(structured.appliedFilters.countries).toBe('SSF,LIC,KEN');
   });
 
-  it.each([['SSA'], ['EAP'], ['FCVY'], ['MIC'], ['LMY'], ['ZF']])(
+  it.each(['FCVY', 'FCVN'])(
+    'routes %s through fcv with nullable aggregate fields on both surfaces',
+    async (code) => {
+      serve(
+        () => undefined,
+        (params) =>
+          params.get('group_by') === 'fcv' && params.get('country') === code
+            ? [groupRow(code, code === 'FCVY' ? 'Fragile' : 'Not-fragile', 2022)]
+            : undefined,
+      );
+      const { structured, text } = await call({ countries: code, year: '2022' });
+      expect(summary(structured)).toEqual([[code, 2022, 'actual']]);
+      expect(structured.estimates[0]).toMatchObject({
+        isAggregate: true,
+        surveyYear: null,
+        welfareType: null,
+        reportingLevel: null,
+        gini: null,
+      });
+      expect(text).toContain(`(${code}) — 2022, aggregate`);
+      expect(text).toContain('**surveyYear:** null');
+      expect(text).toContain('**gini:** null');
+      expect(pipRequests()).toHaveLength(0);
+      expect(groupRequests()[0]?.searchParams.get('version')).toBe(VERSIONS[0]?.version);
+    },
+  );
+
+  it('merges FCV, region and economy series at one pinned version across capped pages and MRV', async () => {
+    serve(
+      (params) => (params.get('fill_gaps') === 'false' ? [surveyRow('KEN', 2022)] : []),
+      (params) => {
+        const code = params.get('group_by') === 'fcv' ? 'FCVY' : 'SSF';
+        return Array.from({ length: 40 }, (_, i) => groupRow(code, code, 1983 + i));
+      },
+    );
+    const input = { countries: ['FCVY', 'SSF', 'KEN'], per_page: 1000 };
+    const first = await call(input);
+    expect(first.structured).toMatchObject({ totalCount: 81, totalPages: 2 });
+    expect(first.structured.estimates).toHaveLength(70);
+    expect(first.text).toContain('per_page=1000 was reduced to 70');
+    const last = await call({ ...input, page: 2 });
+    expect(last.structured.estimates).toHaveLength(11);
+    expect(last.text).toContain('(SSF)');
+    const past = await call({ ...input, page: 3 });
+    expect(past.structured.estimates).toEqual([]);
+    expect(past.text).toContain('Page 3 is past the end');
+    const latest = await call({ ...input, year: 'MRV' });
+    expect(summary(latest.structured)).toEqual([
+      ['FCVY', 2022, 'actual'],
+      ['KEN', 2022, 'survey'],
+      ['SSF', 2022, 'actual'],
+    ]);
+    expect(latest.text).toContain('(FCVY) — 2022, aggregate');
+    expect(
+      [...pipRequests(), ...groupRequests()].every(
+        (url) => url.searchParams.get('version') === VERSIONS[0]?.version,
+      ),
+    ).toBe(true);
+    expect(requestsTo('/pip/v1/versions')).toHaveLength(1);
+  });
+
+  it('returns an empty FCV result on both surfaces', async () => {
+    serve(
+      () => undefined,
+      () => [],
+    );
+    const { structured, text } = await call({ countries: 'FCVN', year: '1970' });
+    expect(structured).toMatchObject({ estimates: [], totalCount: 0, totalPages: 1 });
+    expect(text).toContain('No estimates returned.');
+  });
+
+  it.each([{ welfare_type: 'income' }, { reporting_level: 'urban' }])(
+    'rejects %j beside FCV before data requests',
+    async (filter) => {
+      serve(() => undefined);
+      const { error, text } = await failure({ countries: ['KEN', 'FCVN'], ...filter });
+      expect(error.data.reason).toBe('aggregate_filter_conflict');
+      expect(text).toContain('Recovery:');
+      expect([...pipRequests(), ...groupRequests()]).toHaveLength(0);
+    },
+  );
+
+  it('rejects FCS with FCVY guidance before any data request without aliasing membership', async () => {
+    serve(() => undefined);
+    const { error, text } = await failure({ countries: ['KEN', 'FCS'], year: '2022' });
+    expect(error.data).toMatchObject({
+      reason: 'unserved_aggregate',
+      countryCodes: 'FCS',
+      retryable: false,
+    });
+    expect(error.message).toContain('FCVY');
+    expect(text).toContain('FCVY');
+    expect(pipRequests()).toHaveLength(0);
+    expect(groupRequests()).toHaveLength(0);
+  });
+
+  it.each([['SSA'], ['EAP'], ['MIC'], ['LMY'], ['ZF']])(
     'rejects %s as an aggregate this tool does not serve, before any data request',
     async (code) => {
       serve(() => undefined);

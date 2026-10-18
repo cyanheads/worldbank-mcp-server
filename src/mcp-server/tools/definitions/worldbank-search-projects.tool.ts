@@ -328,6 +328,7 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
   errors: [
     {
       reason: 'invalid_country_code',
+      severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
       when: 'A countries entry resolves to no economy: it is not two or three letters or digits, no economy in the World Bank country index has that three-character code, or it is a WDI aggregate such as SSF or WLD, which the portfolio lists no operations under. Also when countries holds only separators and so names no code at all.',
       recovery:
@@ -335,6 +336,7 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
     },
     {
       reason: 'invalid_date',
+      severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
       when: 'approved_from or approved_to is shaped YYYY-MM-DD but names no real day — a month outside 01–12, or a day outside its month.',
       recovery:
@@ -342,6 +344,7 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
     },
     {
       reason: 'reversed_date_range',
+      severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
       when: 'approved_from falls after approved_to, an interval no project can match.',
       recovery:
@@ -349,6 +352,7 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
     },
     {
       reason: 'invalid_query',
+      severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
       when: 'The Projects API could not parse query and answered HTTP 400, or query contains #, which the API answers with rows unrelated to the search.',
       recovery:
@@ -356,6 +360,7 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
     },
     {
       reason: 'page_out_of_range',
+      severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
       when: 'The requested page starts past the 100,000-result offset the Projects API serves.',
       recovery:

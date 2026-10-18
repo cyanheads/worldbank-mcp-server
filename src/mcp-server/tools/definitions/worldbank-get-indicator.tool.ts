@@ -48,12 +48,14 @@ export const worldbankGetIndicator = tool('worldbank_get_indicator', {
   errors: [
     {
       reason: 'indicator_not_found',
+      severity: 'notice',
       code: JsonRpcErrorCode.NotFound,
       when: 'The indicator ID does not exist in the World Bank API.',
       recovery: 'Use worldbank_search_indicators to find valid indicator IDs by keyword or topic.',
     },
     {
       reason: 'multiple_indicators',
+      severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
       when: 'The ID is "all", or another selector the World Bank resolves to more than one indicator.',
       recovery:

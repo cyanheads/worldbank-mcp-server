@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.5.3-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.2.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/worldbank-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/worldbank-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.2-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.5.3-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.3.1-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/worldbank-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/worldbank-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.3-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -25,7 +25,7 @@
 
 ## Overview
 
-World Bank Open Data across three separate upstream APIs — development indicators, poverty and inequality estimates, and the Bank's lending portfolio. Search the 29,500+ indicator catalog, query country-level time series, pull poverty and inequality metrics from the Poverty and Inequality Platform, and search active and historical lending projects from any MCP client. Runs as a stdio process, a local Streamable HTTP server, or the public hosted endpoint above.
+World Bank Open Data: 29,500+ development indicators, poverty and inequality estimates, and the Bank's lending projects. Search indicators, query country time series, pull poverty metrics, and search active and historical projects. No API key required.
 
 ### Tools
 
@@ -38,7 +38,7 @@ World Bank Open Data across three separate upstream APIs — development indicat
 | `worldbank_search_indicators` | Search the 29,500+ indicator catalog by keyword, topic, or source |
 | `worldbank_get_indicator` | Fetch complete metadata for a single indicator: name, description, source, unit, and topics |
 | `worldbank_get_data` | Query indicator values for one or more countries across a time range, the most recent N periods, or each country's latest N non-empty values, annually, quarterly, or monthly |
-| `worldbank_get_poverty` | Poverty headcount, gap, and severity at any poverty line for economies and PIP's regional, income-group, and lending-group aggregates, plus the Gini coefficient and decile shares, from the Poverty and Inequality Platform |
+| `worldbank_get_poverty` | Poverty headcount, gap, and severity at any poverty line for economies and PIP's regional, income-group, lending-group, and fragility-group aggregates, plus the Gini coefficient and decile shares, from the Poverty and Inequality Platform |
 | `worldbank_search_projects` | Search the World Bank lending portfolio by text, country, region, status, financing window, and board approval date |
 
 ### Resources
@@ -107,7 +107,7 @@ World Bank Open Data across three separate upstream APIs — development indicat
 
 ### `worldbank_get_poverty` <sub>tool</sub>
 
-- Economies by ISO3 or ISO2 code, including those PIP publishes only as model estimates (`AFG`), plus PIP's aggregates: `WLD`, regions (`SSF`, `AFE`), income groups (`LMIC`/`LMC`), and lending groups (`IDX`, `IDB`, `IBD`, `REST`); `year` as a year, `all`, or `MRV`; any `poverty_line`, defaulting to the applied PPP vintage's international line; up to 70 estimates a page (~50 KB)
+- Economies by ISO3 or ISO2 code, including those PIP publishes only as model estimates (`AFG`), plus PIP's aggregates: `WLD`, regions (`SSF`, `AFE`), income groups (`LMIC`/`LMC`), lending groups (`IDX`, `IDB`, `IBD`, `REST`), and fragility groups (`FCVY`, `FCVN`; WDI's `FCS` is rejected with `FCVY` guidance, without asserting the same membership); `year` as a year, `all`, or `MRV`; any `poverty_line`, defaulting to the applied PPP vintage's international line; up to 70 estimates a page (~50 KB)
 - Headcount, gap, severity, and Watts index, plus the Gini coefficient, mean log deviation, polarization, and decile shares on survey rows; `estimationType` separates survey rows from gap-filled ones, whose inequality fields are null, and `isAggregate` flags aggregate rows
 - `fill_gaps` (default `true`) includes gap-filled years; `welfare_type` and `reporting_level` narrow economy results, and `ppp_version` picks the PPP vintage
 

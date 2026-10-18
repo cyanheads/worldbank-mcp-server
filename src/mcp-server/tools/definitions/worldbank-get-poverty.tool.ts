@@ -42,7 +42,7 @@ function listedValuesHint(parameters: readonly string[], listed: readonly string
 export const worldbankGetPoverty = tool('worldbank_get_poverty', {
   title: 'Get World Bank Poverty and Inequality Estimates',
   description:
-    'Query poverty and inequality estimates from the World Bank Poverty and Inequality Platform (PIP) for economies and for PIP\'s own aggregates — World, World Bank regions, income groups, and lending groups. Returns the poverty headcount ratio, poverty gap, and poverty severity at any poverty line, plus mean and median welfare and population. Use it for inequality and distribution questions too — survey-based economy rows carry the Gini coefficient, mean log deviation, polarization, and the ten decile income/consumption shares, because PIP returns poverty and inequality in the same row. PIP is a separate dataset from the WDI series worldbank_get_data reads: it measures welfare in PPP dollars per person per day, at a PPP vintage ppp_version selects, and computes its aggregates at any poverty line, where worldbank_get_data carries only the published lines. Every row reports how it was produced. On an economy, estimationType "survey" rows carry the full inequality block; "interpolation", "extrapolation", and "CMD estimation" rows are gap-filled estimates for years no survey covers, and their gini, mld, polarization, and decileShares are null — a documented gap in the source data, not an error. Aggregate rows (isAggregate true) are "actual", "nowcast", or "projection", add popInPoverty, and carry no distributional block.',
+    'Query poverty and inequality estimates from the World Bank Poverty and Inequality Platform (PIP) for economies and for PIP\'s own aggregates — World, World Bank regions, income groups, lending groups, and fragility groups. Returns the poverty headcount ratio, poverty gap, and poverty severity at any poverty line, plus mean and median welfare and population. Use it for inequality and distribution questions too — survey-based economy rows carry the Gini coefficient, mean log deviation, polarization, and the ten decile income/consumption shares, because PIP returns poverty and inequality in the same row. PIP is a separate dataset from the WDI series worldbank_get_data reads: it measures welfare in PPP dollars per person per day, at a PPP vintage ppp_version selects, and computes its aggregates at any poverty line, where worldbank_get_data carries only the published lines. Every row reports how it was produced. On an economy, estimationType "survey" rows carry the full inequality block; "interpolation", "extrapolation", and "CMD estimation" rows are gap-filled estimates for years no survey covers, and their gini, mld, polarization, and decileShares are null — a documented gap in the source data, not an error. Aggregate rows (isAggregate true) are "actual", "nowcast", or "projection", add popInPoverty, and carry no distributional block.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   inputAliases: { limit: 'per_page' },
   input: z.object({
@@ -74,7 +74,7 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
           ),
       ])
       .describe(
-        'Country codes: a single code, an array, or one string separated by commas, semicolons, or pipes. Economies go by ISO3 (IND, USA) or ISO2 (IN, US) code, including those PIP publishes only as model estimates (AFG); "all" returns every economy. PIP\'s aggregates are served too: WLD; the World Bank regions AFE, AFW, EAS, ECS, LCN, MEA, NAC, SAS, SSF; the income groups HIC, LIC, LMIC (or LMC), UMIC (or UMC); and the lending groups IDX (IDA only), IDB or BLND (IDA blend), IBD or IBRD (IBRD only), and REST. Income groups follow the fiscal-year classification PIP\'s data release was built with — FY2026 (July 2025) for release 20260922 — applied to every year, so membership can differ from the current one worldbank_get_country reports. IDA (IDA total) is rejected because PIP computes no IDA total: ask for IDX and IDB together. Other aggregate codes (SSA, EAP, FCVY, MIC, LMY) are rejected, and welfare_type and reporting_level cannot be combined with an aggregate.',
+        "Country codes: a single code, an array, or one string separated by commas, semicolons, or pipes. Economies go by ISO3 (IND, USA) or ISO2 (IN, US) code, including those PIP publishes only as model estimates (AFG); \"all\" returns every economy. PIP's aggregates are served too: WLD; the World Bank regions AFE, AFW, EAS, ECS, LCN, MEA, NAC, SAS, SSF; the income groups HIC, LIC, LMIC (or LMC), UMIC (or UMC); the fragility groups FCVY (fragile) and FCVN (not fragile); and the lending groups IDX (IDA only), IDB or BLND (IDA blend), IBD or IBRD (IBRD only), and REST. Income groups follow the fiscal-year classification PIP's data release was built with — FY2026 (July 2025) for release 20260922 — applied to every year, so membership can differ from the current one worldbank_get_country reports. IDA (IDA total) is rejected because PIP computes no IDA total: ask for IDX and IDB together. FCS is rejected: use PIP's FCVY for its fragile group, whose membership is not asserted to match WDI's FCS. Other aggregate codes (SSA, EAP, MIC, LMY) are rejected, and welfare_type and reporting_level cannot be combined with an aggregate.",
       ),
     year: z
       .string()
@@ -286,7 +286,7 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
             isAggregate: z
               .boolean()
               .describe(
-                'True on a PIP aggregate — World, a region, an income group, or a lending group — whose median, distributional block, survey fields, welfareType, and reportingLevel are null.',
+                'True on a PIP aggregate — World, a region, an income group, a lending group, or a fragility group — whose median, distributional block, survey fields, welfareType, and reportingLevel are null.',
               ),
           })
           .describe(
@@ -395,6 +395,7 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
   errors: [
     {
       reason: 'country_not_found',
+      severity: 'notice',
       code: JsonRpcErrorCode.NotFound,
       when: 'No economy or aggregate PIP publishes goes by one or more of the codes, including a two-character code the World Bank country listing does not carry.',
       recovery:
@@ -402,6 +403,7 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
     },
     {
       reason: 'ambiguous_aggregate',
+      severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
       when: "IDA or its ISO2 code XG names WDI's IDA total, which PIP does not compute.",
       recovery:
@@ -409,13 +411,15 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
     },
     {
       reason: 'unserved_aggregate',
+      severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
-      when: "An aggregate code this tool does not serve: an FCV or PovcalNet grouping from PIP's regions table (FCVY, SSA, EAP), or a WDI income aggregate PIP computes none for (MIC, LMY).",
+      when: "An aggregate code this tool does not serve: WDI's FCS, a PovcalNet grouping from PIP's regions table (SSA, EAP), or a WDI income aggregate PIP computes none for (MIC, LMY).",
       recovery:
         'Use one of the accepted aggregate codes the message lists — SSF rather than SSA for Sub-Saharan Africa — or query the individual economies instead.',
     },
     {
       reason: 'aggregate_filter_conflict',
+      severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
       when: 'welfare_type or reporting_level was set alongside an aggregate code.',
       recovery:
@@ -423,6 +427,7 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
     },
     {
       reason: 'invalid_parameter',
+      severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
       when: 'PIP rejected the value supplied for a query parameter other than country.',
       recovery:
@@ -430,6 +435,7 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
     },
     {
       reason: 'ppp_version_unavailable',
+      severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
       when: "ppp_version names a PPP vintage PIP's current data release is not published at.",
       recovery:

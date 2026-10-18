@@ -141,6 +141,7 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
   errors: [
     {
       reason: 'missing_filter',
+      severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
       when: 'None of query, topic_id, or source_id were provided.',
       recovery:
@@ -148,6 +149,7 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
     },
     {
       reason: 'invalid_filter',
+      severity: 'notice',
       code: JsonRpcErrorCode.NotFound,
       when: 'The topic_id or source_id does not exist upstream.',
       recovery:
@@ -155,6 +157,7 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
     },
     {
       reason: 'empty_query',
+      severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
       when: 'The query contains no letters or digits once punctuation is ignored.',
       recovery:

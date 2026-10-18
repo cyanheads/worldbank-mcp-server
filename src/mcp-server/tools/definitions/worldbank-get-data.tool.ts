@@ -385,6 +385,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
   errors: [
     {
       reason: 'invalid_params',
+      severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
       when: 'More than one of date_range, mrv, and mrnev is provided, or frequency is provided with date_range.',
       recovery:
@@ -392,6 +393,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
     },
     {
       reason: 'mixed_all_selector',
+      severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
       when: 'countries combines "all" with one or more country codes.',
       recovery:
@@ -399,6 +401,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
     },
     {
       reason: 'reversed_date_range',
+      severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
       when: 'date_range names a range whose first period comes after its second.',
       recovery:
@@ -406,6 +409,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
     },
     {
       reason: 'multiple_indicators',
+      severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
       when: 'The indicator ID is "all", which selects every indicator rather than one.',
       recovery:
@@ -413,12 +417,14 @@ export const worldbankGetData = tool('worldbank_get_data', {
     },
     {
       reason: 'indicator_not_found',
+      severity: 'notice',
       code: JsonRpcErrorCode.NotFound,
       when: 'The indicator ID does not exist.',
       recovery: 'Use worldbank_search_indicators to find valid indicator IDs by keyword or topic.',
     },
     {
       reason: 'indicator_not_queryable',
+      severity: 'notice',
       code: JsonRpcErrorCode.NotFound,
       when: 'The standard data endpoint does not serve the indicator, and no catalog source can serve it through the source-scoped data API instead — the catalog no longer lists the ID, the catalog lookup failed, or the source is not organized by country, series, and time plus at most one further dimension.',
       recovery:
@@ -426,6 +432,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
     },
     {
       reason: 'unknown_dimension_value',
+      severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
       when: "dimension_value is not a value the indicator's dataset lists for its extra dimension.",
       recovery:
@@ -433,12 +440,14 @@ export const worldbankGetData = tool('worldbank_get_data', {
     },
     {
       reason: 'dimension_not_applicable',
+      severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
       when: 'dimension_value is given for an indicator the standard data endpoint serves, or whose dataset has no dimension beyond country, series, and time.',
       recovery: 'Remove dimension_value; this indicator has no extra dimension to select.',
     },
     {
       reason: 'source_scope_too_large',
+      severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
       when: 'A source-scoped query would read more rows (countries × periods × unpinned dimension values) than one request allows.',
       recovery:
@@ -446,12 +455,14 @@ export const worldbankGetData = tool('worldbank_get_data', {
     },
     {
       reason: 'country_not_found',
+      severity: 'notice',
       code: JsonRpcErrorCode.NotFound,
       when: 'One or more country codes are invalid. The message and countryCodes name the codes the World Bank country listing lacks, or every requested code when it lacks none.',
       recovery: 'Use worldbank_list_countries to browse valid ISO2, ISO3, and aggregate codes.',
     },
     {
       reason: 'indicator_and_country_not_found',
+      severity: 'notice',
       code: JsonRpcErrorCode.NotFound,
       when: 'The indicator ID and the country codes are both invalid. The codes are named as on country_not_found.',
       recovery:

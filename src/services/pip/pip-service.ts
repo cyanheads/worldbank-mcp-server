@@ -1,7 +1,7 @@
 /**
  * @fileoverview World Bank Poverty and Inequality Platform (PIP) service. Wraps
  * the `/pip` endpoint for economies and `/pip-grp` for PIP's regional,
- * income-group, and lending-group aggregates, neither of which shares an
+ * income-group, lending-group, and fragility-group aggregates, neither of which shares an
  * envelope, a pagination model, or an error convention with the Indicators v2
  * API: rows arrive as a flat JSON array, there is no server-side paging, and a
  * rejected parameter value comes back as a real HTTP 404 carrying the list of
@@ -79,8 +79,7 @@ const MAX_QUOTED_VALID_VALUES = 12;
  * The `group_by` `/pip-grp` serves each routed grouping of PIP's regions table
  * under, with the label an error message lists its codes under. `world` rides
  * `wb` because `group_by=world` answers HTTP 500, while `wb` serves `WLD`
- * beside the regions. `fcv` and `regionpcn` are absent on purpose: PIP serves
- * them under their own `group_by`, but this tool does not route them.
+ * beside the regions. `regionpcn` remains unrouted.
  */
 const ROUTED_GROUPINGS: Readonly<Record<string, { groupBy: string; label: string }>> = {
   world: { groupBy: 'wb', label: 'World' },
@@ -88,6 +87,7 @@ const ROUTED_GROUPINGS: Readonly<Record<string, { groupBy: string; label: string
   africa_split: { groupBy: 'wb', label: 'regions' },
   incgroup: { groupBy: 'incgroup', label: 'income groups' },
   ida: { groupBy: 'ida', label: 'lending groups' },
+  fcv: { groupBy: 'fcv', label: 'fragility groups' },
 };
 
 /**
@@ -145,6 +145,19 @@ function routeCodes(
   regions: ReadonlyMap<string, string>,
   filters: { welfareType: string | undefined; reportingLevel: string | undefined },
 ): Routing {
+  if (codes.includes('FCS')) {
+    throw validationError(
+      'FCS is a WDI classification, not a supported PIP aggregate code. Use FCVY for PIP’s fragile group or FCVN for its not-fragile group; their membership is not asserted to match FCS.',
+      {
+        reason: 'unserved_aggregate',
+        countryCodes: 'FCS',
+        retryable: false,
+        recovery: {
+          hint: 'Use FCVY for PIP’s fragile group or FCVN for its not-fragile group, or query individual economies.',
+        },
+      },
+    );
+  }
   const routing: Routing = { economies: [], groups: new Map() };
   const unserved: string[] = [];
   for (const code of codes) {
