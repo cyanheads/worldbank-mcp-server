@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import {
   INDICATOR_ID,
   INDICATOR_ID_MESSAGE,
@@ -92,18 +93,21 @@ export const worldbankGetIndicator = tool('worldbank_get_indicator', {
   },
 
   format: (result) => {
-    const lines: string[] = [`# ${result.name}`];
-    lines.push(`**ID:** \`${result.id}\``);
-    if (result.unit) lines.push(`**Unit:** ${result.unit}`);
+    const lines: string[] = [escapeMarkdownInline(result.name)];
+    lines.push(`**ID:** ${escapeMarkdownInline(result.id)}`);
+    if (result.unit) lines.push(`**Unit:** ${escapeMarkdownInline(result.unit)}`);
     lines.push(
-      `**Source:** ${result.sourceName || result.sourceId || 'N/A'} (ID: ${result.sourceId})`,
+      `**Source:** ${escapeMarkdownInline(result.sourceName || result.sourceId || 'N/A')} (ID: ${escapeMarkdownInline(result.sourceId)})`,
     );
-    if (result.sourceOrganization) lines.push(`**Organization:** ${result.sourceOrganization}`);
+    if (result.sourceOrganization)
+      lines.push(`**Organization:** ${escapeMarkdownInline(result.sourceOrganization)}`);
     if (result.topics.length > 0) {
-      lines.push(`**Topics:** ${result.topics.map((t) => `${t.name} (${t.id})`).join(', ')}`);
+      lines.push(
+        `**Topics:** ${result.topics.map((t) => `${escapeMarkdownInline(t.name)} (${escapeMarkdownInline(t.id)})`).join(', ')}`,
+      );
     }
     if (result.sourceNote) {
-      lines.push(`\n**Description:**\n${result.sourceNote}`);
+      lines.push(`\n**Description:**\n${escapeMarkdownInline(result.sourceNote)}`);
     }
     return [{ type: 'text', text: lines.join('\n') }];
   },

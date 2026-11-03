@@ -329,8 +329,8 @@ describe('worldbankGetIndicator', () => {
     expect(result.isError).toBeFalsy();
     expect(result.structuredContent).toMatchObject({ sourceNote: cleanedNote });
     const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
-    expect(text).toContain(`**Description:**\n${cleanedNote}`);
-    expect(text).toContain('exercise books\n- Textbooks');
+    expect(text).toContain(`**Description:**\n${cleanedNote.replace('\n-', '\\\n\\-')}`);
+    expect(text).toContain('exercise books\\\n\\- Textbooks');
     expect(text).not.toMatch(/<\/?br/i);
   });
 

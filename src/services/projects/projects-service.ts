@@ -22,10 +22,8 @@ import {
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { defaultIsTransient, fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
-import {
-  MAX_PROJECTS_PER_PAGE,
-  MAX_PROJECTS_PER_PAGE_WITH_ABSTRACT,
-} from '@/services/response-budget.js';
+import { MAX_PROJECTS_PER_PAGE } from '@/services/response-budget.js';
+import { normalizeSectorNames } from './normalize-sector-names.js';
 import { toWdiIso2 } from './portfolio-country-codes.js';
 import type { ProjectSummary, RawProject, RawProjectsEnvelope } from './types.js';
 
@@ -195,6 +193,7 @@ type ProjectsFilters = {
   projectfinancialtype_exact?: string;
   qterm?: string;
   regionname_exact?: string;
+  sector_exact?: string;
   status_exact?: string;
   strdate?: string;
 };
@@ -210,6 +209,8 @@ export type ProjectSearchOptions = {
   perPage: number;
   query?: string;
   regions: string[];
+  /** Sector names, combined as OR across bare and FY17 spellings. */
+  sectors?: string[];
   statuses: string[];
 };
 
@@ -358,16 +359,10 @@ export class ProjectsService {
    */
   async searchProjects(opts: ProjectSearchOptions, ctx: Context): Promise<ProjectSearchResult> {
     const { countryCodes, includeAbstract, page, perPage } = opts;
+    const sectors = normalizeSectorNames(opts.sectors ?? []);
 
-    /**
-     * Both caps sit below the 1,000 records the endpoint returns for one request
-     * — it accepts a larger `rows` and silently returns 1,000 — so capping here
-     * also keeps `pages` honest about what a request can actually hold.
-     */
-    const rows = Math.min(
-      perPage,
-      includeAbstract ? MAX_PROJECTS_PER_PAGE_WITH_ABSTRACT : MAX_PROJECTS_PER_PAGE,
-    );
+    // The endpoint silently returns at most 1,000 rows, abstracts included.
+    const rows = Math.min(perPage, MAX_PROJECTS_PER_PAGE);
     const offset = (page - 1) * rows;
     if (offset > MAX_OFFSET) {
       throw validationError(
@@ -389,6 +384,11 @@ export class ProjectsService {
       }),
       ...(opts.regions.length > 0 && {
         regionname_exact: opts.regions.join(MULTI_VALUE_SEPARATOR),
+      }),
+      ...(sectors.length > 0 && {
+        sector_exact: [...new Set(sectors.flatMap((name) => [name, `FY17 - ${name}`]))].join(
+          MULTI_VALUE_SEPARATOR,
+        ),
       }),
       ...(opts.financialTypes.length > 0 && {
         projectfinancialtype_exact: opts.financialTypes.join(MULTI_VALUE_SEPARATOR),

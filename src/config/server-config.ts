@@ -21,6 +21,8 @@ const ServerConfigSchema = z.object({
     .describe('World Bank Projects API base URL.'),
   defaultPerPage: z.coerce
     .number()
+    .int()
+    .min(1)
     .default(50)
     .describe('Default page size for list/search operations.'),
   catalogCacheTtlMs: z.coerce

@@ -1,13 +1,13 @@
 <div align="center">
   <h1>@cyanheads/worldbank-mcp-server</h1>
   <p><b>Query 29,500+ World Bank development indicators for 200+ countries across 60+ years via MCP. STDIO or Streamable HTTP.</b>
-  <div>9 Tools • 2 Resources</div>
+  <div>9 Tools • 2 Metadata Resources • 1 Skill</div>
   </p>
 </div>
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.5.4-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.3.1-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/worldbank-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/worldbank-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.3-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.5.4-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.4.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/worldbank-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/worldbank-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -17,6 +17,10 @@
 
 [![Framework](https://img.shields.io/badge/Built%20on-@cyanheads/mcp--ts--core-67E8F9?style=flat-square)](https://www.npmjs.com/package/@cyanheads/mcp-ts-core)
 
+</div>
+
+<div align="center">
+
 **Public Hosted Server:** [https://worldbank.caseyjhand.com/mcp](https://worldbank.caseyjhand.com/mcp)
 
 </div>
@@ -25,7 +29,7 @@
 
 ## Overview
 
-World Bank Open Data: 29,500+ development indicators, poverty and inequality estimates, and the Bank's lending projects. Search indicators, query country time series, pull poverty metrics, and search active and historical projects. No API key required.
+World Bank Open Data: 29,500+ development indicators, poverty and inequality estimates, and the Bank's lending projects. Search indicators, query country and source-specific time series, pull poverty metrics, and search active and historical projects. No API key required. The published `worldbank-guide` skill (`skill://worldbank-guide/SKILL.md`) covers dataset selection, comparable observations, source-specific identifiers, and lending totals.
 
 ### Tools
 
@@ -33,13 +37,13 @@ World Bank Open Data: 29,500+ development indicators, poverty and inequality est
 |:---|:---|
 | `worldbank_list_topics` | List all 21 World Bank thematic topics with descriptions |
 | `worldbank_list_sources` | List 70+ World Bank data sources (datasets) with pagination |
-| `worldbank_list_countries` | List countries and regional aggregates with ISO codes, region, income level, lending type, and coordinates, filterable by region, income level, and lending type |
+| `worldbank_list_countries` | List countries and aggregates with global metadata, or discover a selected source's own entity IDs |
 | `worldbank_get_country` | Fetch full metadata for a specific country or aggregate by ISO2, ISO3, or aggregate code |
 | `worldbank_search_indicators` | Search the 29,500+ indicator catalog by keyword, topic, or source |
 | `worldbank_get_indicator` | Fetch complete metadata for a single indicator: name, description, source, unit, and topics |
 | `worldbank_get_data` | Query indicator values for one or more countries across a time range, the most recent N periods, or each country's latest N non-empty values, annually, quarterly, or monthly |
 | `worldbank_get_poverty` | Poverty headcount, gap, and severity at any poverty line for economies and PIP's regional, income-group, lending-group, and fragility-group aggregates, plus the Gini coefficient and decile shares, from the Poverty and Inequality Platform |
-| `worldbank_search_projects` | Search the World Bank lending portfolio by text, country, region, status, financing window, and board approval date |
+| `worldbank_search_projects` | Search the World Bank lending portfolio by text, country, region, sector, status, financing window, and board approval date |
 
 ### Resources
 
@@ -47,6 +51,7 @@ World Bank Open Data: 29,500+ development indicators, poverty and inequality est
 |:---|:---|
 | `worldbank://indicator/{indicatorId}` | Indicator metadata by ID — name, description, source, unit, and topics |
 | `worldbank://country/{countryCode}` | Country metadata by ISO2, ISO3, or aggregate code — region, income level, capital, coordinates |
+| `skill://worldbank-guide/SKILL.md` | Research guide for dataset selection, source-specific identifiers, comparisons, and lending totals |
 
 ## Capability reference
 
@@ -61,15 +66,16 @@ World Bank Open Data: 29,500+ development indicators, poverty and inequality est
 
 - Paginated list of the 70+ World Bank data sources (datasets); up to 100 per page
 - Each entry carries ID, name, short code, last-updated date, and data/metadata availability
-- Source IDs (e.g. `2` for World Development Indicators) feed `source_id` on `worldbank_search_indicators`
+- Source IDs (e.g. `2` for World Development Indicators) feed `source_id` on `worldbank_search_indicators`, `worldbank_list_countries`, and `worldbank_get_data`
 
 ---
 
 ### `worldbank_list_countries` <sub>tool</sub>
 
-- Filters by region code (`EAS`, `SSF`, … plus membership groupings such as `AFE`, `EUU`, `LDC`), income level (`LIC`, `LMC`, `UMC`, `HIC`), and lending type (`IDX`, `IBD`, `IDB`, `LNX`), combined by AND; up to 150 per page (~50 KB)
+- Filters by region code (`EAS`, `SSF`, … plus membership groupings such as `AFE`, `EUU`, `LDC`), income level (`LIC`, `LMC`, `UMC`, `HIC`), and lending type (`IDX`, `IBD`, `IDB`, `LNX`), combined by AND; up to 300 per page
 - Returns ISO codes, region, income level, lending type, capital, and coordinates; an invalid region or income code is a typed `invalid_filter` error
 - Individual countries only by default — `include_aggregates=true` adds regional, income-group, and world aggregates, flagged `isAggregate`
+- With `source_id`, returns that dataset's canonical entities as `id`, `name`, and `sourceId`, including subnational IDs. Global classification filters and `include_aggregates=true` fail as `unsupported_source_filter`; the default false does not discard source entities
 
 ---
 
@@ -99,25 +105,28 @@ World Bank Open Data: 29,500+ development indicators, poverty and inequality est
 
 ### `worldbank_get_data` <sub>tool</sub>
 
-- `countries` as ISO2, ISO3, aggregate codes, `WLD`, or `all` alone; at most one of `date_range` (a year, quarter, or month, or a range of one type), `mrv` (the latest N periods across the countries), or `mrnev` (each country's own latest N values — Eritrea's GDP per capita at 2011, where `mrv` gives 2025 and null); `frequency` (`annual`, `quarterly`, `monthly`) picks the period form on series that publish several (`CPTOTSAXN` for Kenya, `monthly`, `mrv: 3` → 2026M07–M05); up to 200 observations a page (~50 KB)
+- `countries` as ISO2, ISO3, aggregate codes, `WLD`, or `all` alone; at most one of `date_range` (a year, quarter, or month, or a range of one type), `mrv` (the latest N periods across the countries), or `mrnev` (each country's own latest N non-empty values); `frequency` (`annual`, `quarterly`, `monthly`) picks the period form on series that publish several, while a date window's own form selects it; up to 1,000 observations per page
 - Rows carry both country codes, `isAggregate`, and `value: null` for a missing cell, with `nullCount` per page and `lastUpdated`, the source's data vintage; every `date_range`, `mrv`, and `mrnev` read is checked for another query's cached answer and re-read once, and one that fails twice is an `upstream_inconsistent` error rather than a served result
 - Indicators the standard endpoint doesn't serve (WDI Database Archives, PEFA, ICP, GDLD, International Debt Statistics: DSSI, Food Prices for Nutrition) come from their own dataset, disclosed in `sourceScoped` with the release, classification, sector, or counterpart area applied (`dimension_value`)
+- `source_id` selects a dataset explicitly; discover its entity IDs with the same source on `worldbank_list_countries`. Source-only entities retain their opaque `countryCode` and an empty `countryIso3`; `sourceId` names the serving dataset when known. Unknown or unsupported sources fail as `source_not_found` / `source_not_queryable`
 
 ---
 
 ### `worldbank_get_poverty` <sub>tool</sub>
 
-- Economies by ISO3 or ISO2 code, including those PIP publishes only as model estimates (`AFG`), plus PIP's aggregates: `WLD`, regions (`SSF`, `AFE`), income groups (`LMIC`/`LMC`), lending groups (`IDX`, `IDB`, `IBD`, `REST`), and fragility groups (`FCVY`, `FCVN`; WDI's `FCS` is rejected with `FCVY` guidance, without asserting the same membership); `year` as a year, `all`, or `MRV`; any `poverty_line`, defaulting to the applied PPP vintage's international line; up to 70 estimates a page (~50 KB)
+- Economies by ISO3 or ISO2 code, including those PIP publishes only as model estimates (`AFG`), plus PIP's aggregates: `WLD`, regions (`SSF`, `AFE`), income groups (`LMIC`/`LMC`), lending groups (`IDX`, `IDB`, `IBD`, `REST`), and fragility groups (`FCVY`, `FCVN`; WDI's `FCS` is rejected with `FCVY` guidance, without asserting the same membership); `year` as a year, `all`, or `MRV`; any `poverty_line`, defaulting to the applied PPP vintage's international line; up to 1,000 estimates per page
 - Headcount, gap, severity, and Watts index, plus the Gini coefficient, mean log deviation, polarization, and decile shares on survey rows; `estimationType` separates survey rows from gap-filled ones, whose inequality fields are null, and `isAggregate` flags aggregate rows
+- `estimateType` preserves actual/projection/nowcast provenance independently of `estimationType`; `distributionType` preserves micro/group/imputed classification. Both remain null when upstream supplies none
 - `fill_gaps` (default `true`) includes gap-filled years; `welfare_type` and `reporting_level` narrow economy results, and `ppp_version` picks the PPP vintage
 
 ---
 
 ### `worldbank_search_projects` <sub>tool</sub>
 
-- Free-text `query` combined by AND with `countries` (ISO3, ISO2, or a World Bank regional code such as `3A`), `region`, `status`, `financial_type`, and a board-approval window (`approved_from`/`approved_to`); up to 80 projects a page, newest approval first
+- Free-text `query` combined by AND with `countries` (ISO3, ISO2, or a World Bank regional code such as `3A`), `region`, `sector`, `status`, `financial_type`, and a board-approval window (`approved_from`/`approved_to`); up to 1,000 projects per page, newest approval first
 - Returns ID, name, country, region, status, dates, the commitment amount with its IBRD, IDA, and grant parts, financing windows, sectors, and a URL; `countryCodes` chain into the other tools, a bad code or unparseable query is a typed `invalid_country_code` / `invalid_query` error, and an empty result names the filter that emptied it
-- `include_abstract` (off by default) adds abstracts at 8 projects a page, each cut at 5,000 characters
+- `include_abstract` (off by default) adds complete abstracts without changing the page size
+- `sector` accepts an array of names, combining them by OR and with other filters by AND. Bare and `FY17 - ` spellings query both naming forms; codes are not aliases. Unknown names return no matches; blank names and embedded caret separators fail as `invalid_sector_name`
 
 ---
 
@@ -143,125 +152,43 @@ World Bank-specific:
 - 60+ years of development data (PIP coverage from 1963) across 29,500+ indicators for 200+ countries and regional aggregates
 - Client-side keyword search over the indicator catalog, since the upstream `searchterm` parameter doesn't filter
 - Null-value transparency — `null` observations and `nullCount` surfaced rather than silently dropped
-- `isAggregate` flag on every country/data row to distinguish individual countries from aggregate entities
+- `isAggregate` distinguishes global country and data rows from aggregates; source-entity listings retain their own identifiers without inventing global classifications
 
 Agent-friendly output:
 
 - Tool cross-references woven into descriptions — e.g. `worldbank_search_indicators` names `worldbank_list_topics` for topic IDs, `worldbank_get_data` names `worldbank_search_indicators` for indicator discovery
 - Structured error contracts with typed `reason` codes and actionable `recovery` hints on every tool
 - Consistent pagination metadata (`totalCount`, `currentPage`, `totalPages`) across all list/search/data tools, with a notice naming the pages that exist when a request runs past the end
+- Data, poverty, project, and country reads honor `per_page` up to their documented maximum; larger requests are served at that maximum with requested/served sizes and a notice. The default is 50
 
 ## Getting started
 
-### Public Hosted Instance
+Connect to the hosted instance, no install:
 
-A public instance is available at `https://worldbank.caseyjhand.com/mcp` — no installation required. Point any MCP client at it via Streamable HTTP:
-
-```json
-{
-  "mcpServers": {
-    "worldbank-mcp-server": {
-      "type": "streamable-http",
-      "url": "https://worldbank.caseyjhand.com/mcp"
-    }
-  }
-}
+```sh
+claude mcp add --transport http worldbank-mcp-server https://worldbank.caseyjhand.com/mcp
 ```
 
-### Self-Hosted / Local
+Or run it locally:
 
-Add the following to your MCP client configuration file.
-
-```json
-{
-  "mcpServers": {
-    "worldbank-mcp-server": {
-      "type": "stdio",
-      "command": "bunx",
-      "args": ["@cyanheads/worldbank-mcp-server@latest"],
-      "env": {
-        "MCP_TRANSPORT_TYPE": "stdio",
-        "MCP_LOG_LEVEL": "info"
-      }
-    }
-  }
-}
+```sh
+claude mcp add worldbank-mcp-server -- npx -y @cyanheads/worldbank-mcp-server
 ```
 
-Or with npx (no Bun required):
+For other clients, add this to the MCP config file:
 
 ```json
 {
   "mcpServers": {
     "worldbank-mcp-server": {
-      "type": "stdio",
       "command": "npx",
-      "args": ["-y", "@cyanheads/worldbank-mcp-server@latest"],
-      "env": {
-        "MCP_TRANSPORT_TYPE": "stdio",
-        "MCP_LOG_LEVEL": "info"
-      }
+      "args": ["-y", "@cyanheads/worldbank-mcp-server"]
     }
   }
 }
 ```
 
-Or with Docker:
-
-```json
-{
-  "mcpServers": {
-    "worldbank-mcp-server": {
-      "type": "stdio",
-      "command": "docker",
-      "args": [
-        "run", "-i", "--rm",
-        "-e", "MCP_TRANSPORT_TYPE=stdio",
-        "ghcr.io/cyanheads/worldbank-mcp-server:latest"
-      ]
-    }
-  }
-}
-```
-
-For Streamable HTTP, set the transport and start the server:
-
-```sh
-MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=3010 bun run start:http
-# Server listens at http://localhost:3010/mcp
-```
-
-### Prerequisites
-
-- [Bun v1.4.0](https://bun.sh/) or higher (or Node.js ≥24.0.0).
-- No API key required — the World Bank Open Data API is public and unauthenticated.
-
-### Installation
-
-1. **Clone the repository:**
-
-```sh
-git clone https://github.com/cyanheads/worldbank-mcp-server.git
-```
-
-2. **Navigate into the directory:**
-
-```sh
-cd worldbank-mcp-server
-```
-
-3. **Install dependencies:**
-
-```sh
-bun install
-```
-
-4. **Configure environment (optional):**
-
-```sh
-cp .env.example .env
-# edit .env and set optional overrides
-```
+No API key required. For Docker or a source build, see [Running the server](#running-the-server).
 
 ## Configuration
 
@@ -284,7 +211,7 @@ All configuration is validated at startup via Zod schemas in `src/config/server-
 | `WORLDBANK_API_BASE_URL` | World Bank Indicators API base URL override | `https://api.worldbank.org/v2` |
 | `WORLDBANK_PIP_BASE_URL` | Poverty and Inequality Platform API base URL override | `https://api.worldbank.org/pip/v1` |
 | `WORLDBANK_PROJECTS_BASE_URL` | Projects API base URL override | `https://search.worldbank.org/api/v3` |
-| `WORLDBANK_DEFAULT_PER_PAGE` | Default page size for list/search/data operations; `worldbank_get_data`, `worldbank_list_countries`, `worldbank_search_projects`, and `worldbank_get_poverty` still cap it at their own page limits | `50` |
+| `WORLDBANK_DEFAULT_PER_PAGE` | Positive-integer default page size for list/search/data operations; data, countries, projects, and poverty clamp it to their documented maxima | `50` |
 | `WORLDBANK_CATALOG_CACHE_TTL_MS` | Lifetime of the in-process reference caches — the indicator catalog behind keyword-only search, the country index behind `isAggregate`, source-scoped country codes, and poverty ISO2 codes, each source-scoped dataset's concept/country/period/dimension listings, and PIP's versions listing behind `ppp_version`, regions table behind aggregate codes, and economy list behind model-estimate-only economies; `0` disables them all | `3600000` |
 
 See [`.env.example`](./.env.example) for the full list of optional overrides.
@@ -292,6 +219,16 @@ See [`.env.example`](./.env.example) for the full list of optional overrides.
 ## Running the server
 
 ### Local development
+
+Requires [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
+
+- **Clone and install:**
+
+  ```sh
+  git clone https://github.com/cyanheads/worldbank-mcp-server.git
+  cd worldbank-mcp-server && bun install
+  cp .env.example .env   # optional overrides
+  ```
 
 - **Build and run the production version:**
 
@@ -315,11 +252,10 @@ See [`.env.example`](./.env.example) for the full list of optional overrides.
 ### Docker
 
 ```sh
-docker build -t worldbank-mcp-server .
-docker run --rm -p 3010:3010 worldbank-mcp-server
+docker run --rm -p 3010:3010 ghcr.io/cyanheads/worldbank-mcp-server:latest
 ```
 
-The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `/var/log/worldbank-mcp-server`. OpenTelemetry peer dependencies are installed by default — build with `--build-arg OTEL_ENABLED=false` to omit them.
+The image defaults to HTTP transport, stateless session mode, and logs to `/var/log/worldbank-mcp-server`. To run it over stdio from an MCP client, use `"command": "docker"` with `"args": ["run", "-i", "--rm", "-e", "MCP_TRANSPORT_TYPE=stdio", "ghcr.io/cyanheads/worldbank-mcp-server:latest"]`. To build locally, `docker build -t worldbank-mcp-server .`; OpenTelemetry peer dependencies are installed by default — build with `--build-arg OTEL_ENABLED=false` to omit them.
 
 ## Project structure
 
@@ -332,6 +268,7 @@ The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `
 | `src/services/projects` | Projects API service layer — separate client and domain types. |
 | `src/config` | Server-specific environment variable parsing and validation with Zod. |
 | `tests/` | Unit and integration tests, mirroring the `src/` structure. |
+| `skills/` | The published `worldbank-guide` agent skill, served over MCP and shipped in npm, the MCPB bundle, and Docker. |
 
 ## Development guide
 

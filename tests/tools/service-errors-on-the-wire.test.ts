@@ -464,7 +464,7 @@ describe('service errors on the wire', () => {
     expect(error.data).toMatchObject({
       reason: 'page_out_of_range',
       page: 1252,
-      perPage: 80,
+      perPage: 1000,
       retryable: false,
       recovery: { hint: expect.stringContaining('Lower the page number') },
     });

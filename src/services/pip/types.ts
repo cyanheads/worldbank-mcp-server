@@ -27,6 +27,8 @@ export interface RawPipRow {
   decile8?: number | null;
   decile9?: number | null;
   decile10?: number | null;
+  distribution_type?: string | null;
+  estimate_type?: string | null;
   estimation_type?: string | null;
   gini?: number | null;
   headcount?: number | null;
@@ -69,6 +71,7 @@ export interface RawPipVersion {
  * median, distributional block, survey fields, welfare type, or reporting level.
  */
 export interface RawPipGroupRow {
+  distribution_type?: string | null;
   estimate_type?: string | null;
   headcount?: number | null;
   mean?: number | null;
@@ -136,6 +139,10 @@ export interface PovertyRow {
   countryName: string;
   /** Ten income/consumption shares, poorest decile first, or null when absent. */
   decileShares: number[] | null;
+  /** Underlying distribution classification (micro, group, imputed), when published. */
+  distributionType: string | null;
+  /** PIP's actual, nowcast, or projection classification; null when unpublished. */
+  estimateType: string | null;
   /**
    * How PIP produced the row. On an economy: `survey` carries the
    * distributional block; `interpolation`, `extrapolation`, and `CMD estimation`

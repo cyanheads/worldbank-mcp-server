@@ -101,6 +101,30 @@ const NOT_SERVED_MESSAGE_ID = '175';
  */
 const BULK_PAGE_SIZE = 10_000;
 
+/** Validate the upstream bound before an exhaustive standard-envelope read. */
+function standardPageCount(paging: WbPage, itemCount: number): number {
+  const raw: unknown = paging.pages;
+  const pages =
+    typeof raw === 'number' || (typeof raw === 'string' && raw.trim() !== '') ? Number(raw) : NaN;
+  const rawTotal: unknown = paging.total;
+  const emptyTotal =
+    (typeof rawTotal === 'number' || (typeof rawTotal === 'string' && rawTotal.trim() !== '')) &&
+    Number(rawTotal) === 0;
+  if (
+    !Number.isSafeInteger(pages) ||
+    pages < 0 ||
+    (pages === 0 && (!emptyTotal || itemCount !== 0))
+  ) {
+    throw serviceUnavailable(
+      'World Bank API returned invalid pagination metadata; retry the request.',
+      {
+        errorSource: 'UpstreamPagination',
+      },
+    );
+  }
+  return pages;
+}
+
 /**
  * Page size of a windowed or latest-value data read, which reads every page. It
  * holds any annual series for every entry in one request (265 entries × 66 years
@@ -666,6 +690,7 @@ type CountryIndex = {
 
 /** Options for {@link WorldBankApiService.getData}. */
 type GetDataOptions = {
+  sourceId?: string;
   indicatorId: string;
   countries: string | string[];
   dateRange?: string;
@@ -687,6 +712,8 @@ type GetDataOptions = {
 
 /** One page of observations from either data path. */
 export type DataResult = {
+  /** Serving source ID, only when the upstream envelope or selected source establishes it. */
+  sourceId?: string;
   data: DataPoint[];
   indicator: { id: string; name: string };
   total: number;
@@ -812,7 +839,16 @@ export class WorldBankApiService {
       );
     }
 
-    return (parseXmlErrorEnvelope(text) ?? JSON.parse(text)) as T;
+    try {
+      return (parseXmlErrorEnvelope(text) ?? JSON.parse(text)) as T;
+    } catch (cause) {
+      if (!(cause instanceof SyntaxError)) throw cause;
+      throw serviceUnavailable(
+        'World Bank API returned malformed JSON; retry the request later.',
+        { errorSource: 'UpstreamJson', retryable: false },
+        { cause },
+      );
+    }
   }
 
   /**
@@ -886,7 +922,7 @@ export class WorldBankApiService {
     const first = await requestPage(1);
     if (isWbErrorEnvelope(first)) return first;
     const [paging, items] = first;
-    const pages = Number(paging.pages);
+    const pages = standardPageCount(paging, items?.length ?? 0);
     if (pages <= 1) return { paging, items: items ?? [] };
 
     const rest = await Promise.all(Array.from({ length: pages - 1 }, (_, i) => requestPage(i + 2)));
@@ -1176,6 +1212,27 @@ export class WorldBankApiService {
     });
   }
 
+  /** Validate an explicitly selected source without substituting another dataset. */
+  private async selectedSource(sourceId: string, ctx: Context): Promise<SourceLayout> {
+    const body = await this.fetchLookup<RawSource>(
+      this.buildUrl(`/source/${encodeURIComponent(sourceId)}`),
+      ctx,
+    );
+    if (isWbErrorEnvelope(body) || !body[1]?.some((source) => source.id === sourceId)) {
+      throw notFound(
+        `Source "${sourceId}" not found. Use worldbank_list_sources to find valid IDs.`,
+        { reason: 'source_not_found', sourceId },
+      );
+    }
+    const layout = await this.sourceLayout(sourceId, ctx);
+    if (!layout)
+      throw validationError(
+        `Source "${sourceId}" cannot be addressed by country, series, time and at most one extra dimension. Choose another source with worldbank_list_sources.`,
+        { reason: 'source_not_queryable', sourceId },
+      );
+    return layout;
+  }
+
   /** One of a source's value listings: `country`, `time`, or its extra dimension. */
   private sourceValues(sourceId: string, concept: string, ctx: Context): Promise<DimensionValue[]> {
     const path = `/sources/${encodeURIComponent(sourceId)}/${encodeURIComponent(concept.toLowerCase())}`;
@@ -1267,7 +1324,32 @@ export class WorldBankApiService {
     ctx: Context,
   ): Promise<DataResult> {
     const { indicatorId, countries, dateRange, dimensionValue, frequency, page, perPage } = opts;
-    const catalogRows = await this.catalogRowsForUnserved(indicatorId, ctx);
+    let catalogRows: Indicator[];
+    if (opts.sourceId !== undefined) {
+      await this.selectedSource(opts.sourceId, ctx);
+      const body = await this.readAllPages<RawIndicator>(
+        `/source/${encodeURIComponent(opts.sourceId)}/indicator/${encodeURIComponent(indicatorId)}`,
+        {},
+        ctx,
+        { idInPath: true },
+      );
+      catalogRows = isWbErrorEnvelope(body)
+        ? []
+        : body.items
+            .filter(
+              (item) =>
+                item.id?.toLowerCase() === indicatorId.toLowerCase() &&
+                item.source?.id === opts.sourceId,
+            )
+            .map(normalizeIndicator);
+      if (catalogRows.length === 0)
+        throw notFound(
+          `Indicator "${indicatorId}" is not listed in source ${opts.sourceId}. Use worldbank_search_indicators with source_id="${opts.sourceId}" to find valid IDs.`,
+          { reason: 'indicator_not_found', indicatorId, sourceId: opts.sourceId },
+        );
+    } else {
+      catalogRows = await this.catalogRowsForUnserved(indicatorId, ctx);
+    }
     if (catalogRows.length === 0)
       throw this.indicatorNotQueryable(indicatorId, catalogRows, detail);
 
@@ -1286,20 +1368,21 @@ export class WorldBankApiService {
       this.sourceValues(sourceId, 'time', ctx),
     ]);
 
-    // ── Countries: the source takes its own three-character codes only ──
+    // ── Countries: source IDs retain their canonical spelling, including opaque geography IDs ──
     const codes = Array.isArray(countries) ? countries : countries.split(';');
     const isAll = codes.length === 1 && codes[0]?.toLowerCase() === 'all';
-    const listed = new Set(sourceCountries.map((c) => c.id.toUpperCase()));
+    const listed = new Map(sourceCountries.map((c) => [c.id.toUpperCase(), c.id]));
     const countryIds: string[] = [];
     const uncovered: string[] = [];
     const invalid: string[] = [];
     if (!isAll) {
       for (const code of codes) {
         const upper = code.toUpperCase();
-        const entityId = listed.has(upper) ? upper : index.entities.get(upper)?.id.toUpperCase();
-        if (entityId && listed.has(entityId)) {
-          if (!countryIds.includes(entityId)) countryIds.push(entityId);
-        } else if (entityId) uncovered.push(code);
+        const entityId = listed.get(upper) ?? index.entities.get(upper)?.id;
+        const canonical = entityId && listed.get(entityId.toUpperCase());
+        if (canonical) {
+          if (!countryIds.includes(canonical)) countryIds.push(canonical);
+        } else if (entityId && opts.sourceId === undefined) uncovered.push(code);
         else invalid.push(code);
       }
     }
@@ -1383,7 +1466,7 @@ export class WorldBankApiService {
       const entity = index.entities.get(r.countryId.toUpperCase());
       return {
         countryCode: entity?.iso2 || r.countryId,
-        countryIso3: r.countryId,
+        countryIso3: opts.sourceId !== undefined && !entity ? '' : r.countryId,
         countryName: r.countryName,
         date: r.period,
         value: r.value,
@@ -1402,6 +1485,7 @@ export class WorldBankApiService {
       perPage,
       nullCount: data.filter((d) => d.value === null).length,
       dateFilterDropped: false,
+      sourceId,
       sourceScoped: {
         sourceId,
         sourceName: layout.sourceName,
@@ -1410,8 +1494,10 @@ export class WorldBankApiService {
             ? { concept, selection, id: pinned?.id ?? null, label: pinned?.label ?? null }
             : null,
         note:
-          `Not from the standard World Bank data endpoint, which does not serve "${row.id}": these values come from this ` +
-          "source's own dataset through the source-scoped data API, and may be archived or superseded figures.",
+          opts.sourceId !== undefined
+            ? `These values come from the explicitly selected source's own dataset through the source-scoped data API, and may be archived or superseded figures.`
+            : `Not from the standard World Bank data endpoint, which does not serve "${row.id}": these values come from this ` +
+              "source's own dataset through the source-scoped data API, and may be archived or superseded figures.",
       },
       uncoveredCountries: uncovered,
       ...(lastUpdated && { lastUpdated }),
@@ -1428,6 +1514,7 @@ export class WorldBankApiService {
    */
   async listCountries(
     opts: {
+      sourceId?: string;
       region?: string;
       incomeLevel?: string;
       /** A `/v2/lendingType` id: `IBD`, `IDB`, `IDX`, or `LNX`. */
@@ -1438,7 +1525,7 @@ export class WorldBankApiService {
     },
     ctx: Context,
   ): Promise<{
-    countries: Country[];
+    countries: Array<Country | { id: string; name: string; sourceId: string }>;
     total: number;
     page: number;
     pages: number;
@@ -1447,6 +1534,27 @@ export class WorldBankApiService {
   }> {
     const { region, incomeLevel, lendingType, includeAggregates, page } = opts;
     const perPage = Math.min(opts.perPage, MAX_COUNTRIES_PER_PAGE);
+    if (opts.sourceId !== undefined) {
+      ctx = { ...ctx, signal: AbortSignal.any([ctx.signal, AbortSignal.timeout(50_000)]) };
+      if (region || incomeLevel || lendingType || includeAggregates)
+        throw validationError(
+          'Source entity listings do not establish global region, income, lending or aggregate classifications. Remove region, income_level, lending_type and include_aggregates=true when source_id is set.',
+          { reason: 'unsupported_source_filter', sourceId: opts.sourceId },
+        );
+      await this.selectedSource(opts.sourceId, ctx);
+      const sourceId = opts.sourceId;
+      const entities = await this.sourceValues(sourceId, 'country', ctx);
+      const start = (page - 1) * perPage;
+      return {
+        countries: entities
+          .slice(start, start + perPage)
+          .map((entity) => ({ id: entity.id, name: entity.label, sourceId })),
+        total: entities.length,
+        page,
+        pages: Math.max(1, Math.ceil(entities.length / perPage)),
+        perPage,
+      };
+    }
 
     const filterParams: Record<string, string | number | undefined> = {};
     if (region) filterParams.region = region;
@@ -1646,13 +1754,15 @@ export class WorldBankApiService {
     let paging: WbPage | undefined;
     let indicator: RawDataPoint['indicator'];
     let page = 1;
+    let pages: number | undefined;
     while (true) {
       const next = await this.readSeriesPage(path, date, page, perPage, ctx, timeoutMs, countries);
       if (isWbErrorEnvelope(next)) return next;
       paging ??= next.paging;
+      pages ??= standardPageCount(paging, next.items.length);
       if (items.length === 0) indicator = next.indicator;
       for (const row of next.items) items.push(row);
-      if (page >= Number(paging.pages)) return { paging, items, indicator };
+      if (page >= pages) return { paging, items, indicator };
       page++;
     }
   }
@@ -1748,6 +1858,8 @@ export class WorldBankApiService {
       perPage,
       nullCount: data.filter((d) => d.value === null).length,
       dateFilterDropped: false,
+      ...(typeof read.paging.sourceid === 'string' &&
+        read.paging.sourceid.trim() !== '' && { sourceId: read.paging.sourceid }),
       ...(lastUpdated && { lastUpdated }),
       periodForms,
     };
@@ -1909,6 +2021,11 @@ export class WorldBankApiService {
     const opts = { ...requested, perPage: Math.min(requested.perPage, MAX_OBSERVATIONS_PER_PAGE) };
     const { indicatorId, countries, dateRange, dimensionValue, frequency, page, perPage } = opts;
     const latest = latestSelection(opts);
+    if (opts.sourceId !== undefined)
+      return this.serveFromSource(opts, 'Explicitly selected source', {
+        ...ctx,
+        signal: AbortSignal.any([ctx.signal, AbortSignal.timeout(50_000)]),
+      });
 
     const codes = Array.isArray(countries) ? countries : countries.split(';');
     const path = this.dataPath(codes, indicatorId);
@@ -2008,6 +2125,8 @@ export class WorldBankApiService {
       perPage,
       nullCount: data.filter((d) => d.value === null).length,
       dateFilterDropped,
+      ...(typeof read.paging.sourceid === 'string' &&
+        read.paging.sourceid.trim() !== '' && { sourceId: read.paging.sourceid }),
       ...(lastUpdated && { lastUpdated }),
       periodForms,
       allNull: rows.length > 0 && rows.every((raw) => !OBSERVATION_READER.hasValue(raw)),

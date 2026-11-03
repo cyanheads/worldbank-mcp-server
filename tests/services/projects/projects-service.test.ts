@@ -9,6 +9,7 @@
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createInMemoryStorage, createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import socialUnionCapture from './fixtures/social-union.json' with { type: 'json' };
 
 // ─── fetchWithTimeout mock ────────────────────────────────────────────────────
 // Hoisted so the mock is in place before the service module resolves the dep.
@@ -134,6 +135,88 @@ describe('ProjectsService', () => {
   });
 
   // ─── Envelope normalization ───────────────────────────────────────────────
+
+  it('omits the sector filter on existing searches', async () => {
+    mockBody(envelope([rawProject('P100')]));
+    await service.searchProjects(baseOpts, createMockContext());
+    expect(requestedUrl().pathname).toBe('/api/v3/projects');
+    expect(requestedUrl().searchParams.has('sector_exact')).toBe(false);
+  });
+
+  it.each([
+    ['Social Protection'],
+    ['FY17 - Social Protection'],
+    [' Social Protection ', 'FY17 - Social Protection', 'Primary Education'],
+  ])('expands sector names into one deduplicated OR filter: %j', async (...sectors) => {
+    mockBody(envelope([rawProject('P100')], 77));
+    const result = await service.searchProjects(
+      {
+        ...baseOpts,
+        sectors,
+        regions: ['South Asia'],
+        statuses: ['Active'],
+        approvedFrom: '2020-01-01',
+        page: 2,
+        perPage: 10,
+      },
+      createMockContext(),
+    );
+    expect(requestedUrl().searchParams.get('sector_exact')).toBe(
+      sectors.length === 3
+        ? 'Social Protection^FY17 - Social Protection^Primary Education^FY17 - Primary Education'
+        : 'Social Protection^FY17 - Social Protection',
+    );
+    expect(requestedUrl().searchParams.get('regionname_exact')).toBe('South Asia');
+    expect(requestedUrl().searchParams.get('status_exact')).toBe('Active');
+    expect(requestedUrl().searchParams.get('strdate')).toBe('2020-01-01');
+    expect(requestedUrl().searchParams.get('os')).toBe('10');
+    expect(result).toMatchObject({ total: 77, pages: 8, page: 2, perPage: 10 });
+    expect(result.projects.map((project) => project.id)).toEqual(['P100']);
+  });
+
+  it.each(['', '   ', 'FY17 - ', 'Education^Health'])(
+    'rejects ambiguous or empty sector name %j before fetching',
+    async (sector) => {
+      await expect(
+        service.searchProjects({ ...baseOpts, sectors: [sector] }, createMockContext()),
+      ).rejects.toMatchObject({ data: { reason: 'invalid_sector_name', retryable: false } });
+      expect(fetchWithTimeoutMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it('lets an unknown name return an upstream no-match without a facet lookup', async () => {
+    mockBody(envelope([]));
+    const result = await service.searchProjects(
+      { ...baseOpts, sectors: ['Invented Sector'] },
+      createMockContext(),
+    );
+    expect(requestedUrl().searchParams.get('sector_exact')).toBe(
+      'Invented Sector^FY17 - Invented Sector',
+    );
+    expect(result).toMatchObject({ projects: [], total: 0, pages: 1 });
+    expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('replays the captured sector union envelope without repeating project IDs', async () => {
+    mockBody(JSON.stringify(socialUnionCapture));
+    const result = await service.searchProjects(
+      { ...baseOpts, sectors: ['Social Protection'], perPage: 2 },
+      createMockContext(),
+    );
+    expect(result.projects.map((project) => project.id)).toEqual(['P514519', 'P500380']);
+    expect(result).toMatchObject({ total: 261, perPage: 2, pages: 131 });
+  });
+
+  it('keeps sector filtering on a page past the end', async () => {
+    mockBody(envelope([], 3));
+    const result = await service.searchProjects(
+      { ...baseOpts, sectors: ['Education'], perPage: 2, page: 3 },
+      createMockContext(),
+    );
+    expect(requestedUrl().searchParams.get('sector_exact')).toBe('Education^FY17 - Education');
+    expect(requestedUrl().searchParams.get('os')).toBe('4');
+    expect(result).toMatchObject({ projects: [], total: 3, pages: 2, page: 3 });
+  });
 
   it('collects the ID-keyed projects object into rows in upstream order', async () => {
     mockBody(envelope([rawProject('P100'), rawProject('P200'), rawProject('P300')]));
@@ -485,7 +568,27 @@ describe('ProjectsService', () => {
     expect(result.perPage).toBe(80);
   });
 
-  it('caps a page at 80 projects, offsetting and counting pages at the capped size', async () => {
+  it.each([false, true])(
+    'serves all page sizes independently of abstracts=%s',
+    async (includeAbstract) => {
+      for (const requested of [7, 8, 9, 50, 79, 80, 81, 1000, 1001]) {
+        mockBody(envelope([rawProject('P100', { project_abstract: 'whole abstract' })], 28_074));
+        const result = await service.searchProjects(
+          { ...baseOpts, includeAbstract, page: 2, perPage: requested },
+          createMockContext(),
+        );
+        const served = Math.min(requested, 1000);
+        const params = requestedUrl(fetchWithTimeoutMock.mock.calls.length - 1).searchParams;
+        expect(params.get('rows')).toBe(String(served));
+        expect(params.get('os')).toBe(String(served));
+        expect(result.perPage).toBe(served);
+        expect(result.pages).toBe(Math.ceil(28_074 / served));
+        expect(result.projects[0]?.abstract).toBe(includeAbstract ? 'whole abstract' : null);
+      }
+    },
+  );
+
+  it('serves 1000 projects with offsets and totals at that size', async () => {
     mockBody(envelope([rawProject('P100')], 28_074));
     const result = await service.searchProjects(
       { ...baseOpts, page: 3, perPage: 1000 },
@@ -493,13 +596,12 @@ describe('ProjectsService', () => {
     );
 
     const params = requestedUrl().searchParams;
-    expect(params.get('rows')).toBe('80');
-    // Page 3 at the capped size, so pages 1 and 2 at that size cover rows 0–159.
-    expect(params.get('os')).toBe('160');
-    expect(result).toMatchObject({ perPage: 80, page: 3, pages: 351 });
+    expect(params.get('rows')).toBe('1000');
+    expect(params.get('os')).toBe('2000');
+    expect(result).toMatchObject({ perPage: 1000, page: 3, pages: 29 });
   });
 
-  it('caps a page at 8 projects when abstracts are requested, whole abstracts included', async () => {
+  it('serves the default 50 with whole abstracts included', async () => {
     const long = 'x'.repeat(8_000);
     mockBody(envelope([rawProject('P100', { project_abstract: long })], 28_074));
     const result = await service.searchProjects(
@@ -508,9 +610,9 @@ describe('ProjectsService', () => {
     );
 
     const params = requestedUrl().searchParams;
-    expect(params.get('rows')).toBe('8');
-    expect(params.get('os')).toBe('8');
-    expect(result).toMatchObject({ perPage: 8, pages: 3510 });
+    expect(params.get('rows')).toBe('50');
+    expect(params.get('os')).toBe('50');
+    expect(result).toMatchObject({ perPage: 50, pages: 562 });
     expect(result.projects[0]?.abstract).toHaveLength(8_000);
   });
 
@@ -522,12 +624,12 @@ describe('ProjectsService', () => {
 
     await service.searchProjects({ ...baseOpts, page: 1, perPage: 1000 }, ctx);
     await service.searchProjects({ ...baseOpts, page: 2, perPage: 1000 }, ctx);
-    await service.searchProjects({ ...baseOpts, page: 3, perPage: 80 }, ctx);
+    await service.searchProjects({ ...baseOpts, page: 3, perPage: 1000 }, ctx);
 
     expect([0, 1, 2].map((i) => requestedUrl(i).searchParams.get('os'))).toEqual([
       '0',
-      '80',
-      '160',
+      '1000',
+      '2000',
     ]);
   });
 
@@ -541,7 +643,7 @@ describe('ProjectsService', () => {
     await expect(
       service.searchProjects({ ...baseOpts, page: 1252, perPage: 1000 }, createMockContext()),
     ).rejects.toMatchObject({
-      data: { reason: 'page_out_of_range', page: 1252, perPage: 80, retryable: false },
+      data: { reason: 'page_out_of_range', page: 1252, perPage: 1000, retryable: false },
     });
     expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(1);
   });

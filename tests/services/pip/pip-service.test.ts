@@ -9,6 +9,9 @@
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createInMemoryStorage, createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import braCapture from './fixtures/bra.json' with { type: 'json' };
+import groupCapture from './fixtures/groups.json' with { type: 'json' };
+import ngaCapture from './fixtures/nga.json' with { type: 'json' };
 
 // ─── fetchWithTimeout mock ────────────────────────────────────────────────────
 // Hoisted so the mock is in place before the service module resolves the dep.
@@ -328,6 +331,139 @@ describe('PipService', () => {
 
   // ─── Survey rows ──────────────────────────────────────────────────────────
 
+  it('replays captured survey, latest economy, and aggregate provenance', async () => {
+    mockRows(braCapture);
+    const survey = await service.getPoverty(
+      { ...baseOpts, countries: ['BRA'], fillGaps: false },
+      createMockContext(),
+    );
+    expect(survey.rows[0]).toMatchObject({
+      reportingYear: 2022,
+      estimationType: 'survey',
+      estimateType: null,
+      distributionType: 'micro',
+      gini: 0.5189,
+    });
+    mockRows([]);
+    mockRows(ngaCapture);
+    const latest = await service.getPoverty(
+      { ...baseOpts, countries: ['all'], year: 'MRV' },
+      createMockContext(),
+    );
+    expect(latest.rows[0]).toMatchObject({
+      countryCode: 'NGA',
+      reportingYear: 2026,
+      estimationType: 'extrapolation',
+      estimateType: 'nowcast',
+      distributionType: 'micro',
+      gini: null,
+    });
+    mockRows(groupCapture);
+    const aggregate = await service.getPoverty(
+      { ...baseOpts, countries: ['WLD'], year: 'MRV' },
+      createMockContext(),
+    );
+    expect(aggregate.rows[0]).toMatchObject({
+      estimationType: 'actual',
+      estimateType: 'actual',
+      distributionType: null,
+    });
+  });
+
+  it('preserves separate estimate and distribution classifications without inferring survey defaults', async () => {
+    mockRows([surveyRow('BRA', 2022, { distribution_type: 'micro' })]);
+    const survey = await service.getPoverty(
+      { ...baseOpts, countries: ['BRA'], fillGaps: false },
+      createMockContext(),
+    );
+    expect(survey.rows[0]).toMatchObject({
+      estimationType: 'survey',
+      estimateType: null,
+      distributionType: 'micro',
+      gini: 0.417,
+    });
+
+    mockRows([]);
+    mockRows([
+      gapFilledRow('BRA', 2026, {
+        estimation_type: 'extrapolation',
+        estimate_type: 'nowcast',
+        distribution_type: 'micro',
+      }),
+    ]);
+    const latest = await service.getPoverty(
+      { ...baseOpts, countries: ['BRA'], year: 'MRV' },
+      createMockContext(),
+    );
+    expect(latest.rows[0]).toMatchObject({
+      reportingYear: 2026,
+      estimationType: 'extrapolation',
+      estimateType: 'nowcast',
+      distributionType: 'micro',
+    });
+  });
+
+  it('retains the selected survey row classifications over its gap-filled twin', async () => {
+    mockRows([surveyRow('BRA', 2022, { distribution_type: 'micro' })]);
+    mockRows([
+      gapFilledRow('BRA', 2022, { estimate_type: 'actual', distribution_type: 'imputed' }),
+    ]);
+    const result = await service.getPoverty(
+      { ...baseOpts, countries: ['BRA'], year: 'all' },
+      createMockContext(),
+    );
+    expect(result.rows[0]).toMatchObject({
+      estimationType: 'survey',
+      estimateType: null,
+      distributionType: 'micro',
+    });
+  });
+
+  it.each([
+    ['actual', 'micro'],
+    ['projection', 'group'],
+    ['nowcast', 'imputed'],
+    [null, null],
+  ])(
+    'passes upstream estimate %j and distribution %j through without reinterpretation',
+    async (estimateType, distributionType) => {
+      mockRows([
+        surveyRow('BRA', 2022, {
+          estimate_type: estimateType,
+          distribution_type: distributionType,
+        }),
+      ]);
+      const result = await service.getPoverty(
+        { ...baseOpts, countries: ['BRA'], fillGaps: false },
+        createMockContext(),
+      );
+      expect(result.rows[0]).toMatchObject({
+        estimateType,
+        distributionType,
+        estimationType: 'survey',
+      });
+    },
+  );
+
+  it('preserves aggregate estimate classifications and absent provenance as null', async () => {
+    mockRows([groupRow('WLD', 2026, { estimate_type: 'nowcast' })]);
+    const result = await service.getPoverty(
+      { ...baseOpts, countries: ['WLD'], year: 'MRV' },
+      createMockContext(),
+    );
+    expect(result.rows[0]).toMatchObject({
+      estimationType: 'nowcast',
+      estimateType: 'nowcast',
+      distributionType: null,
+    });
+    mockRows([surveyRow('BRA', 2022)]);
+    const sparse = await service.getPoverty(
+      { ...baseOpts, countries: ['BRA'] },
+      createMockContext(),
+    );
+    expect(sparse.rows[0]).toMatchObject({ estimateType: null, distributionType: null });
+  });
+
   it('returns the inequality block on a survey year and asks upstream once', async () => {
     mockRows([surveyRow('USA', 2022)]);
     const result = await service.getPoverty(baseOpts, createMockContext());
@@ -584,20 +720,34 @@ describe('PipService', () => {
     expect(pipCalls()[0]).not.toContain('per_page');
   });
 
-  it('caps a page at 70 estimates, slicing and counting pages at the capped size', async () => {
+  it.each([50, 69, 70, 71, 1000, 1001])(
+    'serves estimate page size %i at the endpoint maximum only',
+    async (requested) => {
+      const years = Array.from({ length: 200 }, (_, index) => 1800 + index);
+      mockRows(years.map((year) => surveyRow('USA', year)));
+      const result = await service.getPoverty(
+        { ...baseOpts, year: 'all', fillGaps: false, perPage: requested },
+        createMockContext(),
+      );
+      const served = Math.min(requested, 1000);
+      expect(result).toMatchObject({ total: 200, perPage: served, pages: Math.ceil(200 / served) });
+      expect(result.rows.map((row) => row.reportingYear)).toEqual(years.slice(0, served));
+    },
+  );
+
+  it('serves a requested page beyond the former estimate cap', async () => {
     const years = Array.from({ length: 200 }, (_, index) => 1800 + index);
     mockRows(years.map((year) => surveyRow('USA', year)));
 
     const result = await service.getPoverty(
-      { ...baseOpts, year: 'all', fillGaps: false, page: 2, perPage: 1000 },
+      { ...baseOpts, year: 'all', fillGaps: false, page: 2, perPage: 100 },
       createMockContext(),
     );
 
-    expect(result).toMatchObject({ total: 200, perPage: 70, page: 2, pages: 3 });
-    expect(result.rows).toHaveLength(70);
-    // Page 2 at the capped size starts right after page 1's 70 rows.
-    expect(result.rows[0]?.reportingYear).toBe(1870);
-    expect(result.rows.at(-1)?.reportingYear).toBe(1939);
+    expect(result).toMatchObject({ total: 200, perPage: 100, page: 2, pages: 2 });
+    expect(result.rows).toHaveLength(100);
+    expect(result.rows[0]?.reportingYear).toBe(1900);
+    expect(result.rows.at(-1)?.reportingYear).toBe(1999);
   });
 
   it('leaves a page size under the cap as requested and echoes it', async () => {

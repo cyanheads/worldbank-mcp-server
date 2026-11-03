@@ -425,6 +425,8 @@ function normalizeRow(raw: RawPipRow): PovertyRow {
     surveyComparability: raw.survey_comparability ?? null,
     comparableSpell: raw.comparable_spell ?? null,
     estimationType: raw.estimation_type ?? '',
+    estimateType: raw.estimate_type ?? null,
+    distributionType: raw.distribution_type ?? null,
     isInterpolated: raw.is_interpolated ?? false,
     isAggregate: false,
     popInPoverty: null,
@@ -463,6 +465,8 @@ function normalizeGroupRow(raw: RawPipGroupRow): PovertyRow {
     surveyComparability: null,
     comparableSpell: null,
     estimationType: raw.estimate_type ?? '',
+    estimateType: raw.estimate_type ?? null,
+    distributionType: raw.distribution_type ?? null,
     isInterpolated: null,
     isAggregate: true,
     popInPoverty: raw.pop_in_poverty ?? null,
@@ -764,10 +768,10 @@ export class PipService {
         : [],
     );
 
-    const releaseVersion = entries.reduce(
-      (newest, entry) => (entry.releaseVersion > newest ? entry.releaseVersion : newest),
-      '',
-    );
+    let releaseVersion = '';
+    for (const entry of entries) {
+      if (entry.releaseVersion > releaseVersion) releaseVersion = entry.releaseVersion;
+    }
     if (!releaseVersion) {
       throw serializationError('PIP returned a versions listing that names no data release.');
     }

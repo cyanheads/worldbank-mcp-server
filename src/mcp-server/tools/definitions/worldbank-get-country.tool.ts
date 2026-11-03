@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import {
   COUNTRY_CODE,
   COUNTRY_CODE_MESSAGE,
@@ -97,18 +98,22 @@ export const worldbankGetCountry = tool('worldbank_get_country', {
   },
 
   format: (result) => {
-    const lines: string[] = [`# ${result.name} (${result.id})`];
-    lines.push(`**ISO2:** ${result.iso2 || 'N/A'}`);
+    const lines: string[] = [
+      `${escapeMarkdownInline(result.name)} (${escapeMarkdownInline(result.id)})`,
+    ];
+    lines.push(`**ISO2:** ${escapeMarkdownInline(result.iso2 || 'N/A')}`);
     lines.push(
-      `**Region:** ${result.region.name || result.region.id || 'N/A'} (${result.region.id})`,
+      `**Region:** ${escapeMarkdownInline(result.region.name || result.region.id || 'N/A')} (${escapeMarkdownInline(result.region.id)})`,
     );
     lines.push(
-      `**Income Level:** ${result.incomeLevel.name || result.incomeLevel.id || 'N/A'} (${result.incomeLevel.id})`,
+      `**Income Level:** ${escapeMarkdownInline(result.incomeLevel.name || result.incomeLevel.id || 'N/A')} (${escapeMarkdownInline(result.incomeLevel.id)})`,
     );
-    lines.push(`**Lending Type:** ${result.lendingType || 'N/A'}`);
-    if (result.capitalCity) lines.push(`**Capital:** ${result.capitalCity}`);
+    lines.push(`**Lending Type:** ${escapeMarkdownInline(result.lendingType || 'N/A')}`);
+    if (result.capitalCity) lines.push(`**Capital:** ${escapeMarkdownInline(result.capitalCity)}`);
     if (result.longitude && result.latitude) {
-      lines.push(`**Coordinates:** ${result.latitude}, ${result.longitude}`);
+      lines.push(
+        `**Coordinates:** ${escapeMarkdownInline(result.latitude)}, ${escapeMarkdownInline(result.longitude)}`,
+      );
     }
     lines.push(`**Is Aggregate:** ${result.isAggregate ? 'Yes' : 'No'}`);
     return [{ type: 'text', text: lines.join('\n') }];

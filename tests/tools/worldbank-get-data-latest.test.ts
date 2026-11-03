@@ -417,7 +417,7 @@ describe('a call with neither date_range nor mrv', () => {
       dataRequests.map((url) =>
         ['date', 'page', 'per_page'].map((k) => url.searchParams.get(k)).join(' '),
       ),
-    ).toEqual(['1900:2100 1 50', '1900:2100 2 200']);
+    ).toEqual(['1900:2100 1 50', '1900:2100 2 1000']);
   });
 
   it('maps page N to upstream page N, serving its rows and upstream totals', async () => {
@@ -712,7 +712,7 @@ describe('mrnev', () => {
           indicator_id: 'SP.POP.TOTL',
           countries: 'all',
           mrnev: 3,
-          per_page: 1000,
+          per_page: 201,
           page,
         }),
       );
@@ -722,11 +722,9 @@ describe('mrnev', () => {
 
     for (const { structured } of pages) {
       expect(structured).toMatchObject({ totalCount: 900, totalPages: 5 });
-      expect(structured.appliedFilters).toMatchObject({ perPage: 200, requestedPerPage: 1000 });
+      expect(structured.appliedFilters).toMatchObject({ perPage: 201 });
     }
-    expect(pages.map(({ structured }) => structured.data.length)).toEqual([
-      200, 200, 200, 200, 100,
-    ]);
+    expect(pages.map(({ structured }) => structured.data.length)).toEqual([201, 201, 201, 201, 96]);
     const served = pages.flatMap(({ structured }) => cells(structured.data));
     expect(new Set(served).size).toBe(900);
     expect(served.slice(0, 3)).toEqual(truth(WIDE, ['E001'], ['2006', '2005', '2004']));

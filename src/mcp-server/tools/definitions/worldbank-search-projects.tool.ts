@@ -7,18 +7,14 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline, markdownLink } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 import { pagePastEndNotice } from '@/mcp-server/tools/page-past-end-notice.js';
 import { pageSizeReducedNotice } from '@/mcp-server/tools/page-size-reduced-notice.js';
+import { normalizeSectorNames } from '@/services/projects/normalize-sector-names.js';
 import { toPortfolioCode } from '@/services/projects/portfolio-country-codes.js';
 import { getProjectsService } from '@/services/projects/projects-service.js';
-import {
-  MAX_ABSTRACT_CHARS,
-  MAX_PROJECTS_PER_PAGE,
-  MAX_PROJECTS_PER_PAGE_WITH_ABSTRACT,
-  RESPONSE_BUDGET_KB,
-  shorten,
-} from '@/services/response-budget.js';
+import { MAX_PROJECTS_PER_PAGE } from '@/services/response-budget.js';
 import { splitCountryCodes } from '@/services/worldbank/identifiers.js';
 import { getWorldBankApiService } from '@/services/worldbank/worldbank-service.js';
 
@@ -81,7 +77,7 @@ function isCalendarDate(value: string): boolean {
 export const worldbankSearchProjects = tool('worldbank_search_projects', {
   title: 'Search World Bank Projects',
   description:
-    'Search the World Bank lending portfolio — the individual loans, credits, and grants the Bank finances — by free text, country, region, status, financing window (IBRD, IDA, Grants, Other), and board approval date. Returns the project ID, name, borrowing country, region, status, board approval and closing dates, the commitment amount in USD with its IBRD, IDA, and grant parts, financing windows, major sectors, and a link to the project page. This is the operations catalogue, not the statistics catalogue: use it for "what is the World Bank funding in Kenya", "which climate adaptation projects are active", or "how much was committed to education in South Asia since 2020". For development statistics and time series, use worldbank_search_indicators and worldbank_get_data instead. Countries take the ISO3 or ISO2 codes the other tools take (BRA or BR), and multi-country operations carry a World Bank regional code such as 3A; WDI aggregates such as SSF or WLD are rejected, since the portfolio lists operations by economy — use region for those. Every filter is an exact match upstream and combines with the others by AND, so a narrow search can legitimately return nothing; when it does, the response says whether the country codes matched anything on their own.',
+    'Search the World Bank lending portfolio — the individual loans, credits, and grants the Bank finances — by free text, country, region, status, sector names, financing window (IBRD, IDA, Grants, Other), and board approval date. For classified education commitments use sector: ["Education"], rather than a free-text education query. Returns the project ID, name, borrowing country, region, status, board approval and closing dates, the commitment amount in USD with its IBRD, IDA, and grant parts, financing windows, major sectors, and a link to the project page. This is the operations catalogue, not the statistics catalogue: use it for "what is the World Bank funding in Kenya", "which climate adaptation projects are active", or "how much was committed to education in South Asia since 2020". For development statistics and time series, use worldbank_search_indicators and worldbank_get_data instead. Countries take the ISO3 or ISO2 codes the other tools take (BRA or BR), and multi-country operations carry a World Bank regional code such as 3A; WDI aggregates such as SSF or WLD are rejected, since the portfolio lists operations by economy — use region for those. Every filter is an exact match upstream and combines with the others by AND, so a narrow search can legitimately return nothing; when it does, the response says whether the country codes matched anything on their own.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   inputAliases: { limit: 'per_page' },
   input: z.object({
@@ -113,6 +109,12 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
       .optional()
       .describe(
         'Lifecycle stages to include, combined as OR. "Active" is under implementation, "Pipeline" is approved but not yet effective, "Closed" has finished disbursing, and "Dropped" was abandoned before approval. Most of the portfolio is closed, so omitting this returns mostly historical operations.',
+      ),
+    sector: z
+      .array(z.string().describe('A sector name, optionally prefixed FY17 - .'))
+      .optional()
+      .describe(
+        'Exact sector names, such as Education or FY17 - Social Protection, combined as OR across bare and FY17 spellings. Use names copied from the Projects API sector_exact facet, not sector codes. Unknown names return no matches; each name must be nonblank and contain no caret. Combines with other filters by AND.',
       ),
     region: z
       .array(z.enum(PROJECT_REGIONS))
@@ -154,17 +156,16 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
       .boolean()
       .default(false)
       .describe(
-        `Include each project's abstract. Abstracts run long — a median of roughly 1,200 characters, up to 8,000 — so a page carrying them holds at most ${MAX_PROJECTS_PER_PAGE_WITH_ABSTRACT} projects rather than ${MAX_PROJECTS_PER_PAGE}, and an abstract longer than ${MAX_ABSTRACT_CHARS.toLocaleString('en-US')} characters (about 2% of them) is cut there and marked with …, with notice naming the projects cut and each project's url leading to the full text; leave this off while narrowing a search and turn it on once the result set is small enough to read. Projects that publish no abstract report null either way, which appliedFilters.includeAbstract distinguishes.`,
+        "Include each project's complete abstract without changing page size. A project with no abstract reports null; appliedFilters.includeAbstract distinguishes omission from unavailable text.",
       ),
     page: z.number().int().min(1).default(1).describe('Pagination page number (1-based).'),
     per_page: z
       .number()
       .int()
       .min(1)
-      .max(1000)
       .optional()
       .describe(
-        `Results per page (default: server default, max: 1000). One page holds at most ${MAX_PROJECTS_PER_PAGE} projects, or ${MAX_PROJECTS_PER_PAGE_WITH_ABSTRACT} with include_abstract, which keeps a response within about ${RESPONSE_BUDGET_KB} KB; a larger value, the server default included, is reduced to that cap and echoed as appliedFilters.perPage, and totalPages is counted at the reduced size; notice discloses the reduction whenever the result runs past one page.`,
+        'Results per page (default: server default). Positive integers above 1000 are served at that maximum with the requested and served sizes echoed and a notice. totalPages uses the served size.',
       ),
   }),
   output: z.object({
@@ -232,7 +233,7 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
               .string()
               .nullable()
               .describe(
-                `Project abstract, cut at ${MAX_ABSTRACT_CHARS.toLocaleString('en-US')} characters and marked with … when longer. Null when include_abstract was not requested and when the project publishes none — appliedFilters.includeAbstract separates the two.`,
+                'Complete project abstract. Null when include_abstract was not requested or the project publishes none; appliedFilters.includeAbstract distinguishes them.',
               ),
             url: z.string().describe('Project page on projects.worldbank.org.'),
           })
@@ -255,6 +256,12 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
           ),
         status: z.string().optional().describe('Statuses applied, omitted when none.'),
         region: z.string().optional().describe('Regions applied, omitted when none.'),
+        sector: z
+          .array(z.string())
+          .optional()
+          .describe(
+            'Sector names applied, deduplicated with the leading FY17 prefix removed; omitted when none.',
+          ),
         financialType: z
           .string()
           .optional()
@@ -297,11 +304,15 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
       .string()
       .optional()
       .describe(
-        'Context for an empty result set — including whether the country filter matched anything on its own — for a page past the end of the results, for a page size reduced to the page cap, or naming the projects whose abstracts were cut.',
+        'Context for an empty result set — including whether the country filter matched anything on its own — for a page past the end of the results, or for a page size reduced to the maximum.',
       ),
   },
 
   enrichmentTrailer: {
+    notice: {
+      render: (notice) =>
+        notice === undefined ? '' : `**Notice:** ${escapeMarkdownInline(notice)}`,
+    },
     appliedFilters: {
       /**
        * A per-field `render` replaces the whole trailer line, `label` included,
@@ -309,15 +320,28 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
        */
       render: (filters) =>
         `**Applied Filters:** ${[
-          ...(filters.query === undefined ? [] : [`query=${filters.query}`]),
-          ...(filters.countries === undefined ? [] : [`countries=${filters.countries}`]),
-          ...(filters.status === undefined ? [] : [`status=${filters.status}`]),
-          ...(filters.region === undefined ? [] : [`region=${filters.region}`]),
+          ...(filters.query === undefined ? [] : [`query=${escapeMarkdownInline(filters.query)}`]),
+          ...(filters.countries === undefined
+            ? []
+            : [`countries=${escapeMarkdownInline(filters.countries)}`]),
+          ...(filters.status === undefined
+            ? []
+            : [`status=${escapeMarkdownInline(filters.status)}`]),
+          ...(filters.region === undefined
+            ? []
+            : [`region=${escapeMarkdownInline(filters.region)}`]),
+          ...(filters.sector === undefined
+            ? []
+            : [`sector=${filters.sector.map(escapeMarkdownInline).join(', ')}`]),
           ...(filters.financialType === undefined
             ? []
-            : [`financial_type=${filters.financialType}`]),
-          ...(filters.approvedFrom === undefined ? [] : [`approved_from=${filters.approvedFrom}`]),
-          ...(filters.approvedTo === undefined ? [] : [`approved_to=${filters.approvedTo}`]),
+            : [`financial_type=${escapeMarkdownInline(filters.financialType)}`]),
+          ...(filters.approvedFrom === undefined
+            ? []
+            : [`approved_from=${escapeMarkdownInline(filters.approvedFrom)}`]),
+          ...(filters.approvedTo === undefined
+            ? []
+            : [`approved_to=${escapeMarkdownInline(filters.approvedTo)}`]),
           `include_abstract=${filters.includeAbstract}`,
           `page=${filters.page}`,
           `per_page=${filters.perPage}${filters.requestedPerPage === undefined ? '' : ` (requested ${filters.requestedPerPage})`}`,
@@ -326,6 +350,15 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
   },
 
   errors: [
+    {
+      reason: 'invalid_sector_name',
+      code: JsonRpcErrorCode.ValidationError,
+      severity: 'notice',
+      when: 'A sector name is blank after normalization or contains a caret separator.',
+      recovery:
+        'Send each nonblank sector name in its own array element, without caret separators.',
+      thrownBy: 'service',
+    },
     {
       reason: 'invalid_country_code',
       severity: 'notice',
@@ -379,6 +412,7 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
     const codes = input.countries === undefined ? [] : splitCountryCodes(input.countries);
     const statuses = input.status ?? [];
     const regions = input.region ?? [];
+    const sectors = normalizeSectorNames(input.sector ?? []);
     const financialTypes = input.financial_type ?? [];
     const query = input.query?.trim() ? input.query.trim() : undefined;
     const approvedFrom = input.approved_from || undefined;
@@ -518,12 +552,13 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
           countryCodes,
           statuses: [...statuses],
           regions: [...regions],
+          ...(sectors.length > 0 && { sectors }),
           financialTypes: [...financialTypes],
           ...(approvedFrom !== undefined && { approvedFrom }),
           ...(approvedTo !== undefined && { approvedTo }),
           includeAbstract: input.include_abstract,
           page: input.page,
-          perPage,
+          perPage: Math.min(perPage, MAX_PROJECTS_PER_PAGE),
         },
         ctx,
       );
@@ -555,6 +590,7 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
         ...(countryCodes.length > 0 && { countries: countryCodes.join(',') }),
         ...(statuses.length > 0 && { status: statuses.join(',') }),
         ...(regions.length > 0 && { region: regions.join(',') }),
+        ...(sectors.length > 0 && { sector: sectors }),
         ...(financialTypes.length > 0 && { financialType: financialTypes.join(',') }),
         ...(approvedFrom !== undefined && { approvedFrom }),
         ...(approvedTo !== undefined && { approvedTo }),
@@ -566,7 +602,12 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
     });
     ctx.enrich({ totalCount: result.total, currentPage: result.page, totalPages: result.pages });
 
+    const notices: string[] = [];
     if (result.total === 0) {
+      const sectorAdvice =
+        sectors.length > 0
+          ? ' Sector names match exactly across bare and FY17 spellings. Check the sector name or remove the sector filter and retry.'
+          : '';
       /**
        * An exact-match filter that matches nothing is a plain zero-hit upstream,
        * so an empty result has to say which filter emptied it. The enum-backed
@@ -579,14 +620,15 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
         ...(query === undefined ? [] : ['query']),
         ...(statuses.length > 0 ? ['status'] : []),
         ...(regions.length > 0 ? ['region'] : []),
+        ...(sectors.length > 0 ? ['sector'] : []),
         ...(financialTypes.length > 0 ? ['financial_type'] : []),
         ...(approvedFrom === undefined ? [] : ['approved_from']),
         ...(approvedTo === undefined ? [] : ['approved_to']),
       ];
 
       if (result.countryOnlyTotal === 0) {
-        ctx.enrich.notice(
-          `No project carries country code(s) ${codeList}, with every other filter removed: either the portfolio uses no such code, or that economy has no World Bank lending history. Economies are searched by ISO2, an ISO3 code resolved to it, and multi-country operations by a regional code such as 3A.`,
+        notices.push(
+          `No project carries country code(s) ${codeList}, with every other filter removed: either the portfolio uses no such code, or that economy has no World Bank lending history. Economies are searched by ISO2, an ISO3 code resolved to it, and multi-country operations by a regional code such as 3A.${sectorAdvice}`,
         );
       } else if (result.countryOnlyTotal !== null) {
         /**
@@ -598,65 +640,37 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
           countryCodes.length > 1
             ? ' That count is for the codes combined, so one of them may still be unused by the portfolio — re-run with a single code to check it on its own.'
             : '';
-        ctx.enrich.notice(
-          `No project matches every filter at once. Country code(s) ${codeList} match ${result.countryOnlyTotal} projects with every other filter removed, so ${otherFilters.join(', ')} narrowed the result to nothing — drop or widen ${otherFilters.length === 1 ? 'it' : 'one of them'} and retry.${perCodeCaveat}`,
+        notices.push(
+          `No project matches every filter at once. Country code(s) ${codeList} match ${result.countryOnlyTotal} projects with every other filter removed, so ${otherFilters.join(', ')} narrowed the result to nothing — drop or widen ${otherFilters.length === 1 ? 'it' : 'one of them'} and retry.${perCodeCaveat}${sectorAdvice}`,
         );
       } else {
         // No probe count to lean on, so name every filter in force, countries included.
         const applied = [...(countryCodes.length > 0 ? ['countries'] : []), ...otherFilters];
-        ctx.enrich.notice(
-          `No project matches this search. Filters combine by AND and match exactly${applied.length > 0 ? ` — ${applied.join(', ')} ${applied.length === 1 ? 'was' : 'were'} applied` : ''}. Widen the date window, add statuses, or drop words from the query, which requires every word to appear.`,
+        notices.push(
+          `No project matches this search. Filters combine by AND and match exactly${applied.length > 0 ? ` — ${applied.join(', ')} ${applied.length === 1 ? 'was' : 'were'} applied` : ''}. Widen the date window, add statuses, or drop words from the query, which requires every word to appear.${sectorAdvice}`,
         );
       }
-    } else {
-      const cut = result.projects.flatMap((project) =>
-        project.abstract !== null && project.abstract.length > MAX_ABSTRACT_CHARS
-          ? [project.id]
-          : [],
-      );
-      const notices = [
-        ...(result.projects.length === 0
-          ? [
-              pagePastEndNotice({
-                noun: ['project', 'projects'],
-                page: result.page,
-                pages: result.pages,
-                perPage: result.perPage,
-                total: result.total,
-              }),
-            ]
-          : []),
-        pageSizeReducedNotice({
-          requested: perPage,
-          served: result.perPage,
+    } else if (result.projects.length === 0) {
+      notices.push(
+        pagePastEndNotice({
+          noun: ['project', 'projects'],
           page: result.page,
           pages: result.pages,
-          ...(input.include_abstract && {
-            condition: `with include_abstract on (${MAX_PROJECTS_PER_PAGE} with include_abstract off)`,
-          }),
+          perPage: result.perPage,
+          total: result.total,
         }),
-        ...(cut.length > 0
-          ? [
-              cut.length === 1
-                ? `The abstract of ${cut[0]} runs past ${MAX_ABSTRACT_CHARS.toLocaleString('en-US')} characters and is cut there, marked with …; the project page at url carries the full text.`
-                : `The abstracts of ${new Intl.ListFormat('en', { type: 'conjunction' }).format(cut)} run past ${MAX_ABSTRACT_CHARS.toLocaleString('en-US')} characters and are cut there, marked with …; each project page at url carries the full text.`,
-            ]
-          : []),
-      ].filter((notice) => notice !== undefined);
-      if (notices.length > 0) ctx.enrich.notice(notices.join(' '));
+      );
     }
+    const reduced = pageSizeReducedNotice({
+      requested: perPage,
+      served: result.perPage,
+      page: result.page,
+      pages: result.pages,
+    });
+    if (reduced) notices.push(reduced);
+    if (notices.length > 0) ctx.enrich.notice(notices.join(' '));
 
-    /**
-     * The heaviest 8-row page of whole abstracts reaches ~69 KB, and 295 of the
-     * portfolio's 14,779 published abstracts run past the ceiling (2026-09-25).
-     */
-    return {
-      projects: result.projects.map((project) =>
-        project.abstract === null
-          ? project
-          : { ...project, abstract: shorten(project.abstract, MAX_ABSTRACT_CHARS) },
-      ),
-    };
+    return { projects: result.projects };
   },
 
   format: (result) => {
@@ -669,39 +683,34 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
       value === null ? 'null' : value.toLocaleString('en-US');
 
     /**
-     * The breakdown shares the total's line, unbolded and in the same USD, and
-     * names only the parts that add to it: a null or zero part is left out, and
-     * so is a single remaining part equal to the total, which says nothing the
-     * total does not. structuredContent carries every part, nulls and zeros
-     * included.
+     * Preserve every component's identity, including nulls, zeros, and a sole
+     * component equal to the total, on the rendered surface as well.
      */
     const breakdown = (project: (typeof result.projects)[number]) => {
       const parts = Object.entries({
         ibrdCommitment: project.ibrdCommitment,
         idaCommitment: project.idaCommitment,
         grantAmount: project.grantAmount,
-      }).filter(([, value]) => value !== null && value !== 0);
-      if (parts.length === 0) return '';
-      if (parts.length === 1 && parts[0]?.[1] === project.totalCommitment) return '';
+      });
       return ` (${parts.map(([field, value]) => `${field} ${amount(value)}`).join(' · ')})`;
     };
 
     /**
-     * Six lines a project keep an 80-row page inside the response budget. A row
-     * with no abstract gets no abstract line: format() sees only the rows, and
+     * A row with no abstract gets no abstract line: format() sees only the rows, and
      * the applied-filters trailer's include_abstract says whether abstracts were
      * requested at all.
      */
     for (const project of result.projects) {
       lines.push(
-        `\n## ${project.name} (${project.id})`,
-        `- **status:** ${project.status || 'unknown'} | **countryName:** ${project.countryName} | **countryCodes:** ${project.countryCodes.join(', ') || 'none'} | **regionName:** ${project.regionName}`,
-        `- **boardApprovalDate:** ${project.boardApprovalDate} | **closingDate:** ${project.closingDate}`,
-        `- **totalCommitment:** ${amount(project.totalCommitment)}${project.totalCommitment === null ? '' : ' USD'}${breakdown(project)} | **financialTypes:** ${project.financialTypes.join(', ') || 'none'}`,
-        `- **majorSectors:** ${project.majorSectors.join(', ') || 'none'}`,
-        `- **url:** ${project.url}`,
+        `\n${escapeMarkdownInline(project.name)} (${escapeMarkdownInline(project.id)})`,
+        `- **status:** ${escapeMarkdownInline(project.status || 'unknown')} | **countryName:** ${escapeMarkdownInline(project.countryName)} | **countryCodes:** ${project.countryCodes.map(escapeMarkdownInline).join(', ') || 'none'} | **regionName:** ${escapeMarkdownInline(project.regionName)}`,
+        `- **boardApprovalDate:** ${escapeMarkdownInline(String(project.boardApprovalDate))} | **closingDate:** ${escapeMarkdownInline(String(project.closingDate))}`,
+        `- **totalCommitment:** ${amount(project.totalCommitment)}${project.totalCommitment === null ? '' : ' USD'}${breakdown(project)} | **financialTypes:** ${project.financialTypes.map(escapeMarkdownInline).join(', ') || 'none'}`,
+        `- **majorSectors:** ${project.majorSectors.map(escapeMarkdownInline).join(', ') || 'none'}`,
+        `- **url:** ${markdownLink(project.url, project.url)}`,
       );
-      if (project.abstract !== null) lines.push(`- **abstract:** ${project.abstract}`);
+      if (project.abstract !== null)
+        lines.push(`- **abstract:** ${escapeMarkdownInline(project.abstract)}`);
     }
 
     return [{ type: 'text', text: lines.join('\n') }];

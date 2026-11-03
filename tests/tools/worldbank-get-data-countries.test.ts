@@ -224,8 +224,8 @@ describe('worldbank_get_data country handling, end to end', () => {
       expect(structured.data.map((d) => d.countryCode)).toEqual(['BJ', 'BF']);
       expect(structured.appliedFilters.countries).toBe('BJ;BF');
       const text = textOf(result);
-      expect(text).toContain('## Benin (BJ / BEN)');
-      expect(text).toContain('## Burkina Faso (BF / BFA)');
+      expect(text).toContain('Benin (BJ / BEN)');
+      expect(text).toContain('Burkina Faso (BF / BFA)');
       expect(text).toContain('countries=BJ;BF');
     },
   );
@@ -389,9 +389,9 @@ describe('worldbank_get_data country handling, end to end', () => {
       ['1W', 'WLD', true],
     ]);
     const text = textOf(result);
-    expect(text).toContain('## High income (XD / HIC) [Aggregate]');
-    expect(text).toContain('## Not classified (XY / INX) [Aggregate]');
-    expect(text).toContain('## Low income (XM / LIC) [Aggregate]');
+    expect(text).toContain('High income (XD / HIC) [Aggregate]');
+    expect(text).toContain('Not classified (XY / INX) [Aggregate]');
+    expect(text).toContain('Low income (XM / LIC) [Aggregate]');
     // The data request and the one country listing — the fill costs no request.
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
@@ -407,8 +407,8 @@ describe('worldbank_get_data country handling, end to end', () => {
       ['KE', 'KEN', false],
     ]);
     const text = textOf(result);
-    expect(text).toContain('## Brazil (BR / BRA)');
-    expect(text).toContain('## Kenya (KE / KEN)');
+    expect(text).toContain('Brazil (BR / BRA)');
+    expect(text).toContain('Kenya (KE / KEN)');
   });
 
   it('keeps a row the index does not carry as upstream sent it', async () => {
@@ -420,7 +420,7 @@ describe('worldbank_get_data country handling, end to end', () => {
       ['QQ', ''],
       ['XD', 'ODD'],
     ]);
-    expect(textOf(result)).toContain('## Somewhere (QQ)\n');
+    expect(textOf(result)).toContain('Somewhere (QQ)\n');
   });
 
   // ─── Lesotho and the edge firewall ────────────────────────────────────────
@@ -447,7 +447,7 @@ describe('worldbank_get_data country handling, end to end', () => {
         ['ZA', 'ZAF'],
       ]);
       expect(structured.appliedFilters.countries).toBe(echoed);
-      expect(textOf(result)).toContain('## Lesotho (LS / LSO)');
+      expect(textOf(result)).toContain('Lesotho (LS / LSO)');
     },
   );
 

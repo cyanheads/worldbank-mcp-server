@@ -227,6 +227,193 @@ describe('WorldBankApiService.getData — source-scoped path', () => {
 
   // ─── Routing and the default release ──────────────────────────────────────
 
+  describe('explicit source validation and discovery', () => {
+    const id = 'IND_Kerala_IN.KL_1495_IND016';
+    const options = {
+      sourceId: '50',
+      indicatorId: 'SP.POP.TOTL',
+      countries: id,
+      page: 1,
+      perPage: 1,
+    };
+    function selectedRoutes() {
+      return {
+        '/v2/source/50': [
+          { page: 1, pages: 1, total: 1 },
+          [{ id: '50', name: 'Subnational Population' }],
+        ],
+        '/v2/source/50/indicator/SP.POP.TOTL': catalog([
+          'SP.POP.TOTL',
+          'Population, total',
+          '50',
+          'Subnational Population',
+        ]),
+        '/v2/sources/50/concepts': concepts('50', 'Subnational Population', [
+          'Country',
+          'Series',
+          'Time',
+        ]),
+        '/v2/sources/50/country': listing('50', 'Country', [[id, 'Kerala']]),
+        '/v2/sources/50/time': listing('50', 'Time', [
+          ['YR2010', '2010'],
+          ['YR2015', '2015'],
+        ]),
+        '/v2/country': COUNTRY_INDEX,
+        [`/v2/sources/50/country/${id}/series/SP.POP.TOTL`]: data('50', [
+          { country: [id, 'Kerala'], time: 'YR2010', value: 34213000 },
+          { country: [id, 'Kerala'], time: 'YR2015', value: 34325000 },
+        ]),
+      };
+    }
+    it('discovers opaque IDs unchanged and paginates past the end', async () => {
+      route(selectedRoutes());
+      const first = await service.listCountries(
+        { sourceId: '50', includeAggregates: false, page: 1, perPage: 1 },
+        createMockContext(),
+      );
+      expect(first.countries).toEqual([{ id, name: 'Kerala', sourceId: '50' }]);
+      const past = await service.listCountries(
+        { sourceId: '50', includeAggregates: false, page: 2, perPage: 1 },
+        createMockContext(),
+      );
+      expect(past).toMatchObject({ countries: [], total: 1, pages: 1 });
+      const data = await service.getData(
+        { ...options, countries: first.countries[0]!.id },
+        createMockContext(),
+      );
+      expect(data).toMatchObject({
+        total: 2,
+        pages: 2,
+        sourceId: '50',
+        data: [{ countryCode: id, countryIso3: '', value: 34325000 }],
+      });
+      expect((await service.getData({ ...options, page: 3 }, createMockContext())).data).toEqual(
+        [],
+      );
+    });
+    it.each([
+      { region: 'SAS' },
+      { incomeLevel: 'LMC' },
+      { lendingType: 'IDX' },
+      { includeAggregates: true },
+    ])('rejects unsupported source filters %j', async (filter) => {
+      route(selectedRoutes());
+      await expect(
+        service.listCountries(
+          { sourceId: '50', includeAggregates: false, page: 1, perPage: 50, ...filter },
+          createMockContext(),
+        ),
+      ).rejects.toMatchObject({ data: { reason: 'unsupported_source_filter' } });
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+    it('rejects a fabricated source without switching datasets', async () => {
+      route({ '/v2/source/99999991': DATA_NOT_FOUND_XML });
+      await expect(
+        service.getData({ ...options, sourceId: '99999991' }, createMockContext()),
+      ).rejects.toMatchObject({ data: { reason: 'source_not_found' } });
+      expect(requestedPaths()).toEqual(['/v2/source/99999991']);
+    });
+    it('rejects a fabricated series before requesting observations', async () => {
+      route({ ...selectedRoutes(), '/v2/source/50/indicator/ZZ.FAKE.91017': DATA_NOT_FOUND_XML });
+      await expect(
+        service.getData({ ...options, indicatorId: 'ZZ.FAKE.91017' }, createMockContext()),
+      ).rejects.toMatchObject({ data: { reason: 'indicator_not_found' } });
+      expect(requestedPaths().some((path) => path.includes('/series/'))).toBe(false);
+    });
+    it('rejects a fabricated entity before accepting ambiguous id160 as empty', async () => {
+      route(selectedRoutes());
+      await expect(
+        service.getData({ ...options, countries: 'ZZ_FAKE_91017' }, createMockContext()),
+      ).rejects.toMatchObject({ data: { reason: 'country_not_found' } });
+    });
+    it('accepts id160 as empty only for a validated scope', async () => {
+      route({
+        ...selectedRoutes(),
+        [`/v2/sources/50/country/${id}/series/SP.POP.TOTL`]: DATA_NOT_FOUND_XML,
+      });
+      expect(await service.getData(options, createMockContext())).toMatchObject({
+        data: [],
+        total: 0,
+        sourceId: '50',
+      });
+    });
+    it.each([{ mrv: 1 }, { mrnev: 1 }])('preserves latest selection %j', async (selection) => {
+      route(selectedRoutes());
+      expect(
+        await service.getData({ ...options, ...selection }, createMockContext()),
+      ).toMatchObject({ data: [{ date: '2015', value: 34325000 }], total: 1 });
+    });
+    it('rejects dimension values when the selected source has no extra dimension', async () => {
+      route(selectedRoutes());
+      await expect(
+        service.getData({ ...options, dimensionValue: 'fake' }, createMockContext()),
+      ).rejects.toMatchObject({ data: { reason: 'dimension_not_applicable' } });
+    });
+  });
+
+  it('selects source 50 directly and preserves canonical subnational identifiers', async () => {
+    const kerala = 'IND_Kerala_IN.KL_1495_IND016';
+    const assam = 'IND_Assam_IN.AS_1487_IND004';
+    route({
+      '/v2/source/50': [
+        { page: 1, pages: 1, total: 1 },
+        [{ id: '50', name: 'Subnational Population' }],
+      ],
+      '/v2/source/50/indicator/SP.POP.TOTL': catalog([
+        'SP.POP.TOTL',
+        'Population, total',
+        '50',
+        'Subnational Population',
+      ]),
+      '/v2/sources/50/concepts': concepts('50', 'Subnational Population', [
+        'Country',
+        'Series',
+        'Time',
+      ]),
+      '/v2/sources/50/country': listing('50', 'Country', [
+        [kerala, 'Kerala'],
+        [assam, 'Assam'],
+      ]),
+      '/v2/sources/50/time': listing('50', 'Time', [
+        ['YR2010', '2010'],
+        ['YR2015', '2015'],
+      ]),
+      '/v2/country': COUNTRY_INDEX,
+      [`/v2/sources/50/country/${encodeURIComponent(`${kerala};${assam}`)}/series/SP.POP.TOTL`]:
+        data('50', [
+          { country: [kerala, 'Kerala'], time: 'YR2010', value: 34213000 },
+          { country: [kerala, 'Kerala'], time: 'YR2015', value: 34325000 },
+          { country: [assam, 'Assam'], time: 'YR2010', value: 31718000 },
+          { country: [assam, 'Assam'], time: 'YR2015', value: 33611000 },
+        ]),
+    });
+    const result = await service.getData(
+      {
+        sourceId: '50',
+        indicatorId: 'SP.POP.TOTL',
+        countries: [kerala.toLowerCase(), assam],
+        dateRange: '2010:2015',
+        page: 1,
+        perPage: 50,
+      },
+      createMockContext(),
+    );
+    expect(
+      result.data.map((row) => [row.countryCode, row.countryIso3, row.date, row.value]),
+    ).toEqual([
+      [assam, '', '2015', 33611000],
+      [assam, '', '2010', 31718000],
+      [kerala, '', '2015', 34325000],
+      [kerala, '', '2010', 34213000],
+    ]);
+    expect(result.sourceScoped).toMatchObject({
+      sourceId: '50',
+      sourceName: 'Subnational Population',
+      dimension: null,
+    });
+    expect(requestedPaths()).not.toContain('/v2/country/IND/indicator/SP.POP.TOTL');
+  });
+
   it('serves an id-175 indicator from its catalog source at the newest release holding data', async () => {
     route(
       archiveRoutes({
@@ -1049,7 +1236,7 @@ describe('WorldBankApiService.getData — source-scoped path', () => {
     expect(past).toMatchObject({ total: 3, pages: 2, page: 9, data: [] });
   });
 
-  it('pages a scope larger than the served size at 200 rows, contiguously', async () => {
+  it('pages a scope above the former cap at 201 rows, contiguously', async () => {
     const years = Array.from({ length: 450 }, (_, i) => 2025 - i);
     route(
       archiveRoutes({
@@ -1072,15 +1259,15 @@ describe('WorldBankApiService.getData — source-scoped path', () => {
           countries: ['SDN'],
           dimensionValue: '202503',
           page,
-          perPage: 1000,
+          perPage: 201,
         },
         ctx,
       );
     const pages = [await call(1), await call(2), await call(3), await call(4)];
 
-    expect(pages.map((p) => p.data.length)).toEqual([200, 200, 50, 0]);
+    expect(pages.map((p) => p.data.length)).toEqual([201, 201, 48, 0]);
     expect(pages.map((p) => [p.perPage, p.pages, p.total])).toEqual(
-      Array.from({ length: 4 }, () => [200, 3, 450]),
+      Array.from({ length: 4 }, () => [201, 3, 450]),
     );
     expect(pages.flatMap((p) => p.data.map((d) => d.value))).toEqual(years);
   });

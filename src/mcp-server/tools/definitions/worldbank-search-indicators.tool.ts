@@ -6,6 +6,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 import { pagePastEndNotice } from '@/mcp-server/tools/page-past-end-notice.js';
 import { INDICATOR_NOTE_EXCERPT_CHARS, shorten } from '@/services/response-budget.js';
@@ -123,6 +124,10 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
   },
 
   enrichmentTrailer: {
+    notice: {
+      render: (notice) =>
+        notice === undefined ? '' : `**Notice:** ${escapeMarkdownInline(notice)}`,
+    },
     appliedFilters: {
       /**
        * A per-field `render` replaces the whole trailer line, `label` included,
@@ -131,9 +136,15 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
        */
       render: (filters) =>
         `**Applied Filters:** ${[
-          ...(filters.query === undefined ? [] : [`query="${filters.query}"`]),
-          ...(filters.topicId === undefined ? [] : [`topic_id=${filters.topicId}`]),
-          ...(filters.sourceId === undefined ? [] : [`source_id=${filters.sourceId}`]),
+          ...(filters.query === undefined
+            ? []
+            : [`query="${escapeMarkdownInline(filters.query)}"`]),
+          ...(filters.topicId === undefined
+            ? []
+            : [`topic_id=${escapeMarkdownInline(filters.topicId)}`]),
+          ...(filters.sourceId === undefined
+            ? []
+            : [`source_id=${escapeMarkdownInline(filters.sourceId)}`]),
         ].join(', ')}`,
     },
   },
@@ -262,14 +273,16 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
   format: (result) => {
     const lines: string[] = [];
     for (const ind of result.indicators) {
-      lines.push(`### ${ind.name}`);
+      lines.push(escapeMarkdownInline(ind.name));
       lines.push(
-        `**ID:** \`${ind.id}\` | **Source:** ${ind.sourceName || 'N/A'} (ID: ${ind.sourceId || 'N/A'})`,
+        `**ID:** ${escapeMarkdownInline(ind.id)} | **Source:** ${escapeMarkdownInline(ind.sourceName || 'N/A')} (ID: ${escapeMarkdownInline(ind.sourceId || 'N/A')})`,
       );
       if (ind.topics.length > 0) {
-        lines.push(`**Topics:** ${ind.topics.map((t) => `${t.name} (${t.id})`).join(', ')}`);
+        lines.push(
+          `**Topics:** ${ind.topics.map((t) => `${escapeMarkdownInline(t.name)} (${escapeMarkdownInline(t.id)})`).join(', ')}`,
+        );
       }
-      if (ind.sourceNote) lines.push(ind.sourceNote);
+      if (ind.sourceNote) lines.push(escapeMarkdownInline(ind.sourceNote));
     }
     return [{ type: 'text', text: lines.join('\n') }];
   },

@@ -1,10 +1,11 @@
 /**
  * @fileoverview List World Bank data sources (datasets). Provides source IDs and names
- * for filtering worldbank_search_indicators by dataset origin.
+ * for filtering indicator searches, data retrieval, and country listings by dataset.
  * @module mcp-server/tools/definitions/worldbank-list-sources.tool
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 import { pagePastEndNotice } from '@/mcp-server/tools/page-past-end-notice.js';
 import { getWorldBankApiService } from '@/services/worldbank/worldbank-service.js';
@@ -12,7 +13,7 @@ import { getWorldBankApiService } from '@/services/worldbank/worldbank-service.j
 export const worldbankListSources = tool('worldbank_list_sources', {
   title: 'List World Bank Data Sources',
   description:
-    'List the 70+ World Bank data sources (datasets), such as World Development Indicators, International Debt Statistics, and Doing Business. Returns source IDs and names for use as source_id in worldbank_search_indicators, one page at a time.',
+    'List the 70+ World Bank data sources (datasets), such as World Development Indicators, International Debt Statistics, and Doing Business. Returns source IDs and names for use as source_id in worldbank_search_indicators, worldbank_get_data, and worldbank_list_countries, one page at a time.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   inputAliases: { limit: 'per_page' },
   input: z.object({
@@ -30,7 +31,11 @@ export const worldbankListSources = tool('worldbank_list_sources', {
       .array(
         z
           .object({
-            id: z.string().describe('Source ID for use in worldbank_search_indicators.'),
+            id: z
+              .string()
+              .describe(
+                'Source ID for use in worldbank_search_indicators, worldbank_get_data, and worldbank_list_countries.',
+              ),
             name: z.string().describe('Dataset name.'),
             code: z.string().describe('Short dataset code.'),
             lastUpdated: z.string().describe('Date of last data update (YYYY-MM-DD or empty).'),
@@ -87,12 +92,15 @@ export const worldbankListSources = tool('worldbank_list_sources', {
   format: (result) => {
     const lines: string[] = [];
     for (const s of result.sources) {
-      lines.push(`### ${s.name} (ID: ${s.id}, Code: ${s.code || 'N/A'})`);
-      if (s.lastUpdated) lines.push(`**Last updated:** ${s.lastUpdated}`);
-      if (s.dataAvailability) lines.push(`**Data availability:** ${s.dataAvailability}`);
+      lines.push(
+        `${escapeMarkdownInline(s.name)} (ID: ${escapeMarkdownInline(s.id)}, Code: ${escapeMarkdownInline(s.code || 'N/A')})`,
+      );
+      if (s.lastUpdated) lines.push(`**Last updated:** ${escapeMarkdownInline(s.lastUpdated)}`);
+      if (s.dataAvailability)
+        lines.push(`**Data availability:** ${escapeMarkdownInline(s.dataAvailability)}`);
       if (s.metadataAvailability)
-        lines.push(`**Metadata availability:** ${s.metadataAvailability}`);
-      if (s.concepts) lines.push(`**Concepts:** ${s.concepts}`);
+        lines.push(`**Metadata availability:** ${escapeMarkdownInline(s.metadataAvailability)}`);
+      if (s.concepts) lines.push(`**Concepts:** ${escapeMarkdownInline(s.concepts)}`);
     }
     if (lines.length === 0) lines.push('No sources returned.');
     return [{ type: 'text', text: lines.join('\n') }];

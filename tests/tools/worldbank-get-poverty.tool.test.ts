@@ -49,6 +49,8 @@ const surveyRow = {
   surveyComparability: 3,
   comparableSpell: '2019 - 2023',
   estimationType: 'survey',
+  estimateType: null,
+  distributionType: 'micro',
   isInterpolated: false,
   isAggregate: false,
   popInPoverty: null,
@@ -69,6 +71,7 @@ const gapFilledRow = {
   surveyComparability: null,
   comparableSpell: null,
   estimationType: 'interpolation',
+  estimateType: 'actual',
   isInterpolated: true,
 };
 
@@ -127,6 +130,36 @@ describe('worldbankGetPoverty', () => {
   });
 
   // ─── Survey year ──────────────────────────────────────────────────────────
+
+  it('renders both nullable provenance fields on both response surfaces', async () => {
+    await stubService({
+      rows: [
+        surveyRow,
+        { ...gapFilledRow, estimateType: 'nowcast', distributionType: null },
+        {
+          ...surveyRow,
+          countryCode: 'WLD',
+          isAggregate: true,
+          estimationType: 'actual',
+          estimateType: 'actual',
+          distributionType: null,
+        },
+      ],
+      total: 3,
+    });
+    const tool = await loadTool();
+    const result = await runToolContract(tool, { countries: ['USA', 'IND'] });
+    expect(result.structuredContent).toMatchObject({
+      estimates: [
+        { estimateType: null, distributionType: 'micro' },
+        { estimateType: 'nowcast', distributionType: null },
+        { estimateType: 'actual', distributionType: null },
+      ],
+    });
+    expect(textOf(result)).toContain('**estimateType:** null | **distributionType:** micro');
+    expect(textOf(result)).toContain('**estimateType:** nowcast | **distributionType:** null');
+    expect(textOf(result)).toContain('**estimateType:** actual | **distributionType:** null');
+  });
 
   it('returns the inequality block for a survey year', async () => {
     await stubService({ rows: [surveyRow], total: 1 });
@@ -334,78 +367,23 @@ describe('worldbankGetPoverty', () => {
     expect(textOf(result)).toContain('Page 2 is past the end of the results');
   });
 
-  // ─── Output budget ────────────────────────────────────────────────────────
-
-  it('discloses a page reduced to the cap on both surfaces, with the size that continues it', async () => {
+  it.each([0, 1, 2584])('discloses maximum clamp with total %i', async (total) => {
     const getPoverty = await stubService({
-      rows: [surveyRow],
-      total: 2584,
-      page: 1,
-      pages: 37,
-      perPage: 70,
+      rows: total ? [gapFilledRow] : [],
+      total,
+      pages: Math.max(1, Math.ceil(total / 1000)),
+      perPage: 1000,
+      gapFilled: total > 0,
     });
     const tool = await loadTool();
-    const result = await runToolContract(tool, {
-      countries: 'all',
-      year: 'all',
-      fill_gaps: false,
-      per_page: 1000,
-    });
-
+    const result = await runToolContract(tool, { countries: 'all', per_page: 1001 });
     expect(getPoverty.mock.calls[0]?.[0]).toMatchObject({ perPage: 1000 });
-    const structured = result.structuredContent as Record<string, unknown>;
-    expect(structured).toMatchObject({
-      appliedFilters: { perPage: 70, requestedPerPage: 1000 },
-      totalCount: 2584,
-      totalPages: 37,
+    expect(result.structuredContent).toMatchObject({
+      appliedFilters: { perPage: 1000, requestedPerPage: 1001 },
     });
-    const notice = structured.notice as string;
-    expect(notice).toMatch(/per_page=1000 was reduced to 70, the most one page holds/);
-    expect(notice).toMatch(/50 KB/);
-    expect(notice).toMatch(
-      /totalPages counts pages of 70, so page 2 with the same filters continues/,
-    );
-    const text = textOf(result);
-    expect(text).toContain('per_page=70 (requested 1000)');
-    expect(text).toContain('per_page=1000 was reduced to 70');
+    expect(textOf(result)).toContain('per_page=1001 was reduced to 1000');
+    if (total) expect(textOf(result)).toContain('Some rows are gap-filled');
   });
-
-  it('keeps the gap-filled caveat alongside the reduction', async () => {
-    await stubService({ rows: [gapFilledRow], total: 500, pages: 8, perPage: 70, gapFilled: true });
-    const tool = await loadTool();
-    const ctx = createMockContext({ errors: tool.errors });
-    await tool.handler(tool.input.parse({ countries: 'IND', per_page: 500 }), ctx);
-
-    const notice = getEnrichment(ctx).notice as string;
-    expect(notice).toMatch(/per_page=500 was reduced to 70/);
-    expect(notice).toMatch(/Some rows are gap-filled/);
-  });
-
-  /**
-   * One estimate fits on one page at the served 70, the page per_page=1000 would
-   * have served too, so there is no reduction to disclose; the echo still carries both sizes.
-   */
-  it.each([
-    [1, [surveyRow]],
-    [2, []],
-  ])(
-    'discloses no reduction on page %i when the whole result fits on one page',
-    async (page, rows) => {
-      await stubService({ rows, total: 1, page, pages: 1, perPage: 70 });
-      const tool = await loadTool();
-      const result = await runToolContract(tool, { countries: 'USA', per_page: 1000, page });
-
-      expect(result.structuredContent).toMatchObject({
-        appliedFilters: { perPage: 70, requestedPerPage: 1000 },
-        totalPages: 1,
-      });
-      expect((result.structuredContent as { notice?: string }).notice ?? '').not.toMatch(
-        /was reduced/,
-      );
-      expect(textOf(result)).not.toContain('was reduced');
-      expect(textOf(result)).toContain('per_page=70 (requested 1000)');
-    },
-  );
 
   it('echoes no requestedPerPage when the requested size fit', async () => {
     await stubService({ rows: [surveyRow], total: 1 });
@@ -435,26 +413,16 @@ describe('worldbankGetPoverty', () => {
     expect(textOf(result)).toContain('per_page=5');
   });
 
-  it('holds limit to the page cap exactly as per_page, disclosing the reduction', async () => {
-    await stubService({ rows: [surveyRow], total: 200, page: 1, pages: 3, perPage: 70 });
-    const tool = await loadTool();
-    const result = await runToolContract(tool, { countries: 'all', limit: 1000 } as never);
-
-    expect(result.structuredContent).toMatchObject({
-      appliedFilters: { perPage: 70, requestedPerPage: 1000 },
-    });
-    expect(textOf(result)).toContain('per_page=1000 was reduced to 70');
-  });
-
-  it('rejects a limit past the per_page maximum under the per_page bound', async () => {
+  it('clamps limit just as per_page', async () => {
+    const getPoverty = await stubService({ rows: [surveyRow], total: 1 });
     const tool = await loadTool();
     const result = await runToolContract(tool, { countries: 'USA', limit: 5000 } as never);
-
-    expect(result.isError).toBe(true);
+    expect(result.isError).toBeFalsy();
+    expect(getPoverty.mock.calls[0]?.[0]).toMatchObject({ perPage: 1000 });
     expect(result.structuredContent).toMatchObject({
-      error: { code: JsonRpcErrorCode.InvalidParams },
+      appliedFilters: { perPage: 1000, requestedPerPage: 5000 },
     });
-    expect(textOf(result)).toContain('per_page');
+    expect(textOf(result)).toContain('per_page=5000 was reduced to 1000');
   });
 
   it('flags a page past the end at the page size limit asked for', async () => {

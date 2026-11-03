@@ -113,6 +113,103 @@ describe('worldbankSearchProjects', () => {
 
   // ─── Results ──────────────────────────────────────────────────────────────
 
+  it('passes normalized sector names and echoes them on both surfaces', async () => {
+    const search = await stubService({ projects: [project], total: 77, pages: 8, page: 2 });
+    const tool = await loadTool();
+    const result = await runToolContract(tool, {
+      sector: ['FY17 - Social Protection', 'Social Protection', ' Primary Education '],
+      region: ['South Asia'],
+      page: 2,
+      per_page: 10,
+    });
+    expect(search.mock.calls[0]?.[0]).toMatchObject({
+      sectors: ['Social Protection', 'Primary Education'],
+      regions: ['South Asia'],
+      page: 2,
+      perPage: 10,
+    });
+    expect(result.structuredContent).toMatchObject({
+      appliedFilters: { sector: ['Social Protection', 'Primary Education'] },
+      totalCount: 77,
+      totalPages: 8,
+      currentPage: 2,
+    });
+    expect(textOf(result)).toContain('sector=Social Protection, Primary Education');
+  });
+
+  it('offers an actionable notice when a sector name has no matches', async () => {
+    await stubService({ projects: [], total: 0 });
+    const tool = await loadTool();
+    const result = await runToolContract(tool, { sector: ['Invented Sector'] });
+    expect(result.structuredContent).toMatchObject({
+      appliedFilters: { sector: ['Invented Sector'] },
+      totalCount: 0,
+    });
+    expect(textOf(result)).toContain('sector');
+    expect(textOf(result)).toContain('remove');
+  });
+
+  it('retains country diagnostics when a sector search is empty', async () => {
+    await stubService({ projects: [], total: 0, countryOnlyTotal: 10 });
+    const tool = await loadTool();
+    const result = await runToolContract(tool, { countries: 'BR', sector: ['Invented Sector'] });
+    expect(textOf(result)).toContain('match 10 projects');
+    expect(textOf(result)).toContain('sector narrowed');
+    expect(textOf(result)).toContain('remove the sector filter');
+  });
+
+  it.each(['', ' ', 'FY17 - ', 'Education^Health'])(
+    'reports invalid sector name %j with recovery on both surfaces',
+    async (sector) => {
+      const search = await stubService({});
+      const tool = await loadTool();
+      const result = await runToolContract(tool, { sector: [sector] });
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ValidationError,
+          data: {
+            reason: 'invalid_sector_name',
+            retryable: false,
+            recovery: {
+              hint: 'Send each nonblank sector name in its own array element, without caret separators.',
+            },
+          },
+        },
+      });
+      expect(textOf(result)).toContain('reason invalid_sector_name');
+      expect(textOf(result)).toContain('Send each nonblank sector name');
+      expect(search).not.toHaveBeenCalled();
+    },
+  );
+
+  it('leaves an empty sector array unset', async () => {
+    const search = await stubService({ projects: [project], total: 1 });
+    const tool = await loadTool();
+    const result = await runToolContract(tool, { sector: [] });
+    expect(search.mock.calls[0]?.[0]).not.toHaveProperty('sectors');
+    expect(result.structuredContent).not.toHaveProperty('appliedFilters.sector');
+    expect(textOf(result)).not.toContain('sector=');
+  });
+
+  it('preserves the sector filter and continuation for a page past the end', async () => {
+    await stubService({ projects: [], total: 3, page: 3, pages: 2 });
+    const tool = await loadTool();
+    const result = await runToolContract(tool, {
+      sector: ['FY17 - Education'],
+      page: 3,
+      per_page: 2,
+    });
+    expect(result.structuredContent).toMatchObject({
+      appliedFilters: { sector: ['Education'], page: 3, perPage: 2 },
+      totalCount: 3,
+      currentPage: 3,
+      totalPages: 2,
+    });
+    expect(textOf(result)).toContain('sector=Education');
+    expect(textOf(result)).toContain('Page 3 is past the end');
+  });
+
   it('returns the projects the service resolved', async () => {
     await stubService({ projects: [project, sparseProject], total: 2 });
     const tool = await loadTool();
@@ -293,7 +390,7 @@ describe('worldbankSearchProjects', () => {
     expect(tool.input.safeParse({ approved_from: '2020-01-01' }).success).toBe(true);
     expect(tool.input.safeParse({ approved_from: '2020' }).success).toBe(false);
     expect(tool.input.safeParse({ approved_to: '01/01/2020' }).success).toBe(false);
-    expect(tool.input.safeParse({ per_page: 1001 }).success).toBe(false);
+    expect(tool.input.safeParse({ per_page: 1001 }).success).toBe(true);
     expect(tool.input.safeParse({ page: 0 }).success).toBe(false);
   });
 
@@ -623,163 +720,44 @@ describe('worldbankSearchProjects', () => {
     );
   });
 
-  // ─── Output budget ────────────────────────────────────────────────────────
-
-  it('discloses a page reduced to the abstract cap on both surfaces, with the size that continues it', async () => {
-    const searchProjects = await stubService({
-      projects: [{ ...project, abstract: 'Rehabilitation of the dam.' }],
-      total: 28_113,
-      page: 1,
-      pages: 3515,
-      perPage: 8,
-    });
-    const tool = await loadTool();
-    const result = await runToolContract(tool, { per_page: 1000, include_abstract: true });
-
-    expect(searchProjects.mock.calls[0]?.[0]).toMatchObject({
-      perPage: 1000,
-      includeAbstract: true,
-    });
-    const structured = result.structuredContent as Record<string, unknown>;
-    expect(structured).toMatchObject({
-      appliedFilters: { perPage: 8, requestedPerPage: 1000, includeAbstract: true },
-      totalCount: 28_113,
-      totalPages: 3515,
-    });
-    const notice = structured.notice as string;
-    expect(notice).toMatch(/per_page=1000 was reduced to 8/);
-    expect(notice).toMatch(/80 with include_abstract off/);
-    expect(notice).toMatch(/50 KB/);
-    expect(notice).toMatch(
-      /totalPages counts pages of 8, so page 2 with the same filters continues/,
-    );
-    expect(notice).not.toMatch(/never shortened/);
-    // Nothing on this page ran past the abstract ceiling, so no project is named as cut.
-    expect(notice).not.toMatch(/cut there/);
-    const text = textOf(result);
-    expect(text).toContain('per_page=8 (requested 1000)');
-    expect(text).toContain('per_page=1000 was reduced to 8');
-  });
-
-  // ─── Abstract ceiling ─────────────────────────────────────────────────────
-
-  it('returns an abstract of up to 5,000 characters whole', async () => {
-    const whole = 'a'.repeat(5000);
-    await stubService({ projects: [{ ...project, abstract: whole }], total: 1 });
-    const tool = await loadTool();
-    const result = await runToolContract(tool, { query: 'P513080', include_abstract: true });
-
-    expect(result.structuredContent).toMatchObject({ projects: [{ abstract: whole }] });
-    expect(textOf(result)).toContain(`**abstract:** ${whole}`);
-    expect(textOf(result)).not.toContain('…');
-    expect((result.structuredContent as { notice?: string }).notice).toBeUndefined();
-  });
-
-  it('cuts a longer abstract at 5,000 characters on both surfaces and names the projects cut', async () => {
-    const long = { ...project, abstract: `${'b'.repeat(5000)}TAIL` };
-    const second = { ...project, id: 'P100002', abstract: `${'c'.repeat(7999)}.` };
-    const short = { ...project, id: 'P100003', abstract: 'Rehabilitation of the dam.' };
-    await stubService({ projects: [long, short, second], total: 3 });
-    const tool = await loadTool();
-    const result = await runToolContract(tool, { query: 'dam', include_abstract: true });
-
-    const structured = result.structuredContent as {
-      projects: Array<{ id: string; abstract: string | null }>;
-      notice: string;
-    };
-    expect(structured.projects.map((p) => p.abstract?.length)).toEqual([5001, 26, 5001]);
-    expect(structured.projects[0]?.abstract).toBe(`${'b'.repeat(5000)}…`);
-    expect(structured.projects[1]?.abstract).toBe('Rehabilitation of the dam.');
-    expect(structured.notice).toMatch(
-      /The abstracts of P513080 and P100002 run past 5,000 characters and are cut there, marked with …/,
-    );
-    expect(structured.notice).toMatch(/project page at url/);
-    const text = textOf(result);
-    expect(text).toContain(`**abstract:** ${'b'.repeat(5000)}…`);
-    expect(text).not.toContain('TAIL');
-    expect(text).toContain('The abstracts of P513080 and P100002 run past 5,000 characters');
-  });
-
-  it('names a single cut project in the singular', async () => {
-    await stubService({ projects: [{ ...project, abstract: 'd'.repeat(6000) }], total: 1 });
-    const tool = await loadTool();
-    const ctx = createMockContext({ errors: tool.errors });
-    await tool.handler(tool.input.parse({ query: 'P513080', include_abstract: true }), ctx);
-
-    expect(getEnrichment(ctx).notice).toMatch(
-      /^The abstract of P513080 runs past 5,000 characters and is cut there, marked with …/,
-    );
-  });
-
-  it('describes the abstract ceiling where include_abstract and abstract are described', async () => {
-    const tool = await loadTool();
-    const item = (
-      tool.output.shape.projects as unknown as {
-        element: { shape: Record<string, { description?: string }> };
-      }
-    ).element.shape;
-    const includeAbstract = (tool.input.shape.include_abstract as { description?: string })
-      .description;
-    expect(includeAbstract).toMatch(/5,000 characters/);
-    expect(includeAbstract).not.toMatch(/whole/);
-    expect(item.abstract?.description).toMatch(/5,000 characters/);
-  });
-
-  it('holds the server default to the same cap', async () => {
-    await stubService({ projects: [project], total: 100, pages: 13, perPage: 8 });
-    const tool = await loadTool();
-    const ctx = createMockContext({ errors: tool.errors });
-    await tool.handler(tool.input.parse({ include_abstract: true }), ctx);
-
-    const enrichment = getEnrichment(ctx);
-    expect(enrichment).toMatchObject({ appliedFilters: { perPage: 8, requestedPerPage: 50 } });
-    expect(enrichment.notice).toMatch(/per_page=50 was reduced to 8/);
-  });
-
-  /**
-   * A result that fits on one page at the served size is the page the requested
-   * size would have served too, so there is no reduction to disclose, with or
-   * without abstracts; the echo still carries both sizes.
-   */
-  it.each([
-    [false, 80, 1, [project]],
-    [true, 8, 1, [project]],
-    [false, 80, 2, []],
-  ])(
-    'discloses no reduction when the whole result fits on one page (include_abstract %s, %i served, page %i)',
-    async (includeAbstract, served, page, projects) => {
-      await stubService({ projects, total: 1, page, pages: 1, perPage: served });
+  it.each([false, true])(
+    'serves the maximum with complete abstracts: %s',
+    async (includeAbstract) => {
+      const abstract = 'b'.repeat(5000) + 'TAIL';
+      const searchProjects = await stubService({ projects: [{ ...project, abstract }], total: 1 });
       const tool = await loadTool();
       const result = await runToolContract(tool, {
-        per_page: 1000,
+        per_page: 1001,
         include_abstract: includeAbstract,
-        page,
       });
-
+      expect(searchProjects.mock.calls[0]?.[0]).toMatchObject({ perPage: 1000, includeAbstract });
       expect(result.structuredContent).toMatchObject({
-        appliedFilters: { perPage: served, requestedPerPage: 1000 },
-        totalPages: 1,
+        projects: [{ abstract }],
+        appliedFilters: { perPage: 1000, requestedPerPage: 1001, includeAbstract },
       });
-      expect((result.structuredContent as { notice?: string }).notice ?? '').not.toMatch(
-        /was reduced/,
-      );
-      expect(textOf(result)).not.toContain('was reduced');
-      expect(textOf(result)).toContain(`per_page=${served} (requested 1000)`);
+      expect(textOf(result)).toContain(abstract);
+      expect(textOf(result)).toContain('per_page=1001 was reduced to 1000');
     },
   );
 
-  it('keeps the page-past-end notice alongside the reduction', async () => {
-    await stubService({ projects: [], total: 100, page: 90, pages: 2, perPage: 80 });
+  it.each([0, 1])('discloses maximum clamping with total %i', async (total) => {
+    await stubService({ projects: [], total, page: 2, pages: 1, perPage: 1000 });
     const tool = await loadTool();
-    const ctx = createMockContext({ errors: tool.errors });
-    await tool.handler(tool.input.parse({ page: 90, per_page: 1000 }), ctx);
+    const result = await runToolContract(tool, { page: 2, per_page: 1001 });
+    expect(result.structuredContent).toMatchObject({
+      appliedFilters: { perPage: 1000, requestedPerPage: 1001 },
+    });
+    expect(textOf(result)).toContain('per_page=1001 was reduced to 1000');
+    expect(textOf(result)).toContain(total === 0 ? 'No project matches' : 'Page 2 is past the end');
+  });
 
-    const notice = getEnrichment(ctx).notice as string;
-    expect(notice).toMatch(
-      /^Page 90 is past the end of the results — 100 projects span 2 pages \(1–2\) at per_page=80\./,
-    );
-    expect(notice).toMatch(/per_page=1000 was reduced to 80, the most one page holds/);
-    expect(notice).not.toMatch(/include_abstract off/);
+  it('serves the default 50 with abstracts', async () => {
+    const searchProjects = await stubService({ projects: [project], total: 100, pages: 2 });
+    const tool = await loadTool();
+    const result = await runToolContract(tool, { include_abstract: true });
+    expect(searchProjects.mock.calls[0]?.[0]).toMatchObject({ perPage: 50 });
+    expect(result.structuredContent).toMatchObject({ appliedFilters: { perPage: 50 } });
+    expect(textOf(result)).not.toContain('was reduced');
   });
 
   it('echoes no requestedPerPage when the requested size fit', async () => {
@@ -912,7 +890,9 @@ describe('worldbankSearchProjects', () => {
 
     // The sparse row reports its gaps rather than rendering blanks.
     expect(text).toContain('**closingDate:** null');
-    expect(text).toContain('**totalCommitment:** null | **financialTypes:** none');
+    expect(text).toContain(
+      '**totalCommitment:** null (ibrdCommitment null · idaCommitment null · grantAmount null) | **financialTypes:** none',
+    );
     expect(text).toContain('**majorSectors:** none');
     expect(text).toContain('**countryCodes:** none | **regionName:** Other');
   });
@@ -962,14 +942,16 @@ describe('worldbankSearchProjects', () => {
       ],
     });
     const text = textOf(result);
-    expect(text).toContain('**totalCommitment:** 22,000,000 USD | **financialTypes:** Grants');
-    // The published zero stays in structuredContent; the text names only the parts that add up.
     expect(text).toContain(
-      '**totalCommitment:** 880,000,000 USD (ibrdCommitment 610,000,000 · grantAmount 270,000,000)',
+      '**totalCommitment:** 22,000,000 USD (ibrdCommitment null · idaCommitment null · grantAmount 22,000,000) | **financialTypes:** Grants',
+    );
+    // Both surfaces preserve the published zero.
+    expect(text).toContain(
+      '**totalCommitment:** 880,000,000 USD (ibrdCommitment 610,000,000 · idaCommitment 0 · grantAmount 270,000,000)',
     );
   });
 
-  it('prints only the non-zero published breakdown parts, and none when one part is the whole total', async () => {
+  it('prints null, zero, and sole-equal-total commitment components', async () => {
     const tool = await loadTool();
     const ibrdOnly = {
       ...project,
@@ -983,12 +965,19 @@ describe('worldbankSearchProjects', () => {
     const [block] = tool.format?.({ projects: [ibrdOnly, project, sparseProject] }) ?? [];
     const text = (block as { text: string }).text;
 
-    // One published part equal to the total adds nothing, so no parenthetical.
-    expect(text).toContain('**totalCommitment:** 50,000,000 USD | **financialTypes:** IBRD');
-    // A zero part drops out like a null one, leaving IBRD as the whole total.
-    expect(text).toContain('**totalCommitment:** 41,800,000 USD | **financialTypes:** IBRD, Other');
-    expect(text).toContain('**totalCommitment:** null | **financialTypes:** none');
-    expect(text).not.toMatch(/(ibrdCommitment|idaCommitment|grantAmount) (null|0\b)/);
+    // A single component retains its identity even when equal to the total.
+    expect(text).toContain(
+      '**totalCommitment:** 50,000,000 USD (ibrdCommitment 50,000,000 · idaCommitment null · grantAmount null) | **financialTypes:** IBRD',
+    );
+    // Zero and null are distinct published values.
+    expect(text).toContain(
+      '**totalCommitment:** 41,800,000 USD (ibrdCommitment 41,800,000 · idaCommitment 0 · grantAmount null) | **financialTypes:** IBRD, Other',
+    );
+    expect(text).toContain(
+      '**totalCommitment:** null (ibrdCommitment null · idaCommitment null · grantAmount null) | **financialTypes:** none',
+    );
+    expect(text).toContain('idaCommitment 0');
+    expect(text).toContain('grantAmount null');
   });
 
   it('describes the grant amount apart from the Grants financing window', async () => {

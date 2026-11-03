@@ -624,8 +624,8 @@ describe('worldbank_get_poverty routing', () => {
     const { structured, text } = await call({ countries: 'IDX', year: '2022' });
 
     expect(structured.estimates[0]).toMatchObject({ countryCode: 'IDX', countryName: 'IDA only' });
-    expect(text).toContain('## IDA only (IDX) — 2022, aggregate');
-    expect(text).not.toMatch(/## IDA \(/);
+    expect(text).toContain('IDA only (IDX) — 2022, aggregate');
+    expect(text).not.toMatch(/IDA \(/);
   });
 
   it('names the IDA-only group as IDX when rejecting a filter beside it', async () => {
@@ -703,7 +703,7 @@ describe('worldbank_get_poverty routing', () => {
     },
   );
 
-  it('merges FCV, region and economy series at one pinned version across capped pages and MRV', async () => {
+  it('merges FCV, region and economy series at one pinned version across requested pages and MRV', async () => {
     serve(
       (params) => (params.get('fill_gaps') === 'false' ? [surveyRow('KEN', 2022)] : []),
       (params) => {
@@ -711,13 +711,13 @@ describe('worldbank_get_poverty routing', () => {
         return Array.from({ length: 40 }, (_, i) => groupRow(code, code, 1983 + i));
       },
     );
-    const input = { countries: ['FCVY', 'SSF', 'KEN'], per_page: 1000 };
+    const input = { countries: ['FCVY', 'SSF', 'KEN'], per_page: 71 };
     const first = await call(input);
     expect(first.structured).toMatchObject({ totalCount: 81, totalPages: 2 });
-    expect(first.structured.estimates).toHaveLength(70);
-    expect(first.text).toContain('per_page=1000 was reduced to 70');
+    expect(first.structured.estimates).toHaveLength(71);
+    expect(first.text).not.toContain('was reduced');
     const last = await call({ ...input, page: 2 });
-    expect(last.structured.estimates).toHaveLength(11);
+    expect(last.structured.estimates).toHaveLength(10);
     expect(last.text).toContain('(SSF)');
     const past = await call({ ...input, page: 3 });
     expect(past.structured.estimates).toEqual([]);
@@ -927,7 +927,7 @@ describe('worldbank_get_poverty routing', () => {
 
   // ─── Paging across merged sources ─────────────────────────────────────────
 
-  it('caps a merged page at 70 estimates and counts pages at that size', async () => {
+  it('serves the maximum merged page without a budget cap', async () => {
     const series = (code: string) =>
       Array.from({ length: 46 }, (_, index) => groupRow(code, code, 1981 + index));
     serve(
@@ -936,11 +936,11 @@ describe('worldbank_get_poverty routing', () => {
     );
     const { structured, text } = await call({ countries: ['SSF', 'WLD'], per_page: 1000 });
 
-    expect(structured.estimates).toHaveLength(70);
-    expect(structured).toMatchObject({ totalCount: 92, totalPages: 2, currentPage: 1 });
-    expect(structured.appliedFilters).toMatchObject({ perPage: 70, requestedPerPage: 1000 });
-    expect(structured.estimates.at(-1)).toMatchObject({ countryCode: 'WLD', reportingYear: 2004 });
-    expect(text).toContain('per_page=1000 was reduced to 70');
+    expect(structured.estimates).toHaveLength(92);
+    expect(structured).toMatchObject({ totalCount: 92, totalPages: 1, currentPage: 1 });
+    expect(structured.appliedFilters).toMatchObject({ perPage: 1000 });
+    expect(structured.estimates.at(-1)).toMatchObject({ countryCode: 'WLD', reportingYear: 2026 });
+    expect(text).not.toContain('was reduced');
   });
 
   it('pages one merged list, the last page short', async () => {

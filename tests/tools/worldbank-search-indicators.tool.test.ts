@@ -550,7 +550,7 @@ describe('worldbankSearchIndicators', () => {
       indicators: [{ id: 'SE.PRM.INPT', sourceNote: excerpt }],
     });
     const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
-    expect(text).toContain(excerpt);
+    expect(text).toContain(excerpt.replace('\n-', '\\\n\\-'));
     expect(text).not.toMatch(/<\/?br/i);
   });
 

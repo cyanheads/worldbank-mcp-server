@@ -5,6 +5,7 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { getWorldBankApiService } from '@/services/worldbank/worldbank-service.js';
 
 export const worldbankListTopics = tool('worldbank_list_topics', {
@@ -36,8 +37,8 @@ export const worldbankListTopics = tool('worldbank_list_topics', {
   format: (result) => {
     const lines: string[] = [`**Topics (${result.topics.length} total)**\n`];
     for (const t of result.topics) {
-      lines.push(`### ${t.name} (ID: ${t.id})`);
-      if (t.sourceNote) lines.push(t.sourceNote);
+      lines.push(`${escapeMarkdownInline(t.name)} (ID: ${escapeMarkdownInline(t.id)})`);
+      if (t.sourceNote) lines.push(escapeMarkdownInline(t.sourceNote));
     }
     return [{ type: 'text', text: lines.join('\n') }];
   },

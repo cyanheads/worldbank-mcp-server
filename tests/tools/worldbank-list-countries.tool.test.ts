@@ -78,6 +78,56 @@ describe('worldbankListCountries', () => {
     expect(result.countries[0]?.id).toBe('US');
   });
 
+  it('returns source entities without invented global metadata on both surfaces', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    const { worldbankListCountries } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
+    );
+    const entity = { id: 'IND_Kerala_IN.KL_1495_IND016', name: 'Kerala', sourceId: '50' };
+    const listCountries = servesAsAsked({ countries: [entity], total: 1, page: 1, pages: 1 });
+    vi.mocked(getWorldBankApiService).mockReturnValue({ listCountries } as never);
+    const result = await runToolContract(worldbankListCountries, { source_id: '50' });
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({ countries: [entity] });
+    expect(JSON.stringify(result.content)).toContain(entity.id);
+    expect(JSON.stringify(result.content)).toContain('50');
+    expect(listCountries.mock.calls[0]?.[0]).toMatchObject({
+      sourceId: '50',
+      includeAggregates: false,
+    });
+  });
+
+  it.each(['source_not_found', 'source_not_queryable', 'unsupported_source_filter'] as const)(
+    'renders source listing recovery for %s',
+    async (reason) => {
+      const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+      const { worldbankListCountries } = await import(
+        '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
+      );
+      vi.mocked(getWorldBankApiService).mockReturnValue({
+        listCountries: vi
+          .fn()
+          .mockRejectedValue(
+            new McpError(
+              reason === 'source_not_found'
+                ? JsonRpcErrorCode.NotFound
+                : JsonRpcErrorCode.ValidationError,
+              'Selected source cannot serve this listing.',
+              { reason, sourceId: '50' },
+            ),
+          ),
+      } as never);
+      const result = await runToolContract(worldbankListCountries, { source_id: '50' });
+      expect(result.structuredContent).toMatchObject({
+        error: { data: { reason, recovery: { hint: expect.any(String) } } },
+      });
+      expect(JSON.stringify(result.content)).toContain(reason);
+      expect(JSON.stringify(result.content)).toContain(
+        'Selected source cannot serve this listing.',
+      );
+    },
+  );
+
   it('populates enrichment with totalCount and pagination', async () => {
     const { worldbankListCountries } = await import(
       '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
@@ -211,22 +261,22 @@ describe('worldbankListCountries', () => {
     expect(() => worldbankListCountries.input.parse({ page: 0 })).toThrow();
   });
 
-  it('rejects per_page above maximum (301)', async () => {
+  it('accepts above-maximum requests for handler normalization', async () => {
     const { worldbankListCountries } = await import(
       '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
     );
-    expect(() => worldbankListCountries.input.parse({ per_page: 301 })).toThrow();
+    expect(() => worldbankListCountries.input.parse({ per_page: 301 })).not.toThrow();
   });
 
-  it('keeps accepting per_page up to 300, and says one page holds at most 150', async () => {
+  it('describes maximum normalization at 300', async () => {
     const { worldbankListCountries } = await import(
       '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
     );
     expect(worldbankListCountries.input.safeParse({ per_page: 300 }).success).toBe(true);
     const perPage = (worldbankListCountries.input.shape.per_page as { description?: string })
       .description;
-    expect(perPage).toMatch(/at most 150 entries/);
-    expect(perPage).toMatch(/appliedFilters\.perPage/);
+    expect(perPage).toMatch(/above 300 are served at that maximum/);
+    expect(perPage).toMatch(/requested and served sizes echoed/);
   });
 
   it('accepts include_aggregates=true', async () => {

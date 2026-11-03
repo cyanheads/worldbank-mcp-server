@@ -6,15 +6,18 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 import { pagePastEndNotice } from '@/mcp-server/tools/page-past-end-notice.js';
 import { pageSizeReducedNotice } from '@/mcp-server/tools/page-size-reduced-notice.js';
-import { MAX_OBSERVATIONS_PER_PAGE, RESPONSE_BUDGET_KB } from '@/services/response-budget.js';
+import { MAX_OBSERVATIONS_PER_PAGE } from '@/services/response-budget.js';
 import {
+  CATALOG_FILTER_ID,
   COUNTRY_LIST_CONTENT,
   INDICATOR_ID,
   INDICATOR_ID_MESSAGE,
   isAllSelector,
+  SOURCE_ID_MESSAGE,
   splitCountryCodes,
 } from '@/services/worldbank/identifiers.js';
 import { type PeriodForm, parseDateWindow, periodForm } from '@/services/worldbank/periods.js';
@@ -81,8 +84,10 @@ const SELECTION_MEANING = {
 function renderDimension(dimension: SourceScopedDisclosure['dimension']): string {
   if (!dimension) return '**Dimension:** none beyond country, series, and time';
   const applied =
-    dimension.id === null ? 'every value' : `${dimension.label ?? ''} (\`${dimension.id}\`)`;
-  return `**${dimension.concept}:** ${applied} — selection: ${dimension.selection} (${SELECTION_MEANING[dimension.selection]})`;
+    dimension.id === null
+      ? 'every value'
+      : `${escapeMarkdownInline(dimension.label ?? '')} (${escapeMarkdownInline(dimension.id)})`;
+  return `**${escapeMarkdownInline(dimension.concept)}:** ${applied} — selection: ${dimension.selection} (${SELECTION_MEANING[dimension.selection]})`;
 }
 
 /**
@@ -98,6 +103,13 @@ export const worldbankGetData = tool('worldbank_get_data', {
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   inputAliases: { limit: 'per_page' },
   input: z.object({
+    source_id: z
+      .string()
+      .regex(CATALOG_FILTER_ID, SOURCE_ID_MESSAGE)
+      .optional()
+      .describe(
+        'Select this source dataset explicitly, including subnational sources. Use worldbank_list_countries with the same source_id for its canonical entity IDs. Omission preserves the standard dataset and automatic fallback.',
+      ),
     indicator_id: z
       .string()
       .regex(INDICATOR_ID, INDICATOR_ID_MESSAGE)
@@ -184,20 +196,27 @@ export const worldbankGetData = tool('worldbank_get_data', {
       .number()
       .int()
       .min(1)
-      .max(1000)
       .optional()
       .describe(
-        `Results per page (default: server default, max: 1000). One page holds at most ${MAX_OBSERVATIONS_PER_PAGE} observations, which keeps a response within about ${RESPONSE_BUDGET_KB} KB; a larger value is reduced to that cap and echoed as appliedFilters.perPage, and totalPages is counted at the reduced size, so page + 1 continues where a page ends; notice discloses the reduction whenever the result runs past one page.`,
+        'Results per page (default: server default). Positive integers above 1000 are served at that maximum with the requested and served sizes echoed and a notice. totalPages uses the served size.',
       ),
   }),
   output: z.object({
+    sourceId: z
+      .string()
+      .optional()
+      .describe(
+        'Serving source ID, present only when established by the selected source or upstream response.',
+      ),
     data: z
       .array(
         z
           .object({
             countryCode: z
               .string()
-              .describe('ISO2 code of the country or aggregate (US, XD for High income).'),
+              .describe(
+                'ISO2 code of the country or aggregate (US, XD for High income), or the canonical opaque entity ID for a source-only entity.',
+              ),
             countryIso3: z
               .string()
               .describe(
@@ -274,7 +293,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
       })
       .optional()
       .describe(
-        'Present only when the standard data endpoint does not serve the indicator and its catalog source served the values instead. Absent for indicators the standard endpoint serves.',
+        'Present when the source-scoped data API served the explicitly selected source or an automatic fallback dataset.',
       ),
     indicator: z
       .object({
@@ -294,6 +313,10 @@ export const worldbankGetData = tool('worldbank_get_data', {
   enrichment: {
     appliedFilters: z
       .object({
+        sourceId: z
+          .string()
+          .optional()
+          .describe('Explicit source_id requested, omitted for automatic routing.'),
         indicatorId: z.string().describe('Indicator ID queried.'),
         countries: z
           .string()
@@ -358,6 +381,10 @@ export const worldbankGetData = tool('worldbank_get_data', {
   },
 
   enrichmentTrailer: {
+    notice: {
+      render: (notice) =>
+        notice === undefined ? '' : `**Notice:** ${escapeMarkdownInline(notice)}`,
+    },
     appliedFilters: {
       /**
        * A per-field `render` replaces the whole trailer line, `label` included,
@@ -367,15 +394,20 @@ export const worldbankGetData = tool('worldbank_get_data', {
        */
       render: (filters) =>
         `**Applied Filters:** ${[
-          `indicator_id=${filters.indicatorId}`,
-          `countries=${filters.countries}`,
-          ...(filters.dateRange === undefined ? [] : [`date_range=${filters.dateRange}`]),
+          `indicator_id=${escapeMarkdownInline(filters.indicatorId)}`,
+          ...(filters.sourceId === undefined
+            ? []
+            : [`source_id=${escapeMarkdownInline(filters.sourceId)}`]),
+          `countries=${escapeMarkdownInline(filters.countries)}`,
+          ...(filters.dateRange === undefined
+            ? []
+            : [`date_range=${escapeMarkdownInline(filters.dateRange)}`]),
           ...(filters.mrv === undefined ? [] : [`mrv=${filters.mrv}`]),
           ...(filters.mrnev === undefined ? [] : [`mrnev=${filters.mrnev}`]),
           ...(filters.frequency === undefined ? [] : [`frequency=${filters.frequency}`]),
           ...(filters.dimensionValue === undefined
             ? []
-            : [`dimension_value=${filters.dimensionValue}`]),
+            : [`dimension_value=${escapeMarkdownInline(filters.dimensionValue)}`]),
           `page=${filters.page}`,
           `per_page=${filters.perPage}${filters.requestedPerPage === undefined ? '' : ` (requested ${filters.requestedPerPage})`}`,
         ].join(', ')}`,
@@ -383,6 +415,20 @@ export const worldbankGetData = tool('worldbank_get_data', {
   },
 
   errors: [
+    {
+      reason: 'source_not_found',
+      severity: 'notice',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'source_id does not name a source.',
+      recovery: 'Use worldbank_list_sources to find valid source IDs.',
+    },
+    {
+      reason: 'source_not_queryable',
+      severity: 'notice',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The selected source has no supported country/series/time layout.',
+      recovery: 'Choose another source with worldbank_list_sources.',
+    },
     {
       reason: 'invalid_params',
       severity: 'notice',
@@ -557,6 +603,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
       result = await getWorldBankApiService().getData(
         {
           indicatorId: input.indicator_id,
+          ...(input.source_id?.trim() && { sourceId: input.source_id.trim() }),
           countries: codes,
           ...(dateRange !== undefined && { dateRange }),
           ...(input.mrv !== undefined && { mrv: input.mrv }),
@@ -564,12 +611,14 @@ export const worldbankGetData = tool('worldbank_get_data', {
           ...(frequency !== undefined && { frequency: FREQUENCY_FORM[frequency] }),
           ...(dimensionValue !== undefined && { dimensionValue }),
           page: input.page,
-          perPage,
+          perPage: Math.min(perPage, MAX_OBSERVATIONS_PER_PAGE),
         },
         ctx,
       );
     } catch (err) {
       if (err instanceof McpError) {
+        if (err.data?.reason === 'source_not_found' || err.data?.reason === 'source_not_queryable')
+          throw ctx.fail(err.data.reason, err.message, err.data);
         const reason = err.data?.reason as string | undefined;
         if (reason === 'indicator_not_found') {
           throw ctx.fail('indicator_not_found', err.message, {
@@ -628,6 +677,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
 
     ctx.enrich({
       appliedFilters: {
+        ...(input.source_id?.trim() && { sourceId: input.source_id.trim() }),
         indicatorId: input.indicator_id,
         countries: countryCodes,
         ...(dateRange !== undefined && { dateRange }),
@@ -718,51 +768,55 @@ export const worldbankGetData = tool('worldbank_get_data', {
       data: result.data,
       indicator: result.indicator,
       nullCount: result.nullCount,
+      ...(result.sourceId !== undefined && { sourceId: result.sourceId }),
       ...(result.sourceScoped && { sourceScoped: result.sourceScoped }),
     };
   },
 
   format: (result) => {
     const lines: string[] = [
-      `# ${result.indicator.name || result.indicator.id}`,
-      `**ID:** \`${result.indicator.id}\` | **Null values this page:** ${result.nullCount}\n`,
+      escapeMarkdownInline(result.indicator.name || result.indicator.id),
+      `**ID:** ${escapeMarkdownInline(result.indicator.id)} | **Null values this page:** ${result.nullCount}\n`,
     ];
 
     const scoped = result.sourceScoped;
+    if (result.sourceId !== undefined)
+      lines.push(`**Serving source ID:** ${escapeMarkdownInline(result.sourceId)}`);
     if (scoped) {
       lines.push(
-        `> **Source-scoped data:** ${scoped.sourceName} (source ${scoped.sourceId}). ${scoped.note}`,
-        `> ${renderDimension(scoped.dimension)}\n`,
+        `**Source-scoped data:** ${escapeMarkdownInline(scoped.sourceName)} (source ${escapeMarkdownInline(scoped.sourceId)}). ${escapeMarkdownInline(scoped.note)}`,
+        `${renderDimension(scoped.dimension)}\n`,
       );
     }
     const pinnedId = scoped?.dimension?.id;
 
     // Group by country for readability
-    const byCountry = new Map<string, typeof result.data>();
+    type Row = (typeof result.data)[number];
+    const byCountry = new Map<string, [Row, ...Row[]]>();
     for (const d of result.data) {
-      const key = `${d.countryCode}|${d.countryName}`;
-      let bucket = byCountry.get(key);
-      if (!bucket) {
-        bucket = [];
-        byCountry.set(key, bucket);
-      }
-      bucket.push(d);
+      const key = JSON.stringify([d.countryCode, d.countryName]);
+      const bucket = byCountry.get(key);
+      if (bucket) bucket.push(d);
+      else byCountry.set(key, [d]);
     }
 
-    for (const [key, rows] of byCountry) {
-      const [code, name] = key.split('|');
-      const aggTag = rows[0]?.isAggregate ? ' [Aggregate]' : '';
-      const iso3 = rows[0]?.countryIso3;
-      const iso3Str = iso3 ? ` / ${iso3}` : '';
-      lines.push(`## ${name} (${code}${iso3Str})${aggTag}`);
+    for (const rows of byCountry.values()) {
+      const { countryCode: code, countryName: name, isAggregate, countryIso3: iso3 } = rows[0];
+      const aggTag = isAggregate ? ' [Aggregate]' : '';
+      const iso3Str = iso3 ? ` / ${escapeMarkdownInline(iso3)}` : '';
+      lines.push(
+        `${escapeMarkdownInline(name)} (${escapeMarkdownInline(code)}${iso3Str})${aggTag}`,
+      );
       for (const row of rows) {
         const valStr = row.value !== null ? String(row.value) : 'No data';
-        const statusStr = row.obsStatus ? ` [obs_status: ${row.obsStatus}]` : '';
+        const statusStr = row.obsStatus
+          ? ` [obs_status: ${escapeMarkdownInline(row.obsStatus)}]`
+          : '';
         const dimensionStr =
           row.dimension && row.dimension.id !== pinnedId
-            ? ` [${row.dimension.id}: ${row.dimension.label}]`
+            ? ` [${escapeMarkdownInline(row.dimension.id)}: ${escapeMarkdownInline(row.dimension.label)}]`
             : '';
-        lines.push(`- **${row.date}:** ${valStr}${dimensionStr}${statusStr}`);
+        lines.push(`- **${escapeMarkdownInline(row.date)}:** ${valStr}${dimensionStr}${statusStr}`);
       }
     }
 

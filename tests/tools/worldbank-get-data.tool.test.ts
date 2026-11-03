@@ -91,6 +91,89 @@ describe('worldbankGetData', () => {
     expect(result.indicator.id).toBe('NY.GDP.PCAP.CD');
   });
 
+  it('wires selected source IDs and preserves source-only rows and provenance on both surfaces', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const id = 'IND_Kerala_IN.KL_1495_IND016';
+    const getData = servesAsAsked({
+      ...mockDataResult,
+      sourceId: '50',
+      data: [
+        {
+          ...usRow,
+          countryCode: id,
+          countryIso3: '',
+          countryName: 'Kerala',
+          date: '2015',
+          value: 34325000,
+        },
+      ],
+      sourceScoped: {
+        sourceId: '50',
+        sourceName: 'Subnational Population',
+        dimension: null,
+        note: 'Explicitly selected source dataset.',
+      },
+    });
+    vi.mocked(getWorldBankApiService).mockReturnValue({ getData } as never);
+    const result = await runToolContract(worldbankGetData, {
+      source_id: '50',
+      indicator_id: 'SP.POP.TOTL',
+      countries: id,
+    });
+    expect(result.isError).not.toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      sourceId: '50',
+      data: [{ countryCode: id, countryIso3: '', value: 34325000 }],
+    });
+    const text = JSON.stringify(result.content);
+    for (const value of [
+      id,
+      '50',
+      'Subnational Population',
+      '34325000',
+      'Explicitly selected source dataset.',
+    ])
+      expect(text).toContain(value);
+    expect(getData.mock.calls[0]?.[0]).toMatchObject({ sourceId: '50', countries: [id] });
+  });
+
+  it.each(['source_not_found', 'source_not_queryable'] as const)(
+    'renders selected-source recovery for %s',
+    async (reason) => {
+      const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+      const { worldbankGetData } = await import(
+        '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+      );
+      vi.mocked(getWorldBankApiService).mockReturnValue({
+        getData: vi
+          .fn()
+          .mockRejectedValue(
+            new McpError(
+              reason === 'source_not_found'
+                ? JsonRpcErrorCode.NotFound
+                : JsonRpcErrorCode.ValidationError,
+              'Choose a valid source.',
+              { reason, sourceId: '99999991' },
+            ),
+          ),
+      } as never);
+      const result = await runToolContract(worldbankGetData, {
+        source_id: '99999991',
+        indicator_id: 'SP.POP.TOTL',
+        countries: 'US',
+      });
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          data: { reason, recovery: { hint: expect.stringContaining('worldbank_list_sources') } },
+        },
+      });
+      expect(JSON.stringify(result.content)).toContain('worldbank_list_sources');
+    },
+  );
+
   it('populates enrichment with totalCount and pagination', async () => {
     const { worldbankGetData } = await import(
       '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
@@ -1008,7 +1091,7 @@ describe('worldbankGetData', () => {
     ).not.toThrow();
   });
 
-  it('keeps accepting per_page up to 1000, and says one page holds at most 200', async () => {
+  it('describes maximum normalization at 1000', async () => {
     const { worldbankGetData } = await import(
       '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
     );
@@ -1020,13 +1103,13 @@ describe('worldbankGetData', () => {
       }).success,
     ).toBe(true);
     const perPage = (worldbankGetData.input.shape.per_page as { description?: string }).description;
-    expect(perPage).toMatch(/at most 200 observations/);
+    expect(perPage).toMatch(/above 1000 are served at that maximum/);
     expect(perPage).not.toMatch(/higher values/i);
-    expect(worldbankGetData.description).toMatch(/200 per page/);
+    expect(worldbankGetData.description).toMatch(/1000 per page/);
     expect(worldbankGetData.description).not.toMatch(/per_page up to 1000/);
   });
 
-  it('rejects per_page above maximum (1001)', async () => {
+  it('accepts above-maximum requests for handler normalization', async () => {
     const { worldbankGetData } = await import(
       '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
     );
@@ -1036,7 +1119,7 @@ describe('worldbankGetData', () => {
         countries: 'US',
         per_page: 1001,
       }),
-    ).toThrow();
+    ).not.toThrow();
   });
 
   it('rejects page below minimum (0)', async () => {
@@ -1191,7 +1274,7 @@ describe('worldbankGetData', () => {
     expect(text).toContain('**Source-scoped data:** WDI Database Archives (source 57).');
     expect(text).toContain(archiveNote);
     expect(text).toContain(
-      '**Version:** 2025 Mar (`202503`) — selection: newest_with_data (the newest release holding a value for the requested countries and periods)',
+      '**Version:** 2025 Mar (202503) — selection: newest_with_data (the newest release holding a value for the requested countries and periods)',
     );
     // One release applies to every row, so rows don't repeat it.
     expect(text).toContain('- **2023:** 1496923\n');

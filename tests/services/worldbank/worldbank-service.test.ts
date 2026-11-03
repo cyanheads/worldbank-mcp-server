@@ -17,7 +17,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 // ─── fetchWithTimeout mock ────────────────────────────────────────────────────
 // We need to intercept HTTP calls before importing the service. The mock must
 // be hoisted so it's defined before any import that resolves the dep.
-vi.mock('@cyanheads/mcp-ts-core/utils', () => ({
+vi.mock('@cyanheads/mcp-ts-core/utils', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@cyanheads/mcp-ts-core/utils')>()),
   fetchWithTimeout: vi.fn(),
   withRetry: vi.fn().mockImplementation((fn: () => unknown) => fn()),
 }));
@@ -217,6 +218,50 @@ describe('WorldBankApiService', () => {
   });
 
   // ─── HTML error detection ─────────────────────────────────────────────────
+
+  describe('exhaustive standard pagination', () => {
+    it.each([undefined, 'garbage', 'Infinity', -1, 1.5, '', null, true, 0])(
+      'rejects malformed page bound %s before requesting another page',
+      async (pages) => {
+        mockResponse([pagingObj({ pages, total: 1 }), []]);
+        await expect(
+          service.getData(
+            {
+              indicatorId: 'SP.POP.TOTL',
+              countries: 'US',
+              dateRange: '2020:2021',
+              page: 1,
+              perPage: 50,
+            },
+            createMockContext(),
+          ),
+        ).rejects.toMatchObject({ code: JsonRpcErrorCode.ServiceUnavailable });
+        expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(1);
+      },
+    );
+    it.each([undefined, 'garbage', 'Infinity', -1, 1.5, '', null, true, 0])(
+      'rejects malformed country-list page bound %s',
+      async (pages) => {
+        mockResponse([pagingObj({ pages, total: 1 }), []]);
+        await expect(
+          service.listCountries(
+            { includeAggregates: false, page: 1, perPage: 50 },
+            createMockContext(),
+          ),
+        ).rejects.toMatchObject({ code: JsonRpcErrorCode.ServiceUnavailable });
+        expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(1);
+      },
+    );
+    it('accepts numeric-string bounds and retains every country page', async () => {
+      mockResponse([pagingObj({ pages: '2', total: '2' }), [rawCountry('USA', 'United States')]]);
+      mockResponse([pagingObj({ page: 2, pages: '2', total: '2' }), [rawCountry('CAN', 'Canada')]]);
+      const result = await service.listCountries(
+        { includeAggregates: false, page: 1, perPage: 50 },
+        createMockContext(),
+      );
+      expect(result.countries.map((country) => country.id)).toEqual(['USA', 'CAN']);
+    });
+  });
 
   it('throws serviceUnavailable when upstream returns an HTML error page', async () => {
     fetchWithTimeoutMock.mockResolvedValueOnce({
@@ -968,7 +1013,8 @@ describe('WorldBankApiService', () => {
   it.each([
     [100, 100],
     [150, 150],
-    [300, 150],
+    [300, 300],
+    [301, 300],
   ])(
     'listCountries: asks upstream for per_page=%i as %i entries when including aggregates',
     async (perPage, served) => {
@@ -993,9 +1039,9 @@ describe('WorldBankApiService', () => {
     };
     const pages = [await pageAt(1), await pageAt(2), await pageAt(3)];
 
-    expect(pages.map((p) => p.countries.length)).toEqual([150, 67, 0]);
+    expect(pages.map((p) => p.countries.length)).toEqual([217, 0, 0]);
     expect(pages.map((p) => [p.perPage, p.pages, p.total])).toEqual(
-      Array.from({ length: 3 }, () => [150, 2, 217]),
+      Array.from({ length: 3 }, () => [300, 1, 217]),
     );
     expect(pages.flatMap((p) => p.countries.map((c) => c.id))).toEqual(
       Array.from({ length: 217 }, (_, i) => `C${i + 1}`),
@@ -2042,7 +2088,7 @@ describe('WorldBankApiService', () => {
       const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
       for (const code of groups) expect(text).toContain(`${code} (${code}) [Aggregate]`);
       for (const code of controls) {
-        expect(text).toContain(`## ${code} (${code})`);
+        expect(text).toContain(`${code} (${code})`);
         expect(text).not.toContain(`${code} (${code}) [Aggregate]`);
       }
       expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(2);
@@ -2185,7 +2231,7 @@ describe('WorldBankApiService', () => {
       .map((block) => (block.type === 'text' ? block.text : ''))
       .join('\n');
     for (const name of ['China', 'Beijing', 'Codeless A', 'Codeless B'])
-      expect(text).toContain(`## ${name}`);
+      expect(text).toContain(`\n${name} (`);
     expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(3);
   });
 
@@ -2859,8 +2905,9 @@ describe('WorldBankApiService', () => {
   it.each([
     [50, 50],
     [200, 200],
-    [201, 200],
-    [1000, 200],
+    [201, 201],
+    [1000, 1000],
+    [1001, 1000],
   ])(
     'getData: asks upstream for per_page=%i as %i rows of the whole span, one page',
     async (perPage, served) => {
@@ -2911,9 +2958,9 @@ describe('WorldBankApiService', () => {
     };
 
     const pages = [await pageAt(1), await pageAt(2), await pageAt(3), await pageAt(4)];
-    expect(pages.map((p) => p.data.length)).toEqual([200, 200, 50, 0]);
+    expect(pages.map((p) => p.data.length)).toEqual([450, 0, 0, 0]);
     expect(pages.map((p) => [p.perPage, p.pages, p.total])).toEqual(
-      Array.from({ length: 4 }, () => [200, 3, 450]),
+      Array.from({ length: 4 }, () => [1000, 1, 450]),
     );
     expect(pages.flatMap((p) => p.data.map((d) => d.countryCode))).toEqual(
       series.map((row) => row.country.id),

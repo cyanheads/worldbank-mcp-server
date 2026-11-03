@@ -105,97 +105,6 @@ describe('worldbank_list_countries served page size, end to end', () => {
     vi.unstubAllGlobals();
   });
 
-  it.each([100, 150])(
-    'serves per_page=%i with aggregates as asked, with no reduction to disclose',
-    async (size) => {
-      const { structured, text } = await call({ include_aggregates: true, per_page: size });
-
-      expect(requestSizes()).toEqual([String(size)]);
-      expect(structured.countries).toHaveLength(size);
-      expect(structured.appliedFilters).toEqual({
-        includeAggregates: true,
-        page: 1,
-        perPage: size,
-      });
-      expect(structured.notice).toBeUndefined();
-      expect(text).toContain(`include_aggregates=true, page=1, per_page=${size}`);
-    },
-  );
-
-  it('reduces per_page=300 with aggregates to 150 upstream and discloses it on both surfaces', async () => {
-    const { structured, text } = await call({ include_aggregates: true, per_page: 300 });
-
-    expect(requestSizes()).toEqual(['150']);
-    expect(structured.countries).toHaveLength(150);
-    expect(structured.appliedFilters).toMatchObject({ perPage: 150, requestedPerPage: 300 });
-    expect(structured).toMatchObject({ totalCount: 295, currentPage: 1, totalPages: 2 });
-    expect(structured.notice).toMatch(/per_page=300 was reduced to 150, the most one page holds/);
-    expect(structured.notice).toMatch(
-      /totalPages counts pages of 150, so page 2 with the same filters continues where this page ends/,
-    );
-    expect(text).toContain('per_page=150 (requested 300)');
-    expect(text).toContain('per_page=300 was reduced to 150');
-  });
-
-  it.each([
-    ['with aggregates', { include_aggregates: true }, ENTITIES],
-    ['economies only', {}, ECONOMIES],
-  ])(
-    'continues %s with page + 1 at the reduced size, contiguously',
-    async (_label, filter, all) => {
-      const pages = [
-        await call({ ...filter, per_page: 300, page: 1 }),
-        await call({ ...filter, per_page: 300, page: 2 }),
-      ];
-
-      expect(pages.map(({ structured }) => structured.countries.length)).toEqual([
-        150,
-        all.length - 150,
-      ]);
-      expect(pages.map(({ structured }) => structured.totalPages)).toEqual([2, 2]);
-      expect(pages.flatMap(({ structured }) => structured.countries.map((c) => c.id))).toEqual(
-        all.map((e) => e.id),
-      );
-    },
-  );
-
-  it('names the page range at the served size for a page past the end', async () => {
-    const { structured } = await call({ per_page: 300, page: 3 });
-
-    expect(structured.countries).toEqual([]);
-    expect(structured).toMatchObject({
-      totalCount: ECONOMIES.length,
-      currentPage: 3,
-      totalPages: 2,
-    });
-    expect(structured.notice).toMatch(
-      new RegExp(
-        `^Page 3 is past the end of the results — ${ECONOMIES.length} countries span 2 pages \\(1–2\\) at per_page=150\\.`,
-      ),
-    );
-  });
-
-  /**
-   * 48 entries fit on one page at the served 150, the page per_page=300 would
-   * have served too, so there is no reduction to disclose — on the upstream-paged
-   * path and the fetch-all path alike. The echo still says both sizes.
-   */
-  it.each([
-    ['with aggregates', { include_aggregates: true }],
-    ['economies only', {}],
-  ])('discloses no reduction %s when the whole result fits on one page', async (_label, filter) => {
-    serve(ECONOMIES.slice(0, 48));
-    for (const page of [1, 2]) {
-      const { structured, text } = await call({ ...filter, per_page: 300, page });
-
-      expect(structured.appliedFilters).toMatchObject({ perPage: 150, requestedPerPage: 300 });
-      expect(structured.totalPages).toBe(1);
-      expect(structured.notice ?? '').not.toMatch(/was reduced/);
-      expect(text).not.toContain('was reduced');
-      expect(text).toContain('per_page=150 (requested 300)');
-    }
-  });
-
   it('echoes the filters it applied beside the page size', async () => {
     const { structured, text } = await call({
       region: ' SSF ',
@@ -216,5 +125,48 @@ describe('worldbank_list_countries served page size, end to end', () => {
     expect(text).toContain(
       '**Applied Filters:** region=SSF, income_level=LIC, lending_type=IDX, include_aggregates=false, page=2, per_page=20',
     );
+  });
+
+  it.each([50, 149, 150, 151, 300])(
+    'serves per_page=%i without a budget reduction',
+    async (size) => {
+      const { structured, text } = await call({ include_aggregates: true, per_page: size });
+      expect(requestSizes()).toEqual([String(size)]);
+      expect(structured.countries).toHaveLength(Math.min(size, 295));
+      expect(structured.appliedFilters).toMatchObject({ perPage: size });
+      expect(structured.appliedFilters).not.toHaveProperty('requestedPerPage');
+      expect(structured.notice).toBeUndefined();
+      expect(text).toContain(`per_page=${size}`);
+    },
+  );
+
+  it.each([1, 2])('clamps above maximum and discloses it on page %i', async (page) => {
+    const { structured, text } = await call({ include_aggregates: true, per_page: 301, page });
+    expect(structured.appliedFilters).toMatchObject({ perPage: 300, requestedPerPage: 301 });
+    expect(structured.totalPages).toBe(1);
+    expect(structured.notice).toContain('per_page=301 was reduced to 300');
+    expect(text).toContain('per_page=300 (requested 301)');
+    expect(text).toContain('per_page=301 was reduced to 300');
+  });
+
+  it('discloses the maximum clamp on an empty result', async () => {
+    serve([]);
+    const { structured, text } = await call({ include_aggregates: true, per_page: 301 });
+    expect(structured.countries).toEqual([]);
+    expect(structured.appliedFilters).toMatchObject({ perPage: 300, requestedPerPage: 301 });
+    expect(structured.notice).toContain('per_page=301 was reduced to 300');
+    expect(text).toContain('per_page=301 was reduced to 300');
+  });
+
+  it.each([true, false])('pages contiguously on path %s', async (path) => {
+    const pages = [];
+    for (const page of [1, 2, 3, 4]) {
+      pages.push(await call({ per_page: 151, page, include_aggregates: path }));
+    }
+    const expected = (path ? ENTITIES : ECONOMIES).map((row) => row.id);
+    expect(pages.flatMap(({ structured }) => structured.countries.map((row) => row.id))).toEqual(
+      expected,
+    );
+    expect(pages[3]?.structured.countries).toEqual([]);
   });
 });

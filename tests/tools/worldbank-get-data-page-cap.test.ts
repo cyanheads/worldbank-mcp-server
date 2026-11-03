@@ -54,7 +54,7 @@ function dataRequestSizes(): string[] {
  * Fake upstream: the data endpoint pages {@link SERIES} by the `page` and
  * `per_page` it is sent, as the live API does, and the country listing is empty.
  */
-function serve(series: readonly unknown[] = SERIES) {
+function serve(series: readonly unknown[] = SERIES, sourceId: unknown = '2') {
   fetchMock.mockImplementation(async (input) => {
     const url = new URL(String(input instanceof Request ? input.url : input));
     if (url.pathname === '/v2/country') return Response.json(LISTING);
@@ -67,7 +67,7 @@ function serve(series: readonly unknown[] = SERIES) {
           pages: Math.ceil(series.length / size),
           per_page: size,
           total: series.length,
-          sourceid: '2',
+          sourceid: sourceId,
         },
         series.slice((page - 1) * size, page * size),
       ]);
@@ -112,94 +112,66 @@ describe('worldbank_get_data served page size, end to end', () => {
     vi.unstubAllGlobals();
   });
 
-  it.each([50, 200])('serves per_page=%i as asked, with no reduction to disclose', async (size) => {
-    const { structured, text } = await call({ per_page: size });
+  it.each([50, 199, 200, 201, 1000])(
+    'serves per_page=%i without a budget reduction',
+    async (size) => {
+      const { structured, text } = await call({ per_page: size });
+      expect(dataRequestSizes()).toEqual([String(size)]);
+      expect(structured.data).toHaveLength(Math.min(size, 450));
+      expect(structured.appliedFilters).toMatchObject({ perPage: size });
+      expect(structured.appliedFilters).not.toHaveProperty('requestedPerPage');
+      expect(structured.notice).toBeUndefined();
+      expect(text).toContain(`per_page=${size}`);
+    },
+  );
 
-    expect(dataRequestSizes()).toEqual([String(size)]);
-    expect(structured.data).toHaveLength(size);
-    expect(structured.appliedFilters).toMatchObject({ perPage: size });
-    expect(structured.appliedFilters).not.toHaveProperty('requestedPerPage');
-    expect(structured.totalPages).toBe(Math.ceil(450 / size));
-    expect(structured.notice).toBeUndefined();
-    expect(text).toContain(`per_page=${size}`);
-    expect(text).not.toContain('requested');
+  it.each([1, 2])('clamps above maximum and discloses it on page %i', async (page) => {
+    const { structured, text } = await call({ per_page: 1001, page });
+    expect(structured.appliedFilters).toMatchObject({ perPage: 1000, requestedPerPage: 1001 });
+    expect(structured.totalPages).toBe(1);
+    expect(structured.notice).toContain('per_page=1001 was reduced to 1000');
+    expect(text).toContain('per_page=1000 (requested 1001)');
+    expect(text).toContain('per_page=1001 was reduced to 1000');
   });
 
-  it('reduces per_page=1000 to 200 and discloses it on both surfaces', async () => {
-    const { structured, text } = await call({ per_page: 1000 });
-
-    expect(dataRequestSizes()).toEqual(['200']);
-    expect(structured.data).toHaveLength(200);
-    expect(structured.appliedFilters).toMatchObject({ perPage: 200, requestedPerPage: 1000 });
-    expect(structured).toMatchObject({ totalCount: 450, currentPage: 1, totalPages: 3 });
-    expect(structured.notice).toMatch(/per_page=1000 was reduced to 200, the most one page holds/);
-    expect(structured.notice).toMatch(/50 KB/);
-    expect(structured.notice).toMatch(
-      /totalPages counts pages of 200, so page 2 with the same filters continues where this page ends/,
-    );
-    expect(text).toContain('per_page=200 (requested 1000)');
-    expect(text).toContain('per_page=1000 was reduced to 200');
-  });
-
-  it('continues with page + 1 at the reduced size, neither skipping nor repeating a row', async () => {
-    const pages = [
-      await call({ per_page: 1000, page: 1 }),
-      await call({ per_page: 1000, page: 2 }),
-      await call({ per_page: 1000, page: 3 }),
-    ];
-
-    expect(pages.map(({ structured }) => structured.data.length)).toEqual([200, 200, 50]);
-    expect(pages.flatMap(({ structured }) => structured.data.map((d) => d.countryCode))).toEqual(
-      SERIES.map((row) => row.country.id),
-    );
-    // The last page has no next page to point at.
-    expect(pages[2]?.structured.notice).not.toMatch(/continues/);
-  });
-
-  it('names the page range at the served size for a page past the end', async () => {
-    const { structured, text } = await call({ per_page: 1000, page: 4 });
-
+  it('discloses the maximum clamp on an empty result', async () => {
+    serve([]);
+    const { structured, text } = await call({ per_page: 1001 });
     expect(structured.data).toEqual([]);
-    expect(structured).toMatchObject({ totalCount: 450, currentPage: 4, totalPages: 3 });
-    expect(structured.notice).toMatch(
-      /^Page 4 is past the end of the results — 450 observations span 3 pages \(1–3\) at per_page=200\./,
-    );
-    expect(text).toContain('Page 4 is past the end of the results');
+    expect(structured.appliedFilters).toMatchObject({ perPage: 1000, requestedPerPage: 1001 });
+    expect(structured.notice).toContain('per_page=1001 was reduced to 1000');
+    expect(text).toContain('per_page=1001 was reduced to 1000');
   });
 
-  /**
-   * 120 observations fit on one page at the served 200, the page per_page=1000
-   * would have served too, so there is no reduction to disclose. The echo still
-   * says what was served and what was asked for.
-   */
-  it('discloses no reduction when the whole result fits on one page at the served size', async () => {
-    serve(SERIES.slice(0, 120));
-    for (const page of [1, 2]) {
-      const { structured, text } = await call({ per_page: 1000, page });
-
-      expect(structured.appliedFilters).toMatchObject({ perPage: 200, requestedPerPage: 1000 });
-      expect(structured.totalPages).toBe(1);
-      expect(structured.notice ?? '').not.toMatch(/was reduced/);
-      expect(text).not.toContain('was reduced');
-      expect(text).toContain('per_page=200 (requested 1000)');
+  it.each([undefined, '2020'])('pages contiguously on path %s', async (path) => {
+    const pages = [];
+    for (const page of [1, 2, 3, 4]) {
+      pages.push(await call({ per_page: 201, page, ...(path && { date_range: path }) }));
     }
+    const expected = SERIES.map((row) => row.country.id);
+    expect(
+      pages.flatMap(({ structured }) => structured.data.map((row) => row.countryCode)),
+    ).toEqual(expected);
+    expect(pages[3]?.structured.data).toEqual([]);
   });
 
-  it('slices a date window it reads in full at the served size', async () => {
-    const pages = [
-      await call({ per_page: 1000, date_range: '2020', page: 1 }),
-      await call({ per_page: 1000, date_range: '2020', page: 2 }),
-      await call({ per_page: 1000, date_range: '2020', page: 3 }),
-    ];
+  it.each([null, '', '   ', { id: '2' }])(
+    'does not invent provenance from malformed source metadata %j',
+    async (sourceId) => {
+      serve(SERIES, sourceId);
+      for (const args of [{}, { date_range: '2020' }]) {
+        const { structured, text } = await call(args);
+        expect(structured).not.toHaveProperty('sourceId');
+        expect(text).not.toContain('Serving source ID:');
+      }
+    },
+  );
 
-    expect(pages.map(({ structured }) => structured.data.length)).toEqual([200, 200, 50]);
-    expect(pages.map(({ structured }) => structured.totalPages)).toEqual([3, 3, 3]);
-    expect(pages.flatMap(({ structured }) => structured.data.map((d) => d.countryCode))).toEqual(
-      SERIES.map((row) => row.country.id),
-    );
-    expect(pages[1]?.structured.appliedFilters).toMatchObject({
-      perPage: 200,
-      requestedPerPage: 1000,
-    });
+  it('preserves a valid serving source on ordinary and windowed reads', async () => {
+    for (const args of [{}, { date_range: '2020' }]) {
+      const { structured, text } = await call(args);
+      expect(structured).toHaveProperty('sourceId', '2');
+      expect(text).toContain('**Serving source ID:** 2');
+    }
   });
 });

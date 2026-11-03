@@ -689,7 +689,7 @@ describe('frequency without mrv or mrnev', () => {
           indicator_id: 'CPTOTSAXN',
           countries: 'KE',
           frequency: 'monthly',
-          per_page: 1000,
+          per_page: 201,
           page,
         }),
       );
@@ -703,9 +703,9 @@ describe('frequency without mrv or mrnev', () => {
     for (const structured of [first, second, third]) {
       expect(structured).toMatchObject({ totalCount: 320, totalPages: 2 });
     }
-    expect(first?.data).toHaveLength(200);
+    expect(first?.data).toHaveLength(201);
     expect(first?.data[0]).toMatchObject({ date: '2026M08', value: null });
-    expect(second?.data).toHaveLength(120);
+    expect(second?.data).toHaveLength(119);
     expect(second?.data.at(-1)?.date).toBe('2000M01');
     expect(new Set([...(first?.data ?? []), ...(second?.data ?? [])].map((r) => r.date)).size).toBe(
       320,

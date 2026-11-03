@@ -6,10 +6,12 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 import { pagePastEndNotice } from '@/mcp-server/tools/page-past-end-notice.js';
 import { pageSizeReducedNotice } from '@/mcp-server/tools/page-size-reduced-notice.js';
-import { MAX_COUNTRIES_PER_PAGE, RESPONSE_BUDGET_KB } from '@/services/response-budget.js';
+import { MAX_COUNTRIES_PER_PAGE } from '@/services/response-budget.js';
+import { CATALOG_FILTER_ID, SOURCE_ID_MESSAGE } from '@/services/worldbank/identifiers.js';
 import { getWorldBankApiService } from '@/services/worldbank/worldbank-service.js';
 
 /** The `/v2/lendingType` ids — the complete set. */
@@ -22,6 +24,13 @@ export const worldbankListCountries = tool('worldbank_list_countries', {
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   inputAliases: { limit: 'per_page' },
   input: z.object({
+    source_id: z
+      .string()
+      .regex(CATALOG_FILTER_ID, SOURCE_ID_MESSAGE)
+      .optional()
+      .describe(
+        'Select a source-specific entity listing. Entries carry canonical id, name and sourceId only; global classification filters and include_aggregates=true are unavailable. Default false keeps all source entities.',
+      ),
     region: z
       .string()
       .optional()
@@ -56,47 +65,61 @@ export const worldbankListCountries = tool('worldbank_list_countries', {
       .number()
       .int()
       .min(1)
-      .max(300)
       .optional()
       .describe(
-        `Results per page (default: server default, max: 300). One page holds at most ${MAX_COUNTRIES_PER_PAGE} entries, which keeps a response within about ${RESPONSE_BUDGET_KB} KB; a larger value is reduced to that cap and echoed as appliedFilters.perPage, and totalPages is counted at the reduced size, so page + 1 continues where a page ends; notice discloses the reduction whenever the result runs past one page.`,
+        'Results per page (default: server default). Positive integers above 300 are served at that maximum with the requested and served sizes echoed and a notice. totalPages uses the served size.',
       ),
   }),
   output: z.object({
     countries: z
       .array(
         z
-          .object({
-            id: z.string().describe('Country or aggregate ID (ISO2 or WB aggregate code).'),
-            iso2: z.string().describe('ISO2 country code.'),
-            name: z.string().describe('Country or aggregate name.'),
-            region: z
+          .union([
+            z
               .object({
-                id: z.string().describe('Region code.'),
-                name: z.string().describe('Region name.'),
+                id: z
+                  .string()
+                  .describe(
+                    'Canonical source entity ID, accepted unchanged by worldbank_get_data.',
+                  ),
+                name: z.string().describe('Source entity name.'),
+                sourceId: z.string().describe('Source owning this entity.'),
               })
-              .describe('World Bank region this country belongs to.'),
-            incomeLevel: z
+              .describe('An entity from a selected source.'),
+            z
               .object({
-                id: z.string().describe('Income level code.'),
-                name: z.string().describe('Income level name.'),
+                id: z.string().describe('Country or aggregate ID (ISO2 or WB aggregate code).'),
+                iso2: z.string().describe('ISO2 country code.'),
+                name: z.string().describe('Country or aggregate name.'),
+                region: z
+                  .object({
+                    id: z.string().describe('Region code.'),
+                    name: z.string().describe('Region name.'),
+                  })
+                  .describe('World Bank region this country belongs to.'),
+                incomeLevel: z
+                  .object({
+                    id: z.string().describe('Income level code.'),
+                    name: z.string().describe('Income level name.'),
+                  })
+                  .describe('World Bank income classification.'),
+                lendingType: z
+                  .string()
+                  .describe(
+                    'World Bank lending type name: IDA, IBRD, Blend, or Not classified (lending_type filters by the codes IDX, IBD, IDB, LNX). Aggregates report Aggregates.',
+                  ),
+                capitalCity: z.string().describe('Capital city name (empty for aggregates).'),
+                longitude: z.string().describe('Capital longitude (empty for aggregates).'),
+                latitude: z.string().describe('Capital latitude (empty for aggregates).'),
+                isAggregate: z
+                  .boolean()
+                  .describe(
+                    'True when this entry is a regional or income-group aggregate rather than an individual country.',
+                  ),
               })
-              .describe('World Bank income classification.'),
-            lendingType: z
-              .string()
-              .describe(
-                'World Bank lending type name: IDA, IBRD, Blend, or Not classified (lending_type filters by the codes IDX, IBD, IDB, LNX). Aggregates report Aggregates.',
-              ),
-            capitalCity: z.string().describe('Capital city name (empty for aggregates).'),
-            longitude: z.string().describe('Capital longitude (empty for aggregates).'),
-            latitude: z.string().describe('Capital latitude (empty for aggregates).'),
-            isAggregate: z
-              .boolean()
-              .describe(
-                'True when this entry is a regional or income-group aggregate rather than an individual country.',
-              ),
-          })
-          .describe('A country or aggregate entry.'),
+              .describe('A country or aggregate entry.'),
+          ])
+          .describe('A global country or aggregate, or an entity from the selected source.'),
       )
       .describe('Countries (and optionally aggregates) matching the filters.'),
   }),
@@ -106,6 +129,10 @@ export const worldbankListCountries = tool('worldbank_list_countries', {
   enrichment: {
     appliedFilters: z
       .object({
+        sourceId: z
+          .string()
+          .optional()
+          .describe('Source dataset requested, omitted for the global country listing.'),
         region: z.string().optional().describe('Region code applied, omitted when none.'),
         incomeLevel: z
           .string()
@@ -152,6 +179,10 @@ export const worldbankListCountries = tool('worldbank_list_countries', {
   },
 
   enrichmentTrailer: {
+    notice: {
+      render: (notice) =>
+        notice === undefined ? '' : `**Notice:** ${escapeMarkdownInline(notice)}`,
+    },
     appliedFilters: {
       /**
        * A per-field `render` replaces the whole trailer line, `label` included,
@@ -159,9 +190,18 @@ export const worldbankListCountries = tool('worldbank_list_countries', {
        */
       render: (filters) =>
         `**Applied Filters:** ${[
-          ...(filters.region === undefined ? [] : [`region=${filters.region}`]),
-          ...(filters.incomeLevel === undefined ? [] : [`income_level=${filters.incomeLevel}`]),
-          ...(filters.lendingType === undefined ? [] : [`lending_type=${filters.lendingType}`]),
+          ...(filters.sourceId === undefined
+            ? []
+            : [`source_id=${escapeMarkdownInline(filters.sourceId)}`]),
+          ...(filters.region === undefined
+            ? []
+            : [`region=${escapeMarkdownInline(filters.region)}`]),
+          ...(filters.incomeLevel === undefined
+            ? []
+            : [`income_level=${escapeMarkdownInline(filters.incomeLevel)}`]),
+          ...(filters.lendingType === undefined
+            ? []
+            : [`lending_type=${escapeMarkdownInline(filters.lendingType)}`]),
           `include_aggregates=${filters.includeAggregates}`,
           `page=${filters.page}`,
           `per_page=${filters.perPage}${filters.requestedPerPage === undefined ? '' : ` (requested ${filters.requestedPerPage})`}`,
@@ -170,6 +210,28 @@ export const worldbankListCountries = tool('worldbank_list_countries', {
   },
 
   errors: [
+    {
+      reason: 'source_not_found',
+      severity: 'notice',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'source_id does not name a source.',
+      recovery: 'Use worldbank_list_sources to find valid source IDs.',
+    },
+    {
+      reason: 'source_not_queryable',
+      severity: 'notice',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The selected source has no supported country/series/time layout.',
+      recovery: 'Choose another source with worldbank_list_sources.',
+    },
+    {
+      reason: 'unsupported_source_filter',
+      severity: 'notice',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'Global classification filters are combined with source_id.',
+      recovery:
+        'Remove region, income_level, lending_type and include_aggregates=true when selecting source_id.',
+    },
     {
       reason: 'invalid_filter',
       severity: 'notice',
@@ -196,16 +258,24 @@ export const worldbankListCountries = tool('worldbank_list_countries', {
     try {
       result = await getWorldBankApiService().listCountries(
         {
+          ...(input.source_id?.trim() && { sourceId: input.source_id.trim() }),
           ...(region !== undefined && { region }),
           ...(incomeLevel !== undefined && { incomeLevel }),
           ...(lendingType !== undefined && { lendingType }),
           includeAggregates: input.include_aggregates,
           page: input.page,
-          perPage,
+          perPage: Math.min(perPage, MAX_COUNTRIES_PER_PAGE),
         },
         ctx,
       );
     } catch (err) {
+      if (
+        err instanceof McpError &&
+        (err.data?.reason === 'source_not_found' ||
+          err.data?.reason === 'source_not_queryable' ||
+          err.data?.reason === 'unsupported_source_filter')
+      )
+        throw ctx.fail(err.data.reason, err.message, err.data);
       if (err instanceof McpError && err.data?.reason === 'invalid_filter') {
         throw ctx.fail('invalid_filter', err.message, {
           ...err.data,
@@ -217,6 +287,7 @@ export const worldbankListCountries = tool('worldbank_list_countries', {
     }
     ctx.enrich({
       appliedFilters: {
+        ...(input.source_id?.trim() && { sourceId: input.source_id.trim() }),
         ...(region !== undefined && { region }),
         ...(incomeLevel !== undefined && { incomeLevel }),
         ...(lendingType !== undefined && { lendingType }),
@@ -228,55 +299,63 @@ export const worldbankListCountries = tool('worldbank_list_countries', {
     });
     ctx.enrich({ totalCount: result.total, currentPage: result.page, totalPages: result.pages });
 
+    const notices: string[] = [];
     if (result.total === 0) {
       const filters = [
         ...(region === undefined ? [] : [`region=${region}`]),
         ...(incomeLevel === undefined ? [] : [`income_level=${incomeLevel}`]),
         ...(lendingType === undefined ? [] : [`lending_type=${lendingType}`]),
       ];
-      ctx.enrich.notice(
+      notices.push(
         filters.length > 1
           ? `No countries matched ${filters.join(', ')}. The filters combine by AND, so no country matches all of them at once — drop one of them to widen the list.`
           : filters.length === 1
             ? `No countries matched ${filters[0]}.`
             : 'The World Bank returned no countries.',
       );
-    } else {
-      const notices = [
-        ...(result.countries.length === 0
-          ? [
-              pagePastEndNotice({
-                noun: ['country', 'countries'],
-                page: result.page,
-                pages: result.pages,
-                perPage: result.perPage,
-                total: result.total,
-              }),
-            ]
-          : []),
-        pageSizeReducedNotice({
-          requested: perPage,
-          served: result.perPage,
+    } else if (result.countries.length === 0) {
+      notices.push(
+        pagePastEndNotice({
+          noun: ['country', 'countries'],
           page: result.page,
           pages: result.pages,
+          perPage: result.perPage,
+          total: result.total,
         }),
-      ].filter((notice) => notice !== undefined);
-      if (notices.length > 0) ctx.enrich.notice(notices.join(' '));
+      );
     }
+    const reduced = pageSizeReducedNotice({
+      requested: perPage,
+      served: result.perPage,
+      page: result.page,
+      pages: result.pages,
+    });
+    if (reduced) notices.push(reduced);
+    if (notices.length > 0) ctx.enrich.notice(notices.join(' '));
     return { countries: result.countries };
   },
 
   format: (result) => {
     const lines: string[] = [];
     for (const c of result.countries) {
+      if ('sourceId' in c) {
+        lines.push(
+          `${escapeMarkdownInline(c.name)} (${escapeMarkdownInline(c.id)})`,
+          `**Source:** ${escapeMarkdownInline(c.sourceId)}`,
+        );
+        continue;
+      }
       const tag = c.isAggregate ? ' [Aggregate]' : '';
-      lines.push(`### ${c.name} (${c.id}${tag})`);
+      lines.push(`${escapeMarkdownInline(c.name)} (${escapeMarkdownInline(c.id)}${tag})`);
       lines.push(
-        `**ISO2:** ${c.iso2 || 'N/A'} | **Region:** ${c.region.name} (${c.region.id || 'N/A'}) | **Income:** ${c.incomeLevel.name} (${c.incomeLevel.id || 'N/A'})`,
+        `**ISO2:** ${escapeMarkdownInline(c.iso2 || 'N/A')} | **Region:** ${escapeMarkdownInline(c.region.name)} (${escapeMarkdownInline(c.region.id || 'N/A')}) | **Income:** ${escapeMarkdownInline(c.incomeLevel.name)} (${escapeMarkdownInline(c.incomeLevel.id || 'N/A')})`,
       );
-      lines.push(`**Lending Type:** ${c.lendingType || 'N/A'}`);
-      if (c.capitalCity) lines.push(`**Capital:** ${c.capitalCity}`);
-      if (c.longitude && c.latitude) lines.push(`**Coordinates:** ${c.latitude}, ${c.longitude}`);
+      lines.push(`**Lending Type:** ${escapeMarkdownInline(c.lendingType || 'N/A')}`);
+      if (c.capitalCity) lines.push(`**Capital:** ${escapeMarkdownInline(c.capitalCity)}`);
+      if (c.longitude && c.latitude)
+        lines.push(
+          `**Coordinates:** ${escapeMarkdownInline(c.latitude)}, ${escapeMarkdownInline(c.longitude)}`,
+        );
     }
     if (lines.length === 0) lines.push('No countries returned.');
     return [{ type: 'text', text: lines.join('\n') }];
