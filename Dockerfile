@@ -10,7 +10,7 @@
 # build runs under QEMU, where bun >= 1.4 aborts with a JavaScriptCore allocator
 # assertion and fails the multi-arch push.
 # ==============================================================================
-FROM --platform=$BUILDPLATFORM oven/bun:1.4.3 AS build
+FROM --platform=$BUILDPLATFORM oven/bun:1.4.4 AS build
 
 WORKDIR /usr/src/app
 
@@ -24,6 +24,8 @@ RUN --mount=type=cache,target=/root/.bun/install/cache \
 
 # Copy the rest of the source code
 COPY . .
+
+RUN mkdir -p skills
 
 # Build the application — run tsc and tsc-alias directly to avoid bun intercepting
 # the node shim that tsx requires for its CJS compatibility layer
@@ -44,7 +46,7 @@ RUN node_modules/.bin/tsc -p tsconfig.build.json && \
 # A clean image rather than `FROM build`: the build stage's node_modules holds
 # devDependencies.
 # ==============================================================================
-FROM --platform=$BUILDPLATFORM oven/bun:1.4.3 AS deps
+FROM --platform=$BUILDPLATFORM oven/bun:1.4.4 AS deps
 
 WORKDIR /usr/src/app
 
@@ -111,7 +113,7 @@ RUN rm -rf node_modules/@socketsecurity/bun-security-scanner
 # dependencies and build artifacts. Its only Bun invocations are HEALTHCHECK
 # and CMD, which run on the real target at container start.
 # ==============================================================================
-FROM oven/bun:1.4.3-slim AS production
+FROM oven/bun:1.4.4-slim AS production
 
 WORKDIR /usr/src/app
 
@@ -120,7 +122,7 @@ ENV NODE_ENV=production
 
 # OCI image metadata (https://github.com/opencontainers/image-spec/blob/main/annotations.md)
 ARG APP_VERSION
-LABEL org.opencontainers.image.title="@cyanheads/worldbank-mcp-server"
+LABEL org.opencontainers.image.title="worldbank-mcp-server"
 LABEL org.opencontainers.image.description="Query 29,500+ World Bank development indicators for 200+ countries across 60+ years via MCP. STDIO or Streamable HTTP."
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 LABEL org.opencontainers.image.version="${APP_VERSION}"
@@ -133,6 +135,7 @@ COPY --from=deps /usr/src/app/node_modules ./node_modules
 
 # Copy the compiled application code from the build stage
 COPY --from=build /usr/src/app/dist ./dist
+COPY --from=build /usr/src/app/skills ./skills
 
 # The 'oven/bun' image already provides a non-root user named 'bun'.
 # We will use this existing user for enhanced security.
