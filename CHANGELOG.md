@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.6.0](changelog/0.6.x/0.6.0.md) — 2026-11-03
+
+Source-aware World Bank research with complete pages and poverty estimate provenance.
+
 ## [0.5.4](changelog/0.5.x/0.5.4.md) — 2026-10-18
 
 Compact whole-scope data reads and correct aggregate routing.

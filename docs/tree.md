@@ -1,6 +1,6 @@
 # worldbank-mcp-server - Directory Structure
 
-Generated on: 2026-10-18 22:48:38
+Generated on: 2026-11-03 08:19:35
 
 ```text
 worldbank-mcp-server/
@@ -29,6 +29,7 @@ worldbank-mcp-server/
 │   ├── 0.3.x/
 │   ├── 0.4.x/
 │   ├── 0.5.x/
+│   ├── 0.6.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md
@@ -41,6 +42,8 @@ worldbank-mcp-server/
 │   ├── add-resource/
 │   │   └── SKILL.md
 │   ├── add-service/
+│   │   └── SKILL.md
+│   ├── add-skill/
 │   │   └── SKILL.md
 │   ├── add-test/
 │   │   └── SKILL.md
@@ -139,6 +142,9 @@ worldbank-mcp-server/
 │   ├── release-github.ts
 │   ├── split-changelog.ts
 │   └── tree.ts
+├── skills/
+│   └── worldbank-guide/
+│       └── SKILL.md
 ├── src/
 │   ├── config/
 │   │   └── server-config.ts
@@ -167,6 +173,7 @@ worldbank-mcp-server/
 │   │   │   ├── pip-service.ts
 │   │   │   └── types.ts
 │   │   ├── projects/
+│   │   │   ├── normalize-sector-names.ts
 │   │   │   ├── portfolio-country-codes.ts
 │   │   │   ├── projects-service.ts
 │   │   │   └── types.ts
@@ -181,16 +188,26 @@ worldbank-mcp-server/
 │   │   └── shared-load.ts
 │   └── index.ts
 ├── tests/
+│   ├── config/
+│   │   └── server-config.test.ts
 │   ├── fixtures/
 │   │   └── indicator-ranking-catalog.json
 │   ├── prompts/
 │   ├── resources/
 │   │   ├── worldbank-country.resource.test.ts
 │   │   └── worldbank-indicator.resource.test.ts
+│   ├── scripts/
+│   │   └── bundle-agent-docs.test.ts
 │   ├── services/
 │   │   ├── pip/
+│   │   │   ├── fixtures/
+│   │   │   │   ├── bra.json
+│   │   │   │   ├── groups.json
+│   │   │   │   └── nga.json
 │   │   │   └── pip-service.test.ts
 │   │   ├── projects/
+│   │   │   ├── fixtures/
+│   │   │   │   └── social-union.json
 │   │   │   ├── projects-service-http.test.ts
 │   │   │   └── projects-service.test.ts
 │   │   └── worldbank/
@@ -199,7 +216,10 @@ worldbank-mcp-server/
 │   │       ├── source-scoped.test.ts
 │   │       └── worldbank-service.test.ts
 │   └── tools/
+│       ├── catalog-markdown.test.ts
+│       ├── domain-markdown.test.ts
 │       ├── error-severity.test.ts
+│       ├── page-size-input.test.ts
 │       ├── page-size-reduced-notice.test.ts
 │       ├── service-errors-on-the-wire.test.ts
 │       ├── worldbank-get-country.tool.test.ts
@@ -217,7 +237,8 @@ worldbank-mcp-server/
 │       ├── worldbank-list-topics.tool.test.ts
 │       ├── worldbank-search-indicators.tool.test.ts
 │       ├── worldbank-search-projects-countries.test.ts
-│       └── worldbank-search-projects.tool.test.ts
+│       ├── worldbank-search-projects.tool.test.ts
+│       └── worldbank-source-wire.test.ts
 ├── .dockerignore
 ├── .env.example
 ├── .gitattributes
@@ -234,7 +255,9 @@ worldbank-mcp-server/
 ├── Dockerfile
 ├── LICENSE
 ├── manifest.json
+├── mcp.json
 ├── package.json
+├── plugin.json
 ├── README.md
 ├── server.json
 ├── tsconfig.build.json
