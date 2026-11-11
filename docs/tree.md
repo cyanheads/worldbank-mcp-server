@@ -1,6 +1,6 @@
 # worldbank-mcp-server - Directory Structure
 
-Generated on: 2026-11-03 08:19:35
+Generated on: 2026-11-11 16:17:03
 
 ```text
 worldbank-mcp-server/
@@ -167,7 +167,8 @@ worldbank-mcp-server/
 │   │       │   ├── worldbank-search-indicators.tool.ts
 │   │       │   └── worldbank-search-projects.tool.ts
 │   │       ├── page-past-end-notice.ts
-│   │       └── page-size-reduced-notice.ts
+│   │       ├── page-size-reduced-notice.ts
+│   │       └── per-page.ts
 │   ├── services/
 │   │   ├── pip/
 │   │   │   ├── pip-service.ts
@@ -184,6 +185,7 @@ worldbank-mcp-server/
 │   │   │   ├── source-scoped.ts
 │   │   │   ├── types.ts
 │   │   │   └── worldbank-service.ts
+│   │   ├── plain-prose.ts
 │   │   ├── response-budget.ts
 │   │   └── shared-load.ts
 │   └── index.ts
@@ -192,6 +194,8 @@ worldbank-mcp-server/
 │   │   └── server-config.test.ts
 │   ├── fixtures/
 │   │   └── indicator-ranking-catalog.json
+│   ├── helpers/
+│   │   └── linear-cpu-time.ts
 │   ├── prompts/
 │   ├── resources/
 │   │   ├── worldbank-country.resource.test.ts
@@ -210,35 +214,37 @@ worldbank-mcp-server/
 │   │   │   │   └── social-union.json
 │   │   │   ├── projects-service-http.test.ts
 │   │   │   └── projects-service.test.ts
-│   │   └── worldbank/
-│   │       ├── latest-values.test.ts
-│   │       ├── source-scoped-data.test.ts
-│   │       ├── source-scoped.test.ts
-│   │       └── worldbank-service.test.ts
-│   └── tools/
-│       ├── catalog-markdown.test.ts
-│       ├── domain-markdown.test.ts
-│       ├── error-severity.test.ts
-│       ├── page-size-input.test.ts
-│       ├── page-size-reduced-notice.test.ts
-│       ├── service-errors-on-the-wire.test.ts
-│       ├── worldbank-get-country.tool.test.ts
-│       ├── worldbank-get-data-countries.test.ts
-│       ├── worldbank-get-data-frequency.test.ts
-│       ├── worldbank-get-data-latest.test.ts
-│       ├── worldbank-get-data-page-cap.test.ts
-│       ├── worldbank-get-data.tool.test.ts
-│       ├── worldbank-get-indicator.tool.test.ts
-│       ├── worldbank-get-poverty-routing.test.ts
-│       ├── worldbank-get-poverty.tool.test.ts
-│       ├── worldbank-list-countries-page-cap.test.ts
-│       ├── worldbank-list-countries.tool.test.ts
-│       ├── worldbank-list-sources.tool.test.ts
-│       ├── worldbank-list-topics.tool.test.ts
-│       ├── worldbank-search-indicators.tool.test.ts
-│       ├── worldbank-search-projects-countries.test.ts
-│       ├── worldbank-search-projects.tool.test.ts
-│       └── worldbank-source-wire.test.ts
+│   │   ├── worldbank/
+│   │   │   ├── latest-values.test.ts
+│   │   │   ├── source-scoped-data.test.ts
+│   │   │   ├── source-scoped.test.ts
+│   │   │   └── worldbank-service.test.ts
+│   │   └── plain-prose.test.ts
+│   ├── tools/
+│   │   ├── catalog-markdown.test.ts
+│   │   ├── domain-markdown.test.ts
+│   │   ├── error-severity.test.ts
+│   │   ├── page-size-input.test.ts
+│   │   ├── page-size-reduced-notice.test.ts
+│   │   ├── service-errors-on-the-wire.test.ts
+│   │   ├── worldbank-get-country.tool.test.ts
+│   │   ├── worldbank-get-data-countries.test.ts
+│   │   ├── worldbank-get-data-frequency.test.ts
+│   │   ├── worldbank-get-data-latest.test.ts
+│   │   ├── worldbank-get-data-page-cap.test.ts
+│   │   ├── worldbank-get-data.tool.test.ts
+│   │   ├── worldbank-get-indicator.tool.test.ts
+│   │   ├── worldbank-get-poverty-routing.test.ts
+│   │   ├── worldbank-get-poverty.tool.test.ts
+│   │   ├── worldbank-list-countries-page-cap.test.ts
+│   │   ├── worldbank-list-countries.tool.test.ts
+│   │   ├── worldbank-list-sources.tool.test.ts
+│   │   ├── worldbank-list-topics.tool.test.ts
+│   │   ├── worldbank-search-indicators.tool.test.ts
+│   │   ├── worldbank-search-projects-countries.test.ts
+│   │   ├── worldbank-search-projects.tool.test.ts
+│   │   └── worldbank-source-wire.test.ts
+│   └── index-setup.test.ts
 ├── .dockerignore
 ├── .env.example
 ├── .gitattributes

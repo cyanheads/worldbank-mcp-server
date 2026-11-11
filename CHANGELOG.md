@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.6.1](changelog/0.6.x/0.6.1.md) — 2026-11-11
+
+Project objectives and sub-sectors, a country and entity filter, dimension values by label, per_page clamping on every paged tool with WORLDBANK_CLAMP_LIMITS, and fixes for PIP single-year estimates and project sector matching.
+
 ## [0.6.0](changelog/0.6.x/0.6.0.md) — 2026-11-03
 
 Source-aware World Bank research with complete pages and poverty estimate provenance.
