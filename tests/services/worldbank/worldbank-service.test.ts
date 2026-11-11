@@ -702,6 +702,56 @@ describe('WorldBankApiService', () => {
     expect(result.isAggregate).toBe(false); // neither id = "NA"
   });
 
+  /**
+   * `/v2/country` as upstream sends it (2026-11-11): four aggregate names and the
+   * `LCN` and `SSF` region names on 90 country rows end in a space. No
+   * income-level name does yet; ABW's is padded so the income-level trim is
+   * exercised too.
+   */
+  const SPACED_ROWS = [
+    {
+      ...rawAggregate('SSF', 'ZG', 'Sub-Saharan Africa '),
+      region: { id: 'NA', value: 'Aggregates' },
+      incomeLevel: { id: 'NA', value: 'Aggregates' },
+    },
+    {
+      ...rawCountry('AGO', 'Angola'),
+      region: { id: 'SSF', value: 'Sub-Saharan Africa ' },
+      incomeLevel: { id: 'LMC', value: 'Lower middle income' },
+    },
+    {
+      ...rawCountry('ABW', 'Aruba'),
+      region: { id: 'LCN', value: 'Latin America & Caribbean ' },
+      incomeLevel: { id: 'HIC', value: 'High income ' },
+    },
+  ];
+
+  it.each(SPACED_ROWS.map((row) => [row.id, row] as const))(
+    'getCountry: trims the edge spaces upstream leaves on %s names',
+    async (_id, row) => {
+      mockResponse([pagingObj(), [row]]);
+      const result = await service.getCountry(row.id, createMockContext());
+      expect(result.name).toBe(row.name.trim());
+      expect(result.region.name).toBe(row.region.value.trim());
+      expect(result.incomeLevel.name).toBe(row.incomeLevel.value.trim());
+    },
+  );
+
+  it('listCountries: trims the edge spaces upstream leaves on names', async () => {
+    mockResponse([pagingObj({ total: SPACED_ROWS.length }), SPACED_ROWS]);
+    const result = await service.listCountries(
+      { includeAggregates: true, page: 1, perPage: 50 },
+      createMockContext(),
+    );
+    expect(
+      result.countries.map((c) => ('region' in c ? [c.name, c.region.name] : [c.name])),
+    ).toEqual([
+      ['Sub-Saharan Africa', 'Aggregates'],
+      ['Angola', 'Sub-Saharan Africa'],
+      ['Aruba', 'Latin America & Caribbean'],
+    ]);
+  });
+
   // ─── lookupCountry ────────────────────────────────────────────────────────
 
   it('lookupCountry: resolves either identifier, in any case, to both', async () => {
@@ -1111,6 +1161,338 @@ describe('WorldBankApiService', () => {
       expect(url.searchParams.has('lendingType')).toBe(false);
     },
   );
+
+  // ─── listCountries: source-scoped listing ─────────────────────────────────
+
+  /** Answer each request by URL path; an unrouted path fails the test. */
+  function routeByPath(routes: Record<string, unknown>) {
+    fetchWithTimeoutMock.mockImplementation(async (url: string) => {
+      const { pathname } = new URL(url);
+      if (!Object.hasOwn(routes, pathname)) throw new Error(`Unrouted upstream request: ${url}`);
+      return { text: async () => JSON.stringify(routes[pathname]) };
+    });
+  }
+
+  /** The three requests a source entity listing makes: the source, its concepts, its entities. */
+  function sourceListingRoutes(sourceId: string, entities: Array<[id: string, name: string]>) {
+    const source = [{ id: sourceId, name: `Source ${sourceId}` }];
+    return {
+      [`/v2/source/${sourceId}`]: [pagingObj(), source],
+      [`/v2/sources/${sourceId}/concepts`]: {
+        ...pagingObj({ total: 3 }),
+        source: [
+          { ...source[0], concept: ['Country', 'Series', 'Time'].map((id) => ({ id, value: id })) },
+        ],
+      },
+      [`/v2/sources/${sourceId}/country`]: {
+        ...pagingObj({ total: entities.length, per_page: 10_000 }),
+        source: [
+          {
+            ...source[0],
+            concept: [
+              {
+                id: 'Country',
+                name: 'Country',
+                variable: entities.map(([id, value]) => ({ id, value })),
+              },
+            ],
+          },
+        ],
+      },
+    };
+  }
+
+  /** Requests made to `pathname`, as URLs. */
+  function requestsTo(pathname: string): URL[] {
+    return fetchWithTimeoutMock.mock.calls
+      .map(([url]) => new URL(String(url)))
+      .filter((url) => url.pathname === pathname);
+  }
+
+  it('listCountries: reads a source listing whole once and pages it locally at the served size', async () => {
+    const entities = Array.from(
+      { length: 7 },
+      (_, i) => [`E${i + 1}`, `Entity ${i + 1}`] as [string, string],
+    );
+    routeByPath(sourceListingRoutes('50', entities));
+    const pageAt = (page: number) =>
+      service.listCountries(
+        { sourceId: '50', includeAggregates: false, page, perPage: 3 },
+        createMockContext(),
+      );
+    const pages = [await pageAt(1), await pageAt(2), await pageAt(3), await pageAt(4)];
+
+    expect(pages.map((p) => p.countries.map((c) => c.id))).toEqual([
+      ['E1', 'E2', 'E3'],
+      ['E4', 'E5', 'E6'],
+      ['E7'],
+      [],
+    ]);
+    expect(pages.map((p) => [p.total, p.pages, p.perPage])).toEqual(
+      Array.from({ length: 4 }, () => [7, 3, 3]),
+    );
+    expect(pages[0]?.countries[0]).toEqual({ id: 'E1', name: 'Entity 1', sourceId: '50' });
+    // One full read of the listing serves every page.
+    const listing = requestsTo('/v2/sources/50/country');
+    expect(listing).toHaveLength(1);
+    expect(listing[0]?.searchParams.get('per_page')).toBe('10000');
+  });
+
+  // ─── listCountries: filter ────────────────────────────────────────────────
+
+  /** Rows of `/v2/sources/50/country` (Subnational Population), 2026-11-11. */
+  const KENYA_50: Array<[string, string]> = [
+    ['KEN', 'Kenya'],
+    ['KEN_Central_KE.CN_51325_KEN001', 'Kenya, Central'],
+    ['KEN_Coast_KE.CO_51326_KEN002', 'Kenya, Coast'],
+    ['KEN_Eastern_KE.EA_51327_KEN003', 'Kenya, Eastern'],
+    ['KEN_Nairobi_Province_KE.NP_51328_KEN004', 'Kenya, Nairobi'],
+    ['KEN_North_Eastern_KE.NE_51329_KEN005', 'Kenya, North Eastern'],
+    ['KEN_Nyanza_KE.NY_51330_KEN006', 'Kenya, Nyanza'],
+    ['KEN_Rift_Valley_KE.RV_51331_KEN007', 'Kenya, Rift Valley'],
+    ['KEN_Western_KE.WE_51332_KEN008', 'Kenya, Western'],
+  ];
+  const SOURCE_50: Array<[string, string]> = [
+    ['EST_Parnu_EE.PR_1219_EST008', 'Estonia, Pärnu'],
+    ['IND_Kerala_IN.KL_1495_IND016', 'India, Kerala'],
+    ...KENYA_50,
+    ['KGZ_Naryn_KG.NA_1779_KGZ005', 'Kyrgyz Republic, Naryn'],
+  ];
+
+  /** Rows of `/v2/sources/38/country` (Subnational Poverty), 2026-11-11. */
+  const ZAMBIA_38: Array<[string, string]> = [
+    ['ZM', 'Zambia'],
+    ['ZM.CE', 'Central'],
+    ['ZM.CO', 'Copperbelt'],
+    ['ZM.ES', 'Eastern'],
+    ['ZM.LP', 'Luapula'],
+    ['ZM.LS', 'Lusaka'],
+    ['ZM.NR', 'Northern'],
+    ['ZM.NW', 'North-Western'],
+    ['ZM.SO', 'Southern'],
+    ['ZM.WE', 'Western'],
+  ];
+  const SOURCE_38: Array<[string, string]> = [
+    ['CR.PC_AGG_POV', 'Pacífico Central Region'],
+    ['KZ.ZM', 'Jambylslkaya'],
+    ['LV.ZM', 'Zemgale'],
+    ['UG.WE', 'Western'],
+    ...ZAMBIA_38,
+  ];
+
+  const ids = (entries: Array<[string, string]>) => entries.map(([id]) => id);
+
+  it.each([
+    ['Kenya', '50', ids(KENYA_50)],
+    ['nairobi kenya', '50', ['KEN_Nairobi_Province_KE.NP_51328_KEN004']],
+    ['kenya, NAIROBI', '50', ['KEN_Nairobi_Province_KE.NP_51328_KEN004']],
+    ['Nair', '50', ['KEN_Nairobi_Province_KE.NP_51328_KEN004']],
+    ['parnu', '50', ['EST_Parnu_EE.PR_1219_EST008']],
+    ['ESTONIA PÄRNU', '50', ['EST_Parnu_EE.PR_1219_EST008']],
+    ['ZM', '38', ['KZ.ZM', 'LV.ZM', ...ids(ZAMBIA_38)]],
+    ['zm.', '38', ['KZ.ZM', 'LV.ZM', ...ids(ZAMBIA_38)]],
+    ['pacifico', '38', ['CR.PC_AGG_POV']],
+    // "North-Western" holds "western" too; Uganda's UG.WE "Western" holds no "zm".
+    ['western zm', '38', ['ZM.NW', 'ZM.WE']],
+  ])(
+    'listCountries: source filter %j matches the id and name together',
+    async (filter, sourceId, expected) => {
+      routeByPath(sourceListingRoutes(sourceId, sourceId === '50' ? SOURCE_50 : SOURCE_38));
+      const result = await service.listCountries(
+        { sourceId, includeAggregates: false, filter, page: 1, perPage: 50 },
+        createMockContext(),
+      );
+      expect(result.countries.map((c) => c.id)).toEqual(expected);
+      expect(result).toMatchObject({ total: expected.length, pages: 1, perPage: 50 });
+    },
+  );
+
+  it('listCountries: pages filter matches at the served size, past the end included', async () => {
+    routeByPath(sourceListingRoutes('50', SOURCE_50));
+    const pageAt = (page: number) =>
+      service.listCountries(
+        { sourceId: '50', includeAggregates: false, filter: 'kenya', page, perPage: 4 },
+        createMockContext(),
+      );
+    const pages = [await pageAt(1), await pageAt(2), await pageAt(3), await pageAt(4)];
+
+    expect(pages.flatMap((p) => p.countries.map((c) => c.id))).toEqual(ids(KENYA_50));
+    expect(pages.map((p) => p.countries.length)).toEqual([4, 4, 1, 0]);
+    expect(pages.map((p) => [p.total, p.pages, p.page])).toEqual([
+      [9, 3, 1],
+      [9, 3, 2],
+      [9, 3, 3],
+      [9, 3, 4],
+    ]);
+  });
+
+  it('listCountries: a filter nothing matches leaves an empty first page and a zero total', async () => {
+    routeByPath(sourceListingRoutes('50', SOURCE_50));
+    const result = await service.listCountries(
+      { sourceId: '50', includeAggregates: false, filter: 'kenya provinces', page: 1, perPage: 50 },
+      createMockContext(),
+    );
+    expect(result).toEqual({ countries: [], total: 0, page: 1, pages: 1, perPage: 50 });
+  });
+
+  it('listCountries: a filter without letters or digits holds no word, so every entry matches', async () => {
+    routeByPath(sourceListingRoutes('50', SOURCE_50));
+    const result = await service.listCountries(
+      { sourceId: '50', includeAggregates: false, filter: '., -', page: 1, perPage: 50 },
+      createMockContext(),
+    );
+    expect(result.total).toBe(SOURCE_50.length);
+  });
+
+  it('listCountries: leaves the cached source listing whole after a filtered call', async () => {
+    routeByPath(sourceListingRoutes('50', SOURCE_50));
+    const list = (filter?: string) =>
+      service.listCountries(
+        {
+          sourceId: '50',
+          includeAggregates: false,
+          ...(filter && { filter }),
+          page: 1,
+          perPage: 50,
+        },
+        createMockContext(),
+      );
+    await list('nairobi kenya');
+    const whole = await list();
+    expect(whole.countries.map((c) => c.id)).toEqual(ids(SOURCE_50));
+    expect((await list('kenya')).total).toBe(KENYA_50.length);
+  });
+
+  it.each([
+    { region: 'SSF' },
+    { incomeLevel: 'LIC' },
+    { lendingType: 'IDX' },
+    { includeAggregates: true },
+  ])(
+    'listCountries: keeps rejecting %j beside filter on a source listing, before any request',
+    async (classification) => {
+      routeByPath(sourceListingRoutes('50', SOURCE_50));
+      await expect(
+        service.listCountries(
+          {
+            sourceId: '50',
+            includeAggregates: false,
+            filter: 'Kenya',
+            page: 1,
+            perPage: 50,
+            ...classification,
+          },
+          createMockContext(),
+        ),
+      ).rejects.toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        data: { reason: 'unsupported_source_filter' },
+      });
+      expect(fetchWithTimeoutMock).not.toHaveBeenCalled();
+    },
+  );
+
+  /** `/v2/country` rows (2026-11-11): the 14 Sub-Saharan aggregates and a few economies. */
+  const SUB_SAHARAN_AGGREGATES: Array<[string, string, string]> = [
+    ['BSS', 'B6', 'Sub-Saharan Africa (IBRD-only countries)'],
+    ['CAA', 'C9', 'Sub-Saharan Africa (IFC classification)'],
+    ['DNS', 'N6', 'IDA countries in Sub-Saharan Africa not classified as fragile situations '],
+    ['DSF', 'F6', 'IDA countries in Sub-Saharan Africa classified as fragile situations '],
+    ['DSS', 'D6', 'Sub-Saharan Africa (IDA-eligible countries)'],
+    ['FXS', '6F', 'IDA countries classified as fragile situations, excluding Sub-Saharan Africa'],
+    ['NRS', '6X', 'Non-resource rich Sub-Saharan Africa countries'],
+    [
+      'NXS',
+      '6N',
+      'IDA countries not classified as fragile situations, excluding Sub-Saharan Africa',
+    ],
+    ['RRS', 'R6', 'Resource rich Sub-Saharan Africa countries'],
+    ['SSA', 'ZF', 'Sub-Saharan Africa (excluding high income)'],
+    ['SSF', 'ZG', 'Sub-Saharan Africa '],
+    ['SXZ', 'A4', 'Sub-Saharan Africa excluding South Africa'],
+    ['TSS', 'T6', 'Sub-Saharan Africa (IDA & IBRD countries)'],
+    ['XZN', 'A5', 'Sub-Saharan Africa excluding South Africa and Nigeria'],
+  ];
+  const GLOBAL_ROWS = [
+    ...SUB_SAHARAN_AGGREGATES.map(([id, iso2, name]) => rawAggregate(id, iso2, name)),
+    { ...rawCountry('CIV', "Cote d'Ivoire"), region: { id: 'SSF', value: 'Sub-Saharan Africa ' } },
+    {
+      ...rawCountry('COD', 'Congo, Dem. Rep.'),
+      region: { id: 'SSF', value: 'Sub-Saharan Africa ' },
+    },
+    { ...rawCountry('COG', 'Congo, Rep.'), region: { id: 'SSF', value: 'Sub-Saharan Africa ' } },
+    rawCountry('KOR', 'Korea, Rep.'),
+    rawCountry('PRK', "Korea, Dem. People's Rep."),
+  ];
+
+  it.each([
+    ['Sub-Saharan', true, SUB_SAHARAN_AGGREGATES.map(([id]) => id)],
+    ['Sub-Saharan', false, []],
+    ['korea', false, ['KOR', 'PRK']],
+    ['CONGO', true, ['COD', 'COG']],
+    ['cote', false, ['CIV']],
+    ['ssf', true, ['SSF']],
+  ] as const)(
+    'listCountries: global filter %j (include_aggregates=%s) reads the whole listing',
+    async (filter, includeAggregates, expected) => {
+      routeByPath({ '/v2/country': [pagingObj({ total: GLOBAL_ROWS.length }), GLOBAL_ROWS] });
+      const result = await service.listCountries(
+        { includeAggregates, filter, page: 1, perPage: 50 },
+        createMockContext(),
+      );
+      expect(result.countries.map((c) => c.id)).toEqual(expected);
+      expect(result).toMatchObject({ total: expected.length, pages: 1 });
+      // The one-page path would have sent page/per_page through and counted upstream's total.
+      const [request, ...rest] = requestsTo('/v2/country');
+      expect(rest).toEqual([]);
+      expect(request?.searchParams.get('per_page')).toBe('10000');
+      expect(request?.searchParams.get('page')).toBe('1');
+    },
+  );
+
+  it('listCountries: pages global filter matches locally at the served size', async () => {
+    routeByPath({ '/v2/country': [pagingObj({ total: GLOBAL_ROWS.length }), GLOBAL_ROWS] });
+    const pageAt = (page: number) =>
+      service.listCountries(
+        { includeAggregates: true, filter: 'saharan', page, perPage: 5 },
+        createMockContext(),
+      );
+    const pages = [await pageAt(1), await pageAt(2), await pageAt(3), await pageAt(4)];
+    expect(pages.map((p) => p.countries.length)).toEqual([5, 5, 4, 0]);
+    expect(pages.flatMap((p) => p.countries.map((c) => c.id))).toEqual(
+      SUB_SAHARAN_AGGREGATES.map(([id]) => id),
+    );
+    expect(pages.map((p) => [p.total, p.pages])).toEqual(Array.from({ length: 4 }, () => [14, 3]));
+  });
+
+  it('listCountries: sends region, income_level and lending_type upstream and filters what comes back', async () => {
+    const doubled = ['COD', 'COG', 'CIV'].flatMap((id) => {
+      const row = GLOBAL_ROWS.find((r) => r.id === id);
+      return [row, { ...row }];
+    });
+    routeByPath({ '/v2/country': [pagingObj({ total: doubled.length }), doubled] });
+    const result = await service.listCountries(
+      {
+        region: 'SSF',
+        incomeLevel: 'LIC',
+        lendingType: 'IDX',
+        includeAggregates: false,
+        filter: 'congo',
+        page: 1,
+        perPage: 50,
+      },
+      createMockContext(),
+    );
+
+    const params = requestsTo('/v2/country')[0]?.searchParams;
+    expect(params?.get('region')).toBe('SSF');
+    expect(params?.get('incomeLevel')).toBe('LIC');
+    expect(params?.get('lendingType')).toBe('IDX');
+    expect(params?.has('filter')).toBe(false);
+    // Each doubled upstream entry counts once, after the filter.
+    expect(result.countries.map((c) => c.id)).toEqual(['COD', 'COG']);
+    expect(result.total).toBe(2);
+  });
 
   // ─── searchIndicators ─────────────────────────────────────────────────────
 

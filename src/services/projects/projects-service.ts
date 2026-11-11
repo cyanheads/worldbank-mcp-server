@@ -22,10 +22,11 @@ import {
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { defaultIsTransient, fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
+import { plainProse } from '@/services/plain-prose.js';
 import { MAX_PROJECTS_PER_PAGE } from '@/services/response-budget.js';
 import { normalizeSectorNames } from './normalize-sector-names.js';
 import { toWdiIso2 } from './portfolio-country-codes.js';
-import type { ProjectSummary, RawProject, RawProjectsEnvelope } from './types.js';
+import type { ProjectSector, ProjectSummary, RawProject, RawProjectsEnvelope } from './types.js';
 
 /** Minimal request-context shape that satisfies fetchWithTimeout and withRetry. */
 type ReqCtx = Context & Record<string, unknown>;
@@ -58,11 +59,14 @@ const MULTI_VALUE_SEPARATOR = '^';
  * Fields requested via `fl`. Without it the response carries a fixed default
  * projection that omits `status`, `countryname`, `countrycode`, and the
  * abstract. Requesting a list does not narrow the response to exactly that list:
- * `proj_id` and `project_abstract` come back whatever is asked for.
+ * `proj_id` and `project_abstract` come back whatever is asked for, while `pdo`
+ * comes back only when listed. `major_sectors` carries each major sector's
+ * sub-sectors nested inside it.
  */
 const PROJECT_FIELDS = [
   'id',
   'project_name',
+  'pdo',
   'status',
   'countryname',
   'countrycode',
@@ -142,7 +146,7 @@ function toCalendarDate(value: string | null | undefined): string | null {
   return match ? (match[1] as string) : value;
 }
 
-/** Monetary fields arrive as strings; an absent amount is absent, not zero. */
+/** Monetary amounts and sector shares arrive as strings; an absent value is absent, not zero. */
 function toAmount(value: string | null | undefined): number | null {
   if (value === null || value === undefined || value.trim() === '') return null;
   const amount = Number(value);
@@ -161,11 +165,42 @@ function majorSectorNames(raw: RawProject): string[] {
   return [...new Set(names)];
 }
 
+/**
+ * Sub-sectors flattened out of their major sectors, in upstream order, each
+ * keeping the major sector it sits under. Names are trimmed: eight are stored
+ * with a trailing space, which carries no meaning, and the `sector` filter
+ * sends that spelling back for every name. A project whose shares are all zero
+ * publishes no split — 6,227 of 23,377 sectored projects, mostly pre-1990
+ * records and the pipeline — so its shares are null rather than zero, which a
+ * caller weighting a commitment by share would read as nothing committed.
+ */
+function projectSectors(raw: RawProject): ProjectSector[] {
+  const sectors = (raw.major_sectors ?? []).flatMap(({ major_sector }) =>
+    (major_sector?.sectors ?? []).map((sector) => ({
+      name: (sector.sector_name ?? '').trim(),
+      code: sector.sector_code ?? '',
+      majorSector: major_sector?.major_sector_name ?? '',
+      percent: toAmount(sector.sector_percent),
+    })),
+  );
+  if (sectors.every((sector) => !sector.percent)) {
+    for (const sector of sectors) sector.percent = null;
+  }
+  return sectors;
+}
+
+/** Upstream prose as trimmed plain text; null when the project publishes none. */
+function plainText(value: string | null | undefined): string | null {
+  const text = plainProse(value ?? '').trim();
+  return text === '' ? null : text;
+}
+
 function normalizeProject(raw: RawProject, includeAbstract: boolean): ProjectSummary {
   const id = raw.id ?? '';
   return {
     id,
     name: raw.project_name ?? '',
+    objective: plainText(raw.pdo),
     status: raw.status ?? '',
     countryCodes: (raw.countrycode ?? []).map(toWdiIso2),
     countryName: raw.countryname ?? '',
@@ -179,7 +214,8 @@ function normalizeProject(raw: RawProject, includeAbstract: boolean): ProjectSum
     // Upstream repeats a financing window once per instrument drawn on it.
     financialTypes: [...new Set(raw.projectfinancialtype ?? [])],
     majorSectors: majorSectorNames(raw),
-    abstract: includeAbstract ? (raw.project_abstract ?? null) : null,
+    sectors: projectSectors(raw),
+    abstract: includeAbstract ? plainText(raw.project_abstract) : null,
     url: `${PROJECT_PAGE_BASE}/${id}`,
   };
 }
@@ -209,7 +245,7 @@ export type ProjectSearchOptions = {
   perPage: number;
   query?: string;
   regions: string[];
-  /** Sector names, combined as OR across bare and FY17 spellings. */
+  /** Sector names, combined as OR across the bare, trailing-space, and FY17 spellings. */
   sectors?: string[];
   statuses: string[];
 };
@@ -385,10 +421,16 @@ export class ProjectsService {
       ...(opts.regions.length > 0 && {
         regionname_exact: opts.regions.join(MULTI_VALUE_SEPARATOR),
       }),
+      /**
+       * `sector_exact` matches case and whitespace exactly, and upstream stores a
+       * name three ways: bare, FY17-prefixed, and — for eight current names — with
+       * a trailing space, which only that spelling matches. No FY17 name carries
+       * one, so the three spellings cover every stored form of a name.
+       */
       ...(sectors.length > 0 && {
-        sector_exact: [...new Set(sectors.flatMap((name) => [name, `FY17 - ${name}`]))].join(
-          MULTI_VALUE_SEPARATOR,
-        ),
+        sector_exact: [
+          ...new Set(sectors.flatMap((name) => [name, `${name} `, `FY17 - ${name}`])),
+        ].join(MULTI_VALUE_SEPARATOR),
       }),
       ...(opts.financialTypes.length > 0 && {
         projectfinancialtype_exact: opts.financialTypes.join(MULTI_VALUE_SEPARATOR),

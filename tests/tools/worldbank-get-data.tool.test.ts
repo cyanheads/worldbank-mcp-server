@@ -14,7 +14,7 @@ vi.mock('@/services/worldbank/worldbank-service.js', () => ({
 }));
 
 vi.mock('@/config/server-config.js', () => ({
-  getServerConfig: vi.fn().mockReturnValue({ defaultPerPage: 50 }),
+  getServerConfig: vi.fn().mockReturnValue({ defaultPerPage: 50, clampLimits: true }),
 }));
 
 const usRow = {
@@ -1428,10 +1428,27 @@ describe('worldbankGetData', () => {
       'unknown_dimension_value',
       JsonRpcErrorCode.ValidationError,
       {
-        validValues: [{ sourceId: '57', concept: 'Version', ids: ['202407', '202503'] }],
+        validValues: [
+          {
+            sourceId: '57',
+            concept: 'Version',
+            ids: ['202407', '202503'],
+            values: [
+              { id: '202407', label: '2024 Jul' },
+              { id: '202503', label: '2025 Mar' },
+            ],
+          },
+        ],
       },
-      'dimension_value "199912" is not a value "SM.POP.REFG.OR" can be queried at. Valid values — WDI Database Archives (source 57) Version: 202407, 202503.',
-      /Recovery:.*dimension ids the error message lists/,
+      'dimension_value "199912" is not a value "SM.POP.REFG.OR" can be queried at. Valid values — WDI Database Archives (source 57) Version: 202407 "2024 Jul", 202503 "2025 Mar".',
+      /Recovery:.*one of the ids the error message lists.*or the label quoted beside one/,
+    ],
+    [
+      'ambiguous_dimension_value',
+      JsonRpcErrorCode.ValidationError,
+      { sourceId: '57', concept: 'Version', ids: ['199309', '199409'] },
+      'dimension_value "1994 Sep" is the label of more than one value "SM.POP.REFG.OR" can be queried at — WDI Database Archives (source 57) Version: 199309 "1994 Sep", 199409 "1994 Sep".',
+      /Recovery:.*one of the ids the error message names/,
     ],
     [
       'dimension_not_applicable',
@@ -1479,6 +1496,37 @@ describe('worldbankGetData', () => {
       expect(text).toMatch(recovery);
     },
   );
+
+  it.each([
+    ['unknown_dimension_value', 'Valid values — WDI Database Archives (source 57) Version: '],
+    [
+      'ambiguous_dimension_value',
+      'more than one value — WDI Database Archives (source 57) Version: ',
+    ],
+  ])('renders the ids %s names as code spans in content[] only', async (reason, lead) => {
+    const message = `dimension_value "1994 Sep" ${lead}199309 "1994 Sep", 199409 "1994 Sep".`;
+    const rejection = new McpError(
+      JsonRpcErrorCode.ValidationError,
+      message,
+      { reason },
+      { literals: ['199309', '199409'] },
+    );
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      getData: vi.fn().mockRejectedValue(rejection),
+    } as never);
+    const { worldbankGetData } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
+    );
+    const result = await runToolContract(
+      worldbankGetData,
+      { indicator_id: 'SM.POP.REFG.OR', countries: 'SDN', dimension_value: '1994 Sep' },
+      { context: { errors: worldbankGetData.errors } },
+    );
+    expect(result.structuredContent).toMatchObject({ error: { message, data: { reason } } });
+    const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+    expect(text).toContain('`199309` "1994 Sep", `199409` "1994 Sep".');
+  });
 
   it.each([
     'indicator_not_found',

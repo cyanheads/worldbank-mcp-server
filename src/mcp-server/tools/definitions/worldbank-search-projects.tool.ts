@@ -1,16 +1,16 @@
 /**
  * @fileoverview Search the World Bank lending portfolio — active, closed,
  * dropped, and pipeline operations — by free text, country, region, status,
- * financing window, and board approval date.
+ * sector, financing window, and board approval date.
  * @module mcp-server/tools/definitions/worldbank-search-projects.tool
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { escapeMarkdownInline, markdownLink } from '@cyanheads/mcp-ts-core/utils';
-import { getServerConfig } from '@/config/server-config.js';
 import { pagePastEndNotice } from '@/mcp-server/tools/page-past-end-notice.js';
 import { pageSizeReducedNotice } from '@/mcp-server/tools/page-size-reduced-notice.js';
+import { perPageInput, resolvePerPage } from '@/mcp-server/tools/per-page.js';
 import { normalizeSectorNames } from '@/services/projects/normalize-sector-names.js';
 import { toPortfolioCode } from '@/services/projects/portfolio-country-codes.js';
 import { getProjectsService } from '@/services/projects/projects-service.js';
@@ -21,7 +21,7 @@ import { getWorldBankApiService } from '@/services/worldbank/worldbank-service.j
 /**
  * The Projects API keys countries on a two-character code — ISO2 for an
  * individual economy (a legacy code for four of them), and a World Bank regional
- * code such as `3A` for a multi-country operation. Every other tool on this
+ * code such as `3W` for a multi-country operation. Every other tool on this
  * server takes ISO3 too, so a three-character code is resolved through the World
  * Bank country index before the request; sent as-is it would come back as a
  * plain zero-hit rather than an error. Digits are accepted because the regional
@@ -34,8 +34,9 @@ const PROJECT_STATUSES = ['Active', 'Closed', 'Dropped', 'Pipeline'] as const;
 
 /**
  * Operational regions the portfolio publishes, which are the World Bank's
- * lending regions rather than the WDI aggregate codes the other tools use —
- * "Africa" and "Other" are legacy buckets on older operations.
+ * lending regions rather than the WDI aggregate codes the other tools use.
+ * "Africa" is the pre-split region, on closed and dropped operations only (245,
+ * 2026-11-11); "Other" holds current world and multi-regional operations.
  */
 const PROJECT_REGIONS = [
   'East Asia and Pacific',
@@ -77,7 +78,7 @@ function isCalendarDate(value: string): boolean {
 export const worldbankSearchProjects = tool('worldbank_search_projects', {
   title: 'Search World Bank Projects',
   description:
-    'Search the World Bank lending portfolio — the individual loans, credits, and grants the Bank finances — by free text, country, region, status, sector names, financing window (IBRD, IDA, Grants, Other), and board approval date. For classified education commitments use sector: ["Education"], rather than a free-text education query. Returns the project ID, name, borrowing country, region, status, board approval and closing dates, the commitment amount in USD with its IBRD, IDA, and grant parts, financing windows, major sectors, and a link to the project page. This is the operations catalogue, not the statistics catalogue: use it for "what is the World Bank funding in Kenya", "which climate adaptation projects are active", or "how much was committed to education in South Asia since 2020". For development statistics and time series, use worldbank_search_indicators and worldbank_get_data instead. Countries take the ISO3 or ISO2 codes the other tools take (BRA or BR), and multi-country operations carry a World Bank regional code such as 3A; WDI aggregates such as SSF or WLD are rejected, since the portfolio lists operations by economy — use region for those. Every filter is an exact match upstream and combines with the others by AND, so a narrow search can legitimately return nothing; when it does, the response says whether the country codes matched anything on their own.',
+    'Search the World Bank lending portfolio — the individual loans, credits, and grants the Bank finances — by free text, country, region, status, sector, financing window (IBRD, IDA, Grants, Other), and board approval date. Returns the project ID, name, development objective, borrowing country, region, status, board approval and closing dates, the commitment amount in USD with its IBRD, IDA, and grant parts, financing windows, major sectors, the sub-sectors under them with the share of the commitment each carries, and a link to the project page. This is the operations catalogue, not the statistics catalogue: use it for "what is the World Bank funding in Kenya", "which climate adaptation projects are active", or "how much was committed to education in South Asia since 2020". For development statistics and time series, use worldbank_search_indicators and worldbank_get_data instead. sector takes the sub-sector names rows list in sectors[].name, not the majorSectors names — for education commitments, sector: ["Primary Education", "Secondary Education", "Tertiary Education"] rather than a free-text query, which also matches incidental prose. Those are three of the Education sub-sectors, so read sectors[].name on a few matching rows to collect the rest before totalling a whole sector. A project matches when it lists a sector at any share, so a sector total weights each totalCommitment by the percent that sector carries. Countries take the ISO3 or ISO2 codes the other tools take (BRA or BR), and multi-country operations carry a World Bank regional code such as 3W or 3E; WDI aggregates such as SSF or WLD are rejected, since the portfolio lists operations by economy — use region for those. Every filter is an exact match upstream and combines with the others by AND, so a narrow search can legitimately return nothing; when it does, the response says whether the country codes matched anything on their own.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   inputAliases: { limit: 'per_page' },
   input: z.object({
@@ -102,7 +103,7 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
       ])
       .optional()
       .describe(
-        'Borrowing countries: an economy by ISO3 or ISO2 code (BRA or BR), or a World Bank regional code for a multi-country operation (3A for Africa, 4E for East Asia and Pacific). Several codes — an array, or one string separated by commas, semicolons, or pipes — are combined as OR: a project matching any of them is returned. A value made only of separators is rejected rather than read as every country. Yemen, DR Congo, West Bank and Gaza, and Timor-Leste are searched under the legacy codes the portfolio files them by (RY, ZR, GZ, TP), which are also accepted as sent. A WDI aggregate (SSF, WLD, SAS) is rejected; use region for a regional search. Omit for every country.',
+        'Borrowing countries: an economy by ISO3 or ISO2 code (BRA or BR), or a World Bank regional code for a multi-country operation (3W for Western and Central Africa, 3E for Eastern and Southern Africa, 4E for East Asia and Pacific). 3A is the pre-split Africa code, found only on closed and dropped operations. Several codes — an array, or one string separated by commas, semicolons, or pipes — are combined as OR: a project matching any of them is returned. A value made only of separators is rejected rather than read as every country. Yemen, DR Congo, West Bank and Gaza, and Timor-Leste are searched under the legacy codes the portfolio files them by (RY, ZR, GZ, TP), which are also accepted as sent. A WDI aggregate (SSF, WLD, SAS) is rejected; use region for a regional search. Omit for every country.',
       ),
     status: z
       .array(z.enum(PROJECT_STATUSES))
@@ -111,16 +112,18 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
         'Lifecycle stages to include, combined as OR. "Active" is under implementation, "Pipeline" is approved but not yet effective, "Closed" has finished disbursing, and "Dropped" was abandoned before approval. Most of the portfolio is closed, so omitting this returns mostly historical operations.',
       ),
     sector: z
-      .array(z.string().describe('A sector name, optionally prefixed FY17 - .'))
+      .array(
+        z.string().describe('A sub-sector name from sectors[].name, optionally prefixed FY17 - .'),
+      )
       .optional()
       .describe(
-        'Exact sector names, such as Education or FY17 - Social Protection, combined as OR across bare and FY17 spellings. Use names copied from the Projects API sector_exact facet, not sector codes. Unknown names return no matches; each name must be nonblank and contain no caret. Combines with other filters by AND.',
+        'Sub-sector names exactly as rows list them in sectors[].name, such as Primary Education or FY17 - Social Protection — not the majorSectors names, and not sector codes. Each name is searched in its bare and FY17 - spellings at once, and several names combine as OR. A project matches when it lists the sector at any share, so a sector total weights each commitment by sectors[].percent. Unknown names return no matches; each name must be nonblank and contain no caret. Combines with other filters by AND.',
       ),
     region: z
       .array(z.enum(PROJECT_REGIONS))
       .optional()
       .describe(
-        'World Bank operational regions to include, combined as OR. These are the lending regions the portfolio is organized by, not the WDI aggregate codes worldbank_get_data accepts.',
+        'World Bank operational regions to include, combined as OR. These are the lending regions the portfolio is organized by, not the WDI aggregate codes worldbank_get_data accepts. Africa is the pre-split region, found only on closed and dropped operations; current African operations sit under Eastern and Southern Africa or Western and Central Africa.',
       ),
     financial_type: z
       .array(z.enum(FINANCING_WINDOWS))
@@ -159,14 +162,7 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
         "Include each project's complete abstract without changing page size. A project with no abstract reports null; appliedFilters.includeAbstract distinguishes omission from unavailable text.",
       ),
     page: z.number().int().min(1).default(1).describe('Pagination page number (1-based).'),
-    per_page: z
-      .number()
-      .int()
-      .min(1)
-      .optional()
-      .describe(
-        'Results per page (default: server default). Positive integers above 1000 are served at that maximum with the requested and served sizes echoed and a notice. totalPages uses the served size.',
-      ),
+    per_page: perPageInput(MAX_PROJECTS_PER_PAGE),
   }),
   output: z.object({
     projects: z
@@ -175,11 +171,17 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
           .object({
             id: z.string().describe('World Bank project ID, e.g. P513206.'),
             name: z.string().describe('Project name.'),
+            objective: z
+              .string()
+              .nullable()
+              .describe(
+                'Project development objective — what the operation sets out to achieve — as plain text, with markup removed and entities decoded. Null where the project publishes none: 6% of active operations and most dropped ones. A few values stop at 8,000 characters, cut short upstream.',
+              ),
             status: z.string().describe('Lifecycle stage: Active, Closed, Dropped, or Pipeline.'),
             countryCodes: z
               .array(z.string())
               .describe(
-                "Two-character code of the borrowing country — the economy's ISO2 code, which chains into the other tools (YE for Yemen, though the portfolio files it under RY), or a World Bank regional code such as 3A for a multi-country operation. Upstream publishes it as a list, though every project in the portfolio carries exactly one.",
+                "Two-character code of the borrowing country — the economy's ISO2 code, which chains into the other tools (YE for Yemen, though the portfolio files it under RY), or a World Bank regional code such as 3W for a multi-country operation. Upstream publishes it as a list, though every project in the portfolio carries exactly one.",
               ),
             countryName: z.string().describe('Borrowing country, as the portfolio names it.'),
             regionName: z.string().describe('World Bank operational region.'),
@@ -227,13 +229,38 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
             majorSectors: z
               .array(z.string())
               .describe(
-                'Major sectors the operation is classified under, e.g. Health, Education, Transportation. Empty where the portfolio publishes no sector classification.',
+                'Major sectors the operation is classified under, e.g. Health, Education, Transportation. Empty where the portfolio publishes no sector classification. The sector filter takes the sub-sector names in sectors, not these.',
+              ),
+            sectors: z
+              .array(
+                z
+                  .object({
+                    name: z
+                      .string()
+                      .describe(
+                        'Sub-sector name, e.g. Primary Education or FY17 - Social Protection: the value the sector filter takes.',
+                      ),
+                    code: z.string().describe('Sector code, e.g. EEP.'),
+                    majorSector: z
+                      .string()
+                      .describe('The majorSectors name this sub-sector is listed under.'),
+                    percent: z
+                      .number()
+                      .nullable()
+                      .describe(
+                        'Share of the commitment, in percent; the shares of a project usually sum to 100. Null on every entry of a project that publishes no split — its upstream shares are all zero — which is not a share of zero.',
+                      ),
+                  })
+                  .describe('One sub-sector of the operation.'),
+              )
+              .describe(
+                'Sub-sectors the operation is classified under, in upstream order, each with its major sector and share. Empty where the portfolio publishes no sector classification. A sector total weights totalCommitment by percent.',
               ),
             abstract: z
               .string()
               .nullable()
               .describe(
-                'Complete project abstract. Null when include_abstract was not requested or the project publishes none; appliedFilters.includeAbstract distinguishes them.',
+                'Complete project abstract as plain text. Null when include_abstract was not requested or the project publishes none; appliedFilters.includeAbstract distinguishes them.',
               ),
             url: z.string().describe('Project page on projects.worldbank.org.'),
           })
@@ -365,7 +392,7 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
       code: JsonRpcErrorCode.ValidationError,
       when: 'A countries entry resolves to no economy: it is not two or three letters or digits, no economy in the World Bank country index has that three-character code, or it is a WDI aggregate such as SSF or WLD, which the portfolio lists no operations under. Also when countries holds only separators and so names no code at all.',
       recovery:
-        'Pass each economy by an ISO3 or ISO2 code worldbank_list_countries lists, or a World Bank regional code such as 3A for multi-country operations. For every project in a region, drop the aggregate code and set the region filter instead.',
+        'Pass each economy by an ISO3 or ISO2 code worldbank_list_countries lists, or a World Bank regional code such as 3W for multi-country operations. For every project in a region, drop the aggregate code and set the region filter instead.',
     },
     {
       reason: 'invalid_date',
@@ -417,7 +444,6 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
     const query = input.query?.trim() ? input.query.trim() : undefined;
     const approvedFrom = input.approved_from || undefined;
     const approvedTo = input.approved_to || undefined;
-    const perPage = input.per_page ?? getServerConfig().defaultPerPage;
 
     /**
      * Checked here rather than on the schema so each failure carries a reason and
@@ -442,7 +468,7 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
     if (malformedCodes.length > 0) {
       throw ctx.fail(
         'invalid_country_code',
-        `Country code(s) "${malformedCodes.join(', ')}" must be two or three letters or digits: an economy's ISO3 or ISO2 code (BRA, BR) or a World Bank regional code for a multi-country operation (3A, 4E).`,
+        `Country code(s) "${malformedCodes.join(', ')}" must be two or three letters or digits: an economy's ISO3 or ISO2 code (BRA, BR) or a World Bank regional code for a multi-country operation (3W, 4E).`,
         { invalidCodes: malformedCodes },
       );
     }
@@ -544,6 +570,10 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
       page: input.page,
     });
 
+    const pageSize = resolvePerPage(
+      { tool: 'worldbank_search_projects', cap: MAX_PROJECTS_PER_PAGE, perPage: input.per_page },
+      ctx,
+    );
     let result: Awaited<ReturnType<ReturnType<typeof getProjectsService>['searchProjects']>>;
     try {
       result = await getProjectsService().searchProjects(
@@ -558,7 +588,7 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
           ...(approvedTo !== undefined && { approvedTo }),
           includeAbstract: input.include_abstract,
           page: input.page,
-          perPage: Math.min(perPage, MAX_PROJECTS_PER_PAGE),
+          perPage: pageSize.served,
         },
         ctx,
       );
@@ -597,7 +627,7 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
         includeAbstract: input.include_abstract,
         page: input.page,
         perPage: result.perPage,
-        ...(result.perPage < perPage && { requestedPerPage: perPage }),
+        ...(result.perPage < pageSize.requested && { requestedPerPage: pageSize.requested }),
       },
     });
     ctx.enrich({ totalCount: result.total, currentPage: result.page, totalPages: result.pages });
@@ -606,7 +636,7 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
     if (result.total === 0) {
       const sectorAdvice =
         sectors.length > 0
-          ? ' Sector names match exactly across bare and FY17 spellings. Check the sector name or remove the sector filter and retry.'
+          ? ' The sector filter matches the sub-sector names rows list in sectors[].name exactly, in bare and FY17 - spellings, not the majorSectors names. Check each name against sectors[].name on a search without the filter, or remove the sector filter and retry.'
           : '';
       /**
        * An exact-match filter that matches nothing is a plain zero-hit upstream,
@@ -628,7 +658,7 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
 
       if (result.countryOnlyTotal === 0) {
         notices.push(
-          `No project carries country code(s) ${codeList}, with every other filter removed: either the portfolio uses no such code, or that economy has no World Bank lending history. Economies are searched by ISO2, an ISO3 code resolved to it, and multi-country operations by a regional code such as 3A.${sectorAdvice}`,
+          `No project carries country code(s) ${codeList}, with every other filter removed: either the portfolio uses no such code, or that economy has no World Bank lending history. Economies are searched by ISO2, an ISO3 code resolved to it, and multi-country operations by a regional code such as 3W.${sectorAdvice}`,
         );
       } else if (result.countryOnlyTotal !== null) {
         /**
@@ -662,7 +692,7 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
       );
     }
     const reduced = pageSizeReducedNotice({
-      requested: perPage,
+      requested: pageSize.requested,
       served: result.perPage,
       page: result.page,
       pages: result.pages,
@@ -695,18 +725,26 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
       return ` (${parts.map(([field, value]) => `${field} ${amount(value)}`).join(' · ')})`;
     };
 
+    /** `name (code · majorSector · share)`; sector names carry commas, so entries join with `; `. */
+    const sector = (entry: (typeof result.projects)[number]['sectors'][number]) =>
+      `${escapeMarkdownInline(entry.name)} (${escapeMarkdownInline(entry.code)} · ${escapeMarkdownInline(entry.majorSector)} · ${entry.percent === null ? 'percent null' : `${entry.percent}%`})`;
+
     /**
-     * A row with no abstract gets no abstract line: format() sees only the rows, and
-     * the applied-filters trailer's include_abstract says whether abstracts were
-     * requested at all.
+     * A row with no objective or abstract gets no line for it: format() sees only
+     * the rows, and the applied-filters trailer's include_abstract says whether
+     * abstracts were requested at all.
      */
     for (const project of result.projects) {
+      lines.push(`\n${escapeMarkdownInline(project.name)} (${escapeMarkdownInline(project.id)})`);
+      if (project.objective !== null)
+        lines.push(`- **objective:** ${escapeMarkdownInline(project.objective)}`);
       lines.push(
-        `\n${escapeMarkdownInline(project.name)} (${escapeMarkdownInline(project.id)})`,
         `- **status:** ${escapeMarkdownInline(project.status || 'unknown')} | **countryName:** ${escapeMarkdownInline(project.countryName)} | **countryCodes:** ${project.countryCodes.map(escapeMarkdownInline).join(', ') || 'none'} | **regionName:** ${escapeMarkdownInline(project.regionName)}`,
         `- **boardApprovalDate:** ${escapeMarkdownInline(String(project.boardApprovalDate))} | **closingDate:** ${escapeMarkdownInline(String(project.closingDate))}`,
         `- **totalCommitment:** ${amount(project.totalCommitment)}${project.totalCommitment === null ? '' : ' USD'}${breakdown(project)} | **financialTypes:** ${project.financialTypes.map(escapeMarkdownInline).join(', ') || 'none'}`,
-        `- **majorSectors:** ${project.majorSectors.map(escapeMarkdownInline).join(', ') || 'none'}`,
+        // Major-sector names carry commas too (Agriculture, Fishing and Forestry).
+        `- **majorSectors:** ${project.majorSectors.map(escapeMarkdownInline).join('; ') || 'none'}`,
+        `- **sectors:** ${project.sectors.map(sector).join('; ') || 'none'}`,
         `- **url:** ${markdownLink(project.url, project.url)}`,
       );
       if (project.abstract !== null)

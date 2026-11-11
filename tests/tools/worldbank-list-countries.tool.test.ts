@@ -5,6 +5,7 @@
 
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@/services/worldbank/worldbank-service.js', () => ({
@@ -13,7 +14,7 @@ vi.mock('@/services/worldbank/worldbank-service.js', () => ({
 }));
 
 vi.mock('@/config/server-config.js', () => ({
-  getServerConfig: vi.fn().mockReturnValue({ defaultPerPage: 50 }),
+  getServerConfig: vi.fn().mockReturnValue({ defaultPerPage: 50, clampLimits: true }),
 }));
 
 const mockCountriesResult = {
@@ -58,6 +59,25 @@ function servesAsAsked(result: object) {
     ...result,
   }));
 }
+
+/**
+ * The text a CommonMark parse reads back from inline Markdown built only from
+ * what `escapeMarkdownInline` emits: backslash escapes of ASCII punctuation,
+ * backslash hard breaks, and decimal numeric references.
+ */
+function commonMarkText(markdown: string): string {
+  return markdown.replace(
+    /\\\n|\\([!-/:-@[-`{-~])|&#(\d+);/g,
+    (_, punctuation: string | undefined, code: string | undefined) =>
+      punctuation ?? (code === undefined ? '\n' : String.fromCodePoint(Number(code))),
+  );
+}
+
+function textOf(result: Awaited<ReturnType<typeof runToolContract>>) {
+  return result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+}
+
+const NO_MATCH = { countries: [], total: 0, page: 1, pages: 1 };
 
 describe('worldbankListCountries', () => {
   beforeEach(async () => {
@@ -481,6 +501,149 @@ describe('worldbankListCountries', () => {
       three,
     );
     expect(getEnrichment(three).notice).toMatch(/region=NAC, income_level=LIC, lending_type=IDX/);
+  });
+
+  // ─── filter ───────────────────────────────────────────────────────────────
+
+  it('passes the trimmed filter to the service and echoes it on both surfaces', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    const listCountries = servesAsAsked(mockCountriesResult);
+    vi.mocked(getWorldBankApiService).mockReturnValue({ listCountries } as never);
+    const { worldbankListCountries } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
+    );
+
+    const result = await runToolContract(worldbankListCountries, {
+      source_id: '50',
+      filter: '  Nairobi Kenya ',
+    });
+    expect(listCountries.mock.calls[0]?.[0]).toMatchObject({
+      sourceId: '50',
+      filter: 'Nairobi Kenya',
+    });
+    expect((result.structuredContent as { appliedFilters: object }).appliedFilters).toEqual({
+      sourceId: '50',
+      includeAggregates: false,
+      filter: 'Nairobi Kenya',
+      page: 1,
+      perPage: 50,
+    });
+    expect(textOf(result)).toContain(
+      '**Applied Filters:** source_id=50, filter="Nairobi Kenya", include_aggregates=false, page=1, per_page=50',
+    );
+  });
+
+  const wordless = ['', '   ', '\n\t', '.', ' -- ', '—'];
+  it.each(wordless)('reads a filter with no letter or digit, %j, as absent', async (filter) => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    const listCountries = servesAsAsked(mockCountriesResult);
+    vi.mocked(getWorldBankApiService).mockReturnValue({ listCountries } as never);
+    const { worldbankListCountries } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
+    );
+
+    const result = await runToolContract(worldbankListCountries, { filter });
+    expect(listCountries.mock.calls[0]?.[0]).not.toHaveProperty('filter');
+    expect(
+      (result.structuredContent as { appliedFilters: object }).appliedFilters,
+    ).not.toHaveProperty('filter');
+    expect(textOf(result)).not.toContain('filter=');
+  });
+
+  it.each([
+    [
+      'the global listing, with the aggregates it excluded',
+      { filter: 'Sub-Saharan' },
+      'No countries matched filter="Sub-Saharan". Every filter word must appear in an entry\'s id or name. Aggregates are excluded under include_aggregates=false; set include_aggregates=true to match their names and codes too.',
+    ],
+    [
+      'the global listing with aggregates included',
+      { filter: 'Atlantis', include_aggregates: true },
+      'No countries matched filter="Atlantis". Every filter word must appear in an entry\'s id or name.',
+    ],
+    [
+      'the classification filters beside it, which no aggregate passes',
+      { filter: 'Congo', region: 'EAS' },
+      'No countries matched region=EAS, filter="Congo". The filters combine by AND, so no country matches all of them at once — drop one of them to widen the list. Every filter word must appear in an entry\'s id or name.',
+    ],
+    [
+      'the source it searched',
+      { source_id: '50', filter: 'Kenya provinces' },
+      'No entities in source 50 matched filter="Kenya provinces". Every filter word must appear in an entry\'s id or name.',
+    ],
+  ])('names %s when the filter matches nothing', async (_case, args, notice) => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      listCountries: servesAsAsked(NO_MATCH),
+    } as never);
+    const { worldbankListCountries } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
+    );
+
+    const result = await runToolContract(worldbankListCountries, args);
+    expect((result.structuredContent as { notice: string }).notice).toBe(notice);
+    expect(textOf(result)).toContain(`**Notice:** ${escapeMarkdownInline(notice)}`);
+  });
+
+  it('renders a filter that reads as Markdown as its own text on both surfaces', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      listCountries: servesAsAsked(NO_MATCH),
+    } as never);
+    const { worldbankListCountries } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
+    );
+    const filter = '*Kenya* [x](https://e.test) <b>_a_ `c`\n# h | ~d~';
+
+    const result = await runToolContract(worldbankListCountries, { source_id: '50', filter });
+    const structured = result.structuredContent as {
+      notice: string;
+      appliedFilters: { filter: string };
+    };
+    expect(structured.appliedFilters.filter).toBe(filter);
+    expect(structured.notice).toContain(`matched filter="${filter}".`);
+
+    const text = textOf(result);
+    const notice = escapeMarkdownInline(structured.notice);
+    const echo = `filter="${escapeMarkdownInline(filter)}"`;
+    expect(text).toContain(`**Notice:** ${notice}`);
+    expect(text).toContain(`, ${echo}, include_aggregates=false`);
+    expect(commonMarkText(notice)).toBe(structured.notice);
+    expect(commonMarkText(echo)).toBe(`filter="${filter}"`);
+    // Nothing of the filter survives as live syntax.
+    expect(text).not.toMatch(/(?<!\\)\[x\]\(/);
+    expect(text).not.toMatch(/(?<!\\)<b>/);
+    expect(text).not.toMatch(/^# h/m);
+  });
+
+  it('joins the zero-match and page-size notices into one', async () => {
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({
+      listCountries: vi.fn().mockResolvedValue({ ...NO_MATCH, perPage: 300 }),
+    } as never);
+    const { worldbankListCountries } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
+    );
+
+    const result = await runToolContract(worldbankListCountries, {
+      filter: 'Atlantis',
+      include_aggregates: true,
+      per_page: 400,
+    });
+    const notice = (result.structuredContent as { notice: string }).notice;
+    expect(notice).toMatch(/^No countries matched filter="Atlantis"\. /);
+    expect(notice).toContain('per_page=400 was reduced to 300');
+  });
+
+  it('describes filter on both listings', async () => {
+    const { worldbankListCountries } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js'
+    );
+    const shape = worldbankListCountries.input.shape as Record<string, { description?: string }>;
+    expect(shape.filter?.description).toMatch(/every word/);
+    expect(shape.filter?.description).toMatch(/include_aggregates=true/);
+    expect(shape.source_id?.description).toMatch(/filter applies/);
+    expect(worldbankListCountries.description).toMatch(/source_id=50 with filter="Kenya"/);
   });
 
   it('describes the current MEA name and the membership region codes', async () => {

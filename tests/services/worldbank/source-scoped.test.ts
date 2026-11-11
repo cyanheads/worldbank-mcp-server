@@ -17,11 +17,17 @@ import {
   defaultSelection,
   layoutFromConcepts,
   newestVersionWithData,
+  normalizeLabel,
   readRow,
   type ScopedRow,
   sortRows,
   valuesFromListing,
+  valuesWithLabel,
 } from '@/services/worldbank/source-scoped.js';
+import { expectLinear } from '../../helpers/linear-cpu-time.js';
+
+/** U+00A0, the padding upstream appends to some International Debt Statistics labels. */
+const NBSP = ' ';
 
 /** A `/sources/{id}/concepts` listing, concepts in the order given. */
 function concepts(name: string, ids: string[]) {
@@ -149,6 +155,102 @@ describe('valuesFromListing', () => {
     expect(valuesFromListing({})).toEqual([]);
     expect(valuesFromListing({ source: [{ concept: [] }] })).toEqual([]);
   });
+
+  it('trims labels and collapses their whitespace runs, which upstream pads with non-breaking spaces', () => {
+    const listing = {
+      source: [
+        {
+          concept: [
+            {
+              id: 'counterpart-area',
+              variable: [
+                { id: '905', value: `World Bank-IDA${NBSP.repeat(25)}` },
+                { id: 'PCAP.CD.IX.US', value: 'Index (United States  = 100)' },
+                { id: 'X', value: ` \t a${NBSP} \r\n b ` },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    expect(valuesFromListing(listing)).toEqual([
+      { id: '905', label: 'World Bank-IDA' },
+      { id: 'PCAP.CD.IX.US', label: 'Index (United States = 100)' },
+      { id: 'X', label: 'a b' },
+    ]);
+  });
+});
+
+describe('valuesWithLabel', () => {
+  const areas = [
+    { id: '730', label: 'China' },
+    { id: '905', label: 'World Bank-IDA' },
+    { id: '005', label: 'Germany, Fed. Rep. of' },
+    { id: '199309', label: '1994 Sep' },
+    { id: '199409', label: '1994 SEP' },
+  ];
+
+  it.each([
+    ['China', ['730']],
+    ['cHINA', ['730']],
+    [`  World${NBSP}${NBSP}Bank-IDA `, ['905']],
+    ['germany, fed. rep. of', ['005']],
+    ['1994 sep', ['199309', '199409']],
+  ])('matches %j exactly, ignoring case and whitespace runs', (text, ids) => {
+    expect(valuesWithLabel(areas, text).map((v) => v.id)).toEqual(ids);
+  });
+
+  it.each(['Chin', 'China ,', '730', 'Germany', ''])('matches no label for %j', (text) => {
+    expect(valuesWithLabel(areas, text)).toEqual([]);
+  });
+});
+
+describe('normalizeLabel', () => {
+  it('trims and collapses every whitespace run to one space', () => {
+    expect(normalizeLabel(`${NBSP} a \t\r\n${NBSP}b${NBSP}`)).toBe('a b');
+    expect(normalizeLabel('plain')).toBe('plain');
+    expect(normalizeLabel('   ﻿ ')).toBe('');
+  });
+});
+
+describe('timing: label normalization and matching over upstream and caller-sized text', () => {
+  const values = valuesFromListing({
+    source: [
+      {
+        concept: [
+          {
+            variable: Array.from({ length: 304 }, (_, i) => ({
+              id: String(i).padStart(3, '0'),
+              value: `Label ${i}${NBSP.repeat(i % 26)}`,
+            })),
+          },
+        ],
+      },
+    ],
+  });
+  /**
+   * The digit run never reaches Bun's slow-regex mode, so it carries the full
+   * 5k → 320k span; every other shape stays at or below 64k.
+   */
+  const shapes: Array<[name: string, base: number, shape: (chars: number) => string]> = [
+    ['a digit run', 5_000, (n) => '1'.repeat(n)],
+    ['one non-breaking-space run', 1_000, (n) => NBSP.repeat(n)],
+    ['a word between every space', 1_000, (n) => 'a '.repeat(n / 2)],
+    ['mixed whitespace runs ending in a word', 1_000, (n) => `${` ${NBSP}\t`.repeat(n / 3)}x`],
+    ['one long line ending in a break', 1_000, (n) => `${'§1 x'.repeat(n / 4)}\ny`],
+    ['line breaks throughout', 1_000, (n) => '  \r\n'.repeat(n / 4)],
+  ];
+
+  it.each(shapes)('normalizeLabel runs in linear time over %s', (_name, base, shape) => {
+    expectLinear(base, shape, (text) => normalizeLabel(text));
+  });
+
+  it.each(shapes)(
+    'valuesWithLabel matches a caller value in linear time over %s',
+    (_name, base, shape) => {
+      expectLinear(base, shape, (text) => valuesWithLabel(values, text));
+    },
+  );
 });
 
 describe('defaultSelection', () => {
@@ -215,6 +317,21 @@ describe('readRow', () => {
       period: '2015',
       dimension: { id: '202503', label: '2025 Mar' },
       value: 627080,
+    });
+  });
+
+  it('trims and collapses whitespace in the country name and the dimension label', () => {
+    const raw = {
+      variable: [
+        { concept: 'Counterpart-Area', id: '905', value: `World Bank-IDA${NBSP.repeat(25)}` },
+        { concept: 'Time', id: 'YR2023', value: '2023' },
+        { concept: 'Country', id: 'ZMB', value: ` Zambia${NBSP}` },
+      ],
+      value: 1,
+    };
+    expect(readRow(raw, 'Counterpart-Area')).toMatchObject({
+      countryName: 'Zambia',
+      dimension: { id: '905', label: 'World Bank-IDA' },
     });
   });
 

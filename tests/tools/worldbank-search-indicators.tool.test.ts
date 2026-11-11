@@ -19,7 +19,7 @@ vi.mock('@/services/worldbank/worldbank-service.js', () => ({
 }));
 
 vi.mock('@/config/server-config.js', () => ({
-  getServerConfig: vi.fn().mockReturnValue({ defaultPerPage: 50 }),
+  getServerConfig: vi.fn().mockReturnValue({ defaultPerPage: 50, clampLimits: true }),
 }));
 
 const mockIndicator = {
@@ -40,6 +40,8 @@ const mockSearchResult = {
 
 describe('worldbankSearchIndicators', () => {
   beforeEach(async () => {
+    const { getServerConfig } = await import('@/config/server-config.js');
+    vi.mocked(getServerConfig).mockReturnValue({ defaultPerPage: 50, clampLimits: true } as never);
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
     vi.mocked(getWorldBankApiService).mockReturnValue({
       searchIndicators: vi.fn().mockResolvedValue(mockSearchResult),
@@ -247,7 +249,7 @@ describe('worldbankSearchIndicators', () => {
     const input = worldbankSearchIndicators.input.parse({ topic_id: '3', source_id: '6' });
     await worldbankSearchIndicators.handler(input, ctx);
     expect(searchIndicators.mock.calls[0]?.[0]).toMatchObject({ topicId: '3', sourceId: '6' });
-    expect(getEnrichment(ctx).appliedFilters).toEqual({ topicId: '3', sourceId: '6' });
+    expect(getEnrichment(ctx).appliedFilters).toEqual({ topicId: '3', sourceId: '6', perPage: 50 });
   });
 
   it('renders an unknown source alongside a valid topic as invalid_filter on both surfaces', async () => {
@@ -391,11 +393,141 @@ describe('worldbankSearchIndicators', () => {
     expect(() => worldbankSearchIndicators.input.parse({ query: 'GDP', page: 0 })).toThrow();
   });
 
-  it('rejects per_page above maximum (101)', async () => {
+  it('accepts per_page above the 3000 maximum for the handler to clamp', async () => {
     const { worldbankSearchIndicators } = await import(
       '@/mcp-server/tools/definitions/worldbank-search-indicators.tool.js'
     );
-    expect(() => worldbankSearchIndicators.input.parse({ query: 'GDP', per_page: 101 })).toThrow();
+    expect(worldbankSearchIndicators.input.safeParse({ query: 'GDP', per_page: 101 }).success).toBe(
+      true,
+    );
+    expect(
+      worldbankSearchIndicators.input.safeParse({ query: 'GDP', per_page: 5000 }).success,
+    ).toBe(true);
+  });
+
+  it('rejects per_page above 3000 under WORLDBANK_CLAMP_LIMITS=false', async () => {
+    const { getServerConfig } = await import('@/config/server-config.js');
+    vi.mocked(getServerConfig).mockReturnValue({ defaultPerPage: 50, clampLimits: false } as never);
+    const { worldbankSearchIndicators } = await import(
+      '@/mcp-server/tools/definitions/worldbank-search-indicators.tool.js'
+    );
+    const result = await runToolContract(worldbankSearchIndicators, {
+      query: 'GDP',
+      per_page: 3001,
+    });
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.InvalidParams,
+        message:
+          'Input validation error: Invalid arguments for tool worldbank_search_indicators: per_page: Too big: expected number to be <=3000',
+      },
+    });
+    expect(
+      worldbankSearchIndicators.input.safeParse({ query: 'GDP', per_page: 3000 }).success,
+    ).toBe(true);
+  });
+
+  // ─── Page size ────────────────────────────────────────────────────────────
+
+  /** The disclosure for a page size reduced to 3000, with or without a next page. */
+  const reducedTo3000 = (requested: number, continues: boolean) =>
+    `per_page=${requested} was reduced to 3000, the maximum page size. totalPages counts pages of 3000${continues ? ', so page 2 with the same filters continues where this page ends' : ''}.`;
+
+  it('serves per_page 5000 at 3000, echoing both sizes and disclosing it on both surfaces', async () => {
+    const searchIndicators = vi
+      .fn()
+      .mockResolvedValue({ indicators: [mockIndicator], total: 5295, page: 1, pages: 2 });
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({ searchIndicators } as never);
+    const { worldbankSearchIndicators } = await import(
+      '@/mcp-server/tools/definitions/worldbank-search-indicators.tool.js'
+    );
+    const result = await runToolContract(
+      worldbankSearchIndicators,
+      { query: 'population', per_page: 5000 },
+      { context: { errors: worldbankSearchIndicators.errors } },
+    );
+
+    expect(result.isError).toBeFalsy();
+    expect(searchIndicators.mock.calls[0]?.[0]).toMatchObject({ page: 1, perPage: 3000 });
+    expect(result.structuredContent).toMatchObject({
+      appliedFilters: { query: 'population', perPage: 3000, requestedPerPage: 5000 },
+      totalCount: 5295,
+      totalPages: 2,
+      notice: reducedTo3000(5000, true),
+    });
+    const text = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+    expect(text).toContain(
+      '**Applied Filters:** query="population", per_page=3000 (requested 5000)',
+    );
+    expect(text).toContain(reducedTo3000(5000, true));
+  });
+
+  it('clamps a server default of 5000 to 3000 the same way', async () => {
+    const { getServerConfig } = await import('@/config/server-config.js');
+    vi.mocked(getServerConfig).mockReturnValue({
+      defaultPerPage: 5000,
+      clampLimits: true,
+    } as never);
+    const searchIndicators = vi
+      .fn()
+      .mockResolvedValue({ indicators: [mockIndicator], total: 1498, page: 1, pages: 1 });
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({ searchIndicators } as never);
+    const { worldbankSearchIndicators } = await import(
+      '@/mcp-server/tools/definitions/worldbank-search-indicators.tool.js'
+    );
+    const ctx = createMockContext({ errors: worldbankSearchIndicators.errors });
+    await worldbankSearchIndicators.handler(
+      worldbankSearchIndicators.input.parse({ source_id: '2' }),
+      ctx,
+    );
+
+    expect(searchIndicators.mock.calls[0]?.[0]).toMatchObject({ sourceId: '2', perPage: 3000 });
+    expect(getEnrichment(ctx).appliedFilters).toEqual({
+      sourceId: '2',
+      perPage: 3000,
+      requestedPerPage: 5000,
+    });
+    expect(getEnrichment(ctx).notice).toBe(reducedTo3000(5000, false));
+  });
+
+  it('names the page range at the served size on a page past the end', async () => {
+    const searchIndicators = vi
+      .fn()
+      .mockResolvedValue({ indicators: [], total: 5295, page: 3, pages: 2 });
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({ searchIndicators } as never);
+    const { worldbankSearchIndicators } = await import(
+      '@/mcp-server/tools/definitions/worldbank-search-indicators.tool.js'
+    );
+    const result = await runToolContract(
+      worldbankSearchIndicators,
+      { query: 'population', page: 3, per_page: 5000 },
+      { context: { errors: worldbankSearchIndicators.errors } },
+    );
+
+    expect((result.structuredContent as { notice?: string }).notice).toBe(
+      `Page 3 is past the end of the results — 5295 indicators span 2 pages (1–2) at per_page=3000. Keep the same filters and request a page from 1 to 2. ${reducedTo3000(5000, false)}`,
+    );
+  });
+
+  it('adds no page-size notice when the requested size fits', async () => {
+    const searchIndicators = vi.fn().mockResolvedValue(mockSearchResult);
+    const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    vi.mocked(getWorldBankApiService).mockReturnValue({ searchIndicators } as never);
+    const { worldbankSearchIndicators } = await import(
+      '@/mcp-server/tools/definitions/worldbank-search-indicators.tool.js'
+    );
+    const ctx = createMockContext({ errors: worldbankSearchIndicators.errors });
+    await worldbankSearchIndicators.handler(
+      worldbankSearchIndicators.input.parse({ query: 'gdp', per_page: 3000 }),
+      ctx,
+    );
+
+    expect(searchIndicators.mock.calls[0]?.[0]).toMatchObject({ perPage: 3000 });
+    expect(getEnrichment(ctx).appliedFilters).toEqual({ query: 'gdp', perPage: 3000 });
+    expect(getEnrichment(ctx).notice).toBeUndefined();
   });
 
   /**
@@ -483,6 +615,7 @@ describe('worldbankSearchIndicators', () => {
     expect(getEnrichment(ctx).appliedFilters).toEqual({
       query: 'GDP per capita',
       sourceId: '2',
+      perPage: 50,
     });
   });
 
@@ -495,8 +628,11 @@ describe('worldbankSearchIndicators', () => {
       '@/mcp-server/tools/definitions/worldbank-search-indicators.tool.js'
     );
     const render = worldbankSearchIndicators.enrichmentTrailer?.appliedFilters?.render;
-    expect(render?.({ query: 'GDP', topicId: '3' })).toBe(
-      '**Applied Filters:** query="GDP", topic_id=3',
+    expect(render?.({ query: 'GDP', topicId: '3', perPage: 50 })).toBe(
+      '**Applied Filters:** query="GDP", topic_id=3, per_page=50',
+    );
+    expect(render?.({ query: 'GDP', perPage: 3000, requestedPerPage: 5000 })).toBe(
+      '**Applied Filters:** query="GDP", per_page=3000 (requested 5000)',
     );
   });
 

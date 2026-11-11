@@ -9,6 +9,7 @@
 import { JsonRpcErrorCode, type McpError } from '@cyanheads/mcp-ts-core/errors';
 import { createInMemoryStorage, createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { DimensionValue } from '@/services/worldbank/types.js';
 
 vi.mock('@cyanheads/mcp-ts-core/utils', () => ({
   fetchWithTimeout: vi.fn(),
@@ -583,12 +584,24 @@ describe('WorldBankApiService.getData — source-scoped path', () => {
       data: {
         reason: 'unknown_dimension_value',
         dimensionValue: '199912',
-        validValues: [{ sourceId: '57', concept: 'Version', ids: ['202407', '202503', '202601'] }],
+        validValues: [
+          {
+            sourceId: '57',
+            concept: 'Version',
+            ids: ['202407', '202503', '202601'],
+            values: [
+              { id: '202407', label: '2024 Jul' },
+              { id: '202503', label: '2025 Mar' },
+              { id: '202601', label: '2026 Jan' },
+            ],
+          },
+        ],
       },
     });
-    expect(err.message).toContain(
-      'WDI Database Archives (source 57) Version: 202407, 202503, 202601',
+    expect(err.message).toBe(
+      'dimension_value "199912" is not a value "SM.POP.REFG.OR" can be queried at. Valid values — WDI Database Archives (source 57) Version: 202407 "2024 Jul", 202503 "2025 Mar", 202601 "2026 Jan".',
     );
+    expect(err.literals).toEqual(['202407', '202503', '202601']);
     expect(requestedPaths().some((p) => p.includes('/series/'))).toBe(false);
   });
 
@@ -1019,6 +1032,13 @@ describe('WorldBankApiService.getData — source-scoped path', () => {
       dim: ['Classification', id, id],
       value,
     });
+    const fpnAsk = (dimensionValue: string) => ({
+      indicatorId: 'CoCA_fexp',
+      countries: ['USA'],
+      dimensionValue,
+      page: 1,
+      perPage: 50,
+    });
 
     it('routes to the live source by default, without discovering the archive', async () => {
       route(
@@ -1065,6 +1085,25 @@ describe('WorldBankApiService.getData — source-scoped path', () => {
       expect(result.data[0]?.value).toBe(0.07);
     });
 
+    it('routes a value that is an id in the archive to the archive, even when the live source labels a value with it', async () => {
+      route(
+        fpnRoutes({
+          '/v2/sources/88/classification': listing('88', 'classification', [
+            ['FPN 5.0', 'Food Prices for Nutrition 5.0'],
+            ['LIVE', 'FPN 4.1'],
+          ]),
+          '/v2/sources/93/country/USA/series/CoCA_fexp/classification/FPN%204.1': data('93', [
+            fpn('FPN 4.1', 0.07),
+          ]),
+        }),
+      );
+      const result = await service.getData(fpnAsk('FPN 4.1'), createMockContext());
+      expect(result.sourceScoped).toMatchObject({
+        sourceId: '93',
+        dimension: { selection: 'requested', id: 'FPN 4.1' },
+      });
+    });
+
     it('lists both sources’ values when neither carries the requested one', async () => {
       route(fpnRoutes({}));
       const err = (await service
@@ -1081,12 +1120,286 @@ describe('WorldBankApiService.getData — source-scoped path', () => {
         .catch((e: unknown) => e)) as McpError;
       expect(err.data?.reason).toBe('unknown_dimension_value');
       expect(err.message).toContain(
-        'Food Prices for Nutrition (source 88) Classification: FPN 5.0',
+        'Valid values — Food Prices for Nutrition (source 88) Classification: FPN 5.0 "Food Prices for Nutrition 5.0"; FPN Datahub Archive (source 93) Classification: FPN 1.0 "Food Prices for Nutrition 1.0", FPN 4.1 "Food Prices for Nutrition 4.1".',
       );
-      expect(err.message).toContain(
-        'FPN Datahub Archive (source 93) Classification: FPN 1.0, FPN 4.1',
-      );
+      expect(err.data?.validValues).toEqual([
+        {
+          sourceId: '88',
+          concept: 'Classification',
+          ids: ['FPN 5.0'],
+          values: [{ id: 'FPN 5.0', label: 'Food Prices for Nutrition 5.0' }],
+        },
+        {
+          sourceId: '93',
+          concept: 'Classification',
+          ids: ['FPN 1.0', 'FPN 4.1'],
+          values: [
+            { id: 'FPN 1.0', label: 'Food Prices for Nutrition 1.0' },
+            { id: 'FPN 4.1', label: 'Food Prices for Nutrition 4.1' },
+          ],
+        },
+      ]);
+      expect(err.literals).toEqual(['FPN 5.0', 'FPN 1.0', 'FPN 4.1']);
     });
+
+    it('routes a label only the archive lists to the archive, with the requests its id makes', async () => {
+      const archived = {
+        '/v2/sources/93/country/USA/series/CoCA_fexp/classification/FPN%204.1': data('93', [
+          fpn('FPN 4.1', 0.07),
+        ]),
+      };
+      route(fpnRoutes(archived));
+      const byLabel = await service.getData(
+        fpnAsk('food prices for nutrition 4.1'),
+        createMockContext(),
+      );
+      expect(byLabel.sourceScoped).toMatchObject({
+        sourceId: '93',
+        dimension: {
+          selection: 'requested',
+          id: 'FPN 4.1',
+          label: 'Food Prices for Nutrition 4.1',
+        },
+      });
+      expect(byLabel.data[0]?.value).toBe(0.07);
+      const labelPaths = requestedPaths();
+
+      fetchMock.mockClear();
+      const { WorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+      await new WorldBankApiService({} as never, createInMemoryStorage()).getData(
+        fpnAsk('FPN 4.1'),
+        createMockContext(),
+      );
+      expect(labelPaths).toEqual(requestedPaths());
+    });
+
+    it('routes a label both sources list to the first candidate, the live source', async () => {
+      route(
+        fpnRoutes({
+          '/v2/sources/88/classification': listing('88', 'classification', [['FPN 5.0', 'Shared']]),
+          '/v2/sources/93/classification': listing('93', 'classification', [
+            ['FPN 1.0', 'Shared'],
+            ['FPN 4.1', 'Shared'],
+          ]),
+          '/v2/sources/88/country/USA/series/CoCA_fexp/classification/FPN%205.0': data('88', [
+            fpn('FPN 5.0', 0.06),
+          ]),
+        }),
+      );
+      const result = await service.getData(fpnAsk('shared'), createMockContext());
+      expect(result.sourceScoped).toMatchObject({
+        sourceId: '88',
+        dimension: { selection: 'requested', id: 'FPN 5.0', label: 'Shared' },
+      });
+    });
+
+    it('fails a label the deciding candidate lists twice, naming only its ids', async () => {
+      route(
+        fpnRoutes({
+          '/v2/sources/88/classification': listing('88', 'classification', [
+            ['FPN 5.0', 'Shared'],
+            ['FPN 5.1', 'shared'],
+          ]),
+          '/v2/sources/93/classification': listing('93', 'classification', [['FPN 1.0', 'Shared']]),
+        }),
+      );
+      const err = (await service
+        .getData(fpnAsk('SHARED'), createMockContext())
+        .catch((e: unknown) => e)) as McpError;
+      expect(err).toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        data: {
+          reason: 'ambiguous_dimension_value',
+          dimensionValue: 'SHARED',
+          sourceId: '88',
+          concept: 'Classification',
+          ids: ['FPN 5.0', 'FPN 5.1'],
+        },
+      });
+      expect(requestedPaths().some((p) => p.includes('/series/'))).toBe(false);
+    });
+  });
+
+  // ─── dimension_value by label ─────────────────────────────────────────────
+
+  describe('a dimension value named by its label', () => {
+    const IDA = `World Bank-IDA${' '.repeat(25)}`;
+    const zmb = (id: string, label: string, value: number): Obs => ({
+      country: ['ZMB', 'Zambia'],
+      time: 'YR2023',
+      dim: ['Counterpart-Area', id, label],
+      value,
+    });
+    const series = '/v2/sources/6/country/ZMB/series/DT.DOD.DPPG.CD/time/YR2023/counterpart-area';
+    const idsRoutes = () => ({
+      '/v2/source/6': [
+        { page: 1, pages: 1, total: 1 },
+        [{ id: '6', name: 'International Debt Statistics' }],
+      ],
+      '/v2/source/6/indicator/DT.DOD.DPPG.CD': catalog([
+        'DT.DOD.DPPG.CD',
+        'PPG, total (DOD, current US$)',
+        '6',
+        'International Debt Statistics',
+      ]),
+      '/v2/sources/6/concepts': concepts('6', 'International Debt Statistics', [
+        'Country',
+        'Counterpart-Area',
+        'Series',
+        'Time',
+      ]),
+      '/v2/sources/6/counterpart-area': listing('6', 'counterpart-area', [
+        ['005', 'Germany, Fed. Rep. of'],
+        ['730', 'China'],
+        ['905', IDA],
+        ['WLD', 'World'],
+      ]),
+      '/v2/sources/6/country': listing('6', 'country', [['ZMB', 'Zambia']]),
+      '/v2/sources/6/time': listing('6', 'time', [
+        ['YR2022', '2022'],
+        ['YR2023', '2023'],
+      ]),
+      '/v2/country': COUNTRY_INDEX,
+      [`${series}/730`]: data('6', [zmb('730', 'China', 5386396180.7)]),
+      [`${series}/905`]: data('6', [zmb('905', IDA, 1)]),
+    });
+    const ask = (dimensionValue: string) => ({
+      sourceId: '6',
+      indicatorId: 'DT.DOD.DPPG.CD',
+      countries: ['ZMB'],
+      dateRange: '2023',
+      dimensionValue,
+      page: 1,
+      perPage: 50,
+    });
+
+    it.each(['China', 'cHINA'])(
+      'serves %j as the value its label names, with the rows and requests its id gets',
+      async (label) => {
+        route(idsRoutes());
+        const byLabel = await service.getData(ask(label), createMockContext());
+        const labelPaths = requestedPaths();
+
+        fetchMock.mockClear();
+        const { WorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+        const byId = await new WorldBankApiService({} as never, createInMemoryStorage()).getData(
+          ask('730'),
+          createMockContext(),
+        );
+
+        expect(byLabel.sourceScoped?.dimension).toEqual({
+          concept: 'Counterpart-Area',
+          selection: 'requested',
+          id: '730',
+          label: 'China',
+        });
+        expect(byLabel.data).toEqual(byId.data);
+        expect(byLabel.data).toEqual([
+          expect.objectContaining({ countryCode: 'ZMB', date: '2023', value: 5386396180.7 }),
+        ]);
+        expect(labelPaths).toEqual(requestedPaths());
+      },
+    );
+
+    it.each(['905', 'World Bank-IDA', ' world  bank-ida'])(
+      'reports the label upstream pads with non-breaking spaces trimmed, on the pinned value and every row, for %j',
+      async (value) => {
+        route(idsRoutes());
+        const result = await service.getData(ask(value), createMockContext());
+        expect(result.sourceScoped?.dimension).toMatchObject({
+          id: '905',
+          label: 'World Bank-IDA',
+        });
+        expect(result.data.map((row) => row.dimension)).toEqual([
+          { id: '905', label: 'World Bank-IDA' },
+        ]);
+      },
+    );
+
+    it('pairs every id with its quoted label in the message, as validValues.values carries them', async () => {
+      route(idsRoutes());
+      const err = (await service
+        .getData(ask('PRC'), createMockContext())
+        .catch((e: unknown) => e)) as McpError;
+      expect(err.data?.reason).toBe('unknown_dimension_value');
+      const [entry] = (
+        err.data as { validValues: Array<{ ids: string[]; values: DimensionValue[] }> }
+      ).validValues;
+      expect(entry?.ids).toEqual(['005', '730', '905', 'WLD']);
+      expect(entry?.values).toEqual([
+        { id: '005', label: 'Germany, Fed. Rep. of' },
+        { id: '730', label: 'China' },
+        { id: '905', label: 'World Bank-IDA' },
+        { id: 'WLD', label: 'World' },
+      ]);
+      const listed = err.message.split('Counterpart-Area: ')[1]?.replace(/\.$/, '') ?? '';
+      const pairs = [...listed.matchAll(/(.+?) "([^"]*)"(?:, |$)/g)].map(([, id, label]) => ({
+        id,
+        label,
+      }));
+      expect(pairs).toEqual(entry?.values);
+      expect(err.literals).toEqual(entry?.ids);
+      expect(requestedPaths().some((p) => p.includes('/series/'))).toBe(false);
+    });
+
+    it('validates the next call against the listing it read, whatever was done to the error it threw', async () => {
+      route(idsRoutes());
+      const err = (await service
+        .getData(ask('PRC'), createMockContext())
+        .catch((e: unknown) => e)) as McpError;
+      const [entry] = (err.data as { validValues: Array<{ values: DimensionValue[] }> })
+        .validValues;
+      for (const value of entry?.values ?? []) value.label = 'edited';
+      entry?.values.splice(0);
+
+      const result = await service.getData(ask('China'), createMockContext());
+      expect(result.sourceScoped?.dimension).toMatchObject({ id: '730', label: 'China' });
+    });
+  });
+
+  it('rejects a label several releases share as ambiguous_dimension_value, naming each, before any data request', async () => {
+    route(
+      archiveRoutes({
+        '/v2/sources/57/version': listing('57', 'version', [
+          ['199309', '1994 Sep'],
+          ['199409', '1994 Sep'],
+          ['202503', '2025 Mar'],
+        ]),
+      }),
+    );
+    const err = (await service
+      .getData(
+        {
+          indicatorId: 'SM.POP.REFG.OR',
+          countries: ['SDN'],
+          dimensionValue: '1994 Sep',
+          page: 1,
+          perPage: 50,
+        },
+        createMockContext(),
+      )
+      .catch((e: unknown) => e)) as McpError;
+    expect(err).toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: {
+        reason: 'ambiguous_dimension_value',
+        indicatorId: 'SM.POP.REFG.OR',
+        dimensionValue: '1994 Sep',
+        sourceId: '57',
+        concept: 'Version',
+        ids: ['199309', '199409'],
+      },
+    });
+    expect(err.message).toBe(
+      'dimension_value "1994 Sep" is the label of more than one value "SM.POP.REFG.OR" can be queried at — WDI Database Archives (source 57) Version: 199309 "1994 Sep", 199409 "1994 Sep".',
+    );
+    expect(err.literals).toEqual(['199309', '199409']);
+    expect(requestedPaths()).toEqual([
+      '/v2/country/SDN/indicator/SM.POP.REFG.OR',
+      '/v2/indicator/SM.POP.REFG.OR',
+      '/v2/sources/57/concepts',
+      '/v2/sources/57/version',
+    ]);
   });
 
   // ─── Countries ────────────────────────────────────────────────────────────

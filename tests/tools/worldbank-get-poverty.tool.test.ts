@@ -19,6 +19,7 @@ vi.mock('@/config/server-config.js', () => ({
     apiBaseUrl: 'https://api.worldbank.org/v2',
     pipBaseUrl: 'https://api.worldbank.org/pip/v1',
     defaultPerPage: 50,
+    clampLimits: true,
     catalogCacheTtlMs: 60_000,
   }),
 }));
@@ -90,6 +91,7 @@ async function stubService(result: Record<string, unknown>) {
       perPage: opts.perPage,
       countries: opts.countries.map((code) => code.toUpperCase()),
       gapFilled: false,
+      gapFillUnavailable: false,
       modelOnly: [],
       pppVersion: '2021',
       releaseVersion: '20260324',
@@ -255,6 +257,50 @@ describe('worldbankGetPoverty', () => {
     const ctx = createMockContext({ errors: tool.errors });
     await tool.handler(tool.input.parse({ countries: 'USA', year: '2022' }), ctx);
     expect(getEnrichment(ctx).notice).toBeUndefined();
+  });
+
+  const SURVEY_ONLY_NOTICE =
+    'PIP did not return its gap-filled estimates for the surveyed economies, so their rows come from surveys alone. An estimate the surveys do not cover, such as a national figure for a year surveyed only in urban areas, may be missing; retry the same request to include it.';
+
+  it('says on both surfaces that rows stand on surveys alone when the gap-filled estimates were unavailable', async () => {
+    await stubService({ rows: [surveyRow], total: 1, gapFillUnavailable: true });
+    const tool = await loadTool();
+    const result = await runToolContract(tool, { countries: 'USA', year: '2022' });
+
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({
+      estimates: [{ estimationType: 'survey', gini: 0.417 }],
+      notice: SURVEY_ONLY_NOTICE,
+    });
+    expect(textOf(result)).toContain(`**Notice:** ${SURVEY_ONLY_NOTICE}`);
+  });
+
+  it('joins the survey-only notice to the gap-filled one when both apply', async () => {
+    await stubService({
+      rows: [gapFilledRow, surveyRow],
+      total: 2,
+      gapFilled: true,
+      gapFillUnavailable: true,
+    });
+    const tool = await loadTool();
+    const result = await runToolContract(tool, { countries: ['IND', 'USA'], year: '2022' });
+
+    const notice = (result.structuredContent as { notice: string }).notice;
+    expect(notice).toMatch(/^Some rows are gap-filled: /);
+    expect(notice.endsWith(` ${SURVEY_ONLY_NOTICE}`)).toBe(true);
+    expect(textOf(result)).toContain(SURVEY_ONLY_NOTICE);
+    expect(textOf(result)).toContain('Some rows are gap-filled');
+  });
+
+  it('keeps the survey-only notice on a page past the end of the result', async () => {
+    await stubService({ rows: [], total: 1, page: 2, pages: 1, gapFillUnavailable: true });
+    const tool = await loadTool();
+    const result = await runToolContract(tool, { countries: 'USA', year: '2022', page: 2 });
+
+    const notice = (result.structuredContent as { notice: string }).notice;
+    expect(notice).toMatch(/^Page 2 is past the end of the results/);
+    expect(notice.endsWith(` ${SURVEY_ONLY_NOTICE}`)).toBe(true);
+    expect(textOf(result)).toContain(SURVEY_ONLY_NOTICE);
   });
 
   // ─── Multi-country batches ────────────────────────────────────────────────

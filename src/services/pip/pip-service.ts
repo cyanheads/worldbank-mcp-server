@@ -20,6 +20,7 @@ import {
   notFound,
   serializationError,
   serviceUnavailable,
+  timeout,
   validationError,
 } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
@@ -55,6 +56,16 @@ const REQUEST_TIMEOUT_MS = 60_000;
  * between them.
  */
 const REFERENCE_LOAD_TIMEOUT_MS = 2 * REQUEST_TIMEOUT_MS + 5_000;
+
+/**
+ * How long a single year waits on the gap-filled pass once the survey pass has
+ * answered every requested economy. Those survey rows already hold every
+ * economy, and only a grain no survey covers can still be missing, so a cold
+ * gap-filled query is abandoned for the survey rows and the degrade notice
+ * rather than held through its 60s attempt and retry, which outlasts a client
+ * that gives a call 60s.
+ */
+const GAP_FILL_GRACE_MS = 10_000;
 
 /**
  * Bytes of a non-2xx body captured into the error, raised from the framework's
@@ -483,14 +494,36 @@ function rowKey(row: PovertyRow): string {
   return `${row.countryCode}|${row.reportingYear}|${row.reportingLevel}|${row.welfareType}`;
 }
 
+/** Whether `year` names one calendar year, rather than `all`, `MRV`, or nothing. */
+function isSingleYear(year: string | undefined): boolean {
+  return /^\d{4}$/.test(year?.trim() ?? '');
+}
+
 /**
- * Whether the request spans more than one reporting year. `all` — and an
- * omitted `year`, which PIP reads the same way — covers an economy's whole
- * window; a four-digit year and `MRV` each resolve to a single year per
- * economy. The distinction decides what a gap-filled row is allowed to add.
+ * The settled gap-filled pass, or a `Timeout` rejection when {@link GAP_FILL_GRACE_MS}
+ * passes first, with `abandon` aborted so the request stops.
  */
-function spansMultipleYears(year: string | undefined): boolean {
-  return year === undefined || year.trim().toLowerCase() === 'all';
+async function withinGapFillGrace(
+  pass: Promise<PromiseSettledResult<PovertyRow[]>>,
+  abandon: AbortController,
+): Promise<PromiseSettledResult<PovertyRow[]>> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<PromiseRejectedResult>((resolve) => {
+    timer = setTimeout(() => {
+      abandon.abort();
+      resolve({
+        status: 'rejected',
+        reason: timeout(
+          `PIP gap-filled estimates did not arrive within ${GAP_FILL_GRACE_MS / 1000}s of the survey rows.`,
+        ),
+      });
+    }, GAP_FILL_GRACE_MS);
+  });
+  try {
+    return await Promise.race([pass, expired]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /** Whether `year` asks for the most recent year, which PIP matches case-insensitively. */
@@ -536,11 +569,21 @@ type EconomyRows = {
   rows: PovertyRow[];
   /** Whether any row came from the gap-filled pass. */
   gapFilled: boolean;
+  /**
+   * Whether the gap-filled pass failed and a single year was answered from its
+   * survey rows alone, so a grain only an estimate covers may be missing.
+   */
+  gapFillUnavailable: boolean;
   /** Economies PIP publishes only as model estimates, left out because `fill_gaps` was off. */
   modelOnly: string[];
 };
 
-const NO_ECONOMY_ROWS: EconomyRows = { rows: [], gapFilled: false, modelOnly: [] };
+const NO_ECONOMY_ROWS: EconomyRows = {
+  rows: [],
+  gapFilled: false,
+  gapFillUnavailable: false,
+  modelOnly: [],
+};
 
 /** The data release and PPP vintage every request of one query is pinned to. */
 type ResolvedVersion = { pppVersion: string; releaseVersion: string; version: string };
@@ -602,19 +645,26 @@ export class PipService {
           );
         }
 
-        return JSON.parse(text) as unknown;
+        try {
+          return JSON.parse(text) as unknown;
+        } catch (error) {
+          throw serializationError(
+            'PIP returned a response that is not JSON.',
+            { url },
+            { cause: error },
+          );
+        }
       },
       {
         operation: 'PipService.fetchJson',
         context: ctx as ReqCtx,
         baseDelayMs: 1000,
         /**
-         * One retry, not the framework default of three. Some PIP 5xx answers
-         * are settled rather than transient — `country=all&year=all` with
-         * `povline=4.11&welfare_type=consumption` fails on every attempt — so
-         * extra attempts only add delay to them. The one retry earns its place
-         * on a timeout instead: the attempt that timed out leaves the query warm
-         * in PIP's cache, and the retry usually answers at once.
+         * One retry, not the framework default of three. It earns its place on
+         * a timeout: the attempt that timed out leaves the query warm in PIP's
+         * cache, and the retry usually answers at once. PIP has answered some
+         * query shapes with a 500 on every attempt, and further attempts would
+         * only add delay to those.
          */
         maxRetries: 1,
         signal: ctx.signal,
@@ -813,17 +863,26 @@ export class PipService {
    * around them gives an agent the real distribution whenever one exists, and an
    * estimate labelled as such when it doesn't.
    *
-   * What "uncovered" means depends on the request. A four-digit year is answered
-   * once an economy has any survey row, and PIP returns the same row grain in
-   * both modes for a year it surveyed, so gap-filling there is per economy. A
-   * request spanning the whole window (`all`, or no `year`) is the opposite: PIP
-   * surveys a handful of years and estimates every year around them, so an
-   * economy with survey rows still has gaps between and after them, and
-   * gap-filling is per row grain. `MRV` follows `fill_gaps` as PIP's own `MRV`
-   * does: both passes always run, each economy resolves to the newest year
-   * either answers — PIP's latest estimate year wherever it publishes one — and
-   * a survey row wins over its gap-filled twin at that year and grain, so no
-   * economy comes back at two different years.
+   * A survey row covers its own grain ({@link rowKey}) and nothing more, so the
+   * gap-filled pass adds every row at a grain no survey row has, for every
+   * request shape. That is more than the years between surveys: a surveyed year
+   * can lack a grain PIP estimates, as BOL's urban-only 1990 survey lacks the
+   * national figure PIP's gap-filled series carries for that year. `MRV`
+   * follows `fill_gaps` as PIP's own `MRV` does: each economy resolves to the
+   * newest year either pass answers — PIP's latest estimate year wherever it
+   * publishes one — so no economy comes back at two different years.
+   *
+   * The gap-filled pass takes nothing from the survey pass, so the two run at
+   * once, and the gap-filled request is abandoned as soon as the survey request
+   * fails. When the gap-filled pass fails on its own — any upstream error,
+   * including one still out {@link GAP_FILL_GRACE_MS} after the survey rows
+   * arrive — a single year whose every requested economy answered the survey
+   * pass is still answered from the survey rows and flagged
+   * `gapFillUnavailable`: those rows hold every economy, only a grain no survey
+   * covers can be missing, and the survey request already accepted the same
+   * parameters, so the failure is PIP's rather than the caller's. Every other
+   * shape relies on the gap-filled pass for whole economies or years, so its
+   * failure fails the call, as does the caller's cancellation.
    */
   private async surveyFirst(
     codes: readonly string[],
@@ -831,31 +890,57 @@ export class PipService {
     fillGaps: boolean,
     ctx: Context,
   ): Promise<EconomyRows> {
-    const surveyRows = await this.economyPass(codes, filters, false, ctx);
-    if (!fillGaps) return { rows: surveyRows, gapFilled: false, modelOnly: [] };
+    if (!fillGaps) {
+      const rows = await this.economyPass(codes, filters, false, ctx);
+      return { rows, gapFilled: false, gapFillUnavailable: false, modelOnly: [] };
+    }
 
-    const multiYear = spansMultipleYears(filters.year);
-    const mostRecent = isMostRecent(filters.year);
-    const answered = new Set(surveyRows.map((row) => row.countryCode));
-    /**
-     * A four-digit year needs nothing added once every requested economy has
-     * answered; `all` hides which economies were asked for, so it always looks.
-     * A multi-year request always has the years between the surveys to fill,
-     * and `MRV` has PIP's latest estimate year to weigh against the survey's.
-     */
-    const mayHaveGaps =
-      multiYear || mostRecent || codes.includes('ALL') || codes.some((code) => !answered.has(code));
-    if (!mayHaveGaps) return { rows: surveyRows, gapFilled: false, modelOnly: [] };
-
-    const keyOf = multiYear || mostRecent ? rowKey : (row: PovertyRow) => row.countryCode;
-    const covered = new Set(surveyRows.map(keyOf));
-    const filled = (await this.economyPass(codes, filters, true, ctx)).filter(
-      (row) => !covered.has(keyOf(row)),
+    const abandon = new AbortController();
+    const surveyPass = this.economyPass(codes, filters, false, ctx);
+    const filledPass: Promise<PromiseSettledResult<PovertyRow[]>> = this.economyPass(
+      codes,
+      filters,
+      true,
+      { ...ctx, signal: AbortSignal.any([ctx.signal, abandon.signal]) },
+    ).then(
+      (value) => ({ status: 'fulfilled', value }),
+      (reason: unknown) => ({ status: 'rejected', reason }),
     );
+    const surveyRows = await surveyPass.catch((error: unknown) => {
+      abandon.abort();
+      throw error;
+    });
+    // `all` matches no row's code, so it never counts as answered.
+    const answered = new Set(surveyRows.map((row) => row.countryCode));
+    const surveyCoversEveryEconomy =
+      isSingleYear(filters.year) && codes.every((code) => answered.has(code));
+    const filledResult = surveyCoversEveryEconomy
+      ? await withinGapFillGrace(filledPass, abandon)
+      : await filledPass;
+
+    if (filledResult.status === 'rejected') {
+      const error = filledResult.reason;
+      if (!surveyCoversEveryEconomy || ctx.signal.aborted || !(error instanceof McpError)) {
+        throw error;
+      }
+      ctx.log.warning('PIP gap-filled estimates unavailable; answering from survey rows alone', {
+        countries: codes,
+        error: error.message,
+      });
+      return { rows: surveyRows, gapFilled: false, gapFillUnavailable: true, modelOnly: [] };
+    }
+
+    const covered = new Set(surveyRows.map(rowKey));
+    const filled = filledResult.value.filter((row) => !covered.has(rowKey(row)));
     const merged = [...surveyRows, ...filled];
-    const rows = mostRecent ? keepNewestYear(merged) : merged;
+    const rows = isMostRecent(filters.year) ? keepNewestYear(merged) : merged;
     const fromFilled = new Set(filled);
-    return { rows, gapFilled: rows.some((row) => fromFilled.has(row)), modelOnly: [] };
+    return {
+      rows,
+      gapFilled: rows.some((row) => fromFilled.has(row)),
+      gapFillUnavailable: false,
+      modelOnly: [],
+    };
   }
 
   /**
@@ -908,6 +993,7 @@ export class PipService {
       return {
         rows: [...surveyed.rows, ...modelRows],
         gapFilled: surveyed.gapFilled || modelRows.length > 0,
+        gapFillUnavailable: surveyed.gapFillUnavailable,
         modelOnly: fillGaps ? [] : unlisted,
       };
     }
@@ -979,6 +1065,11 @@ export class PipService {
      */
     countries: string[];
     gapFilled: boolean;
+    /**
+     * Whether the gap-filled pass failed and a single year was answered from its
+     * survey rows alone, so a grain only an estimate covers may be missing.
+     */
+    gapFillUnavailable: boolean;
     /** Economies PIP publishes only as model estimates, left out because `fillGaps` was off. */
     modelOnly: string[];
     pppVersion: string;
@@ -1029,6 +1120,7 @@ export class PipService {
       perPage: size,
       countries: requested.map(listedCode),
       gapFilled: economyResult.gapFilled,
+      gapFillUnavailable: economyResult.gapFillUnavailable,
       modelOnly: economyResult.modelOnly,
       pppVersion: resolved.pppVersion,
       releaseVersion: resolved.releaseVersion,

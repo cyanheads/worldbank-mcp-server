@@ -25,6 +25,7 @@ import {
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
 import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
+import { plainProse } from '@/services/plain-prose.js';
 import { MAX_COUNTRIES_PER_PAGE, MAX_OBSERVATIONS_PER_PAGE } from '@/services/response-budget.js';
 import { sharedLoadContext, untilAborted } from '@/services/shared-load.js';
 import {
@@ -53,6 +54,7 @@ import {
   type SourceLayout,
   sortRows,
   valuesFromListing,
+  valuesWithLabel,
 } from './source-scoped.js';
 import type {
   Country,
@@ -239,37 +241,6 @@ function isWbErrorEnvelope(data: unknown): data is WbErrorEnvelope {
 
 // ─── Normalization helpers ────────────────────────────────────────────────────
 
-const NAMED_ENTITIES: Record<string, string> = {
-  amp: '&',
-  apos: "'",
-  gt: '>',
-  lt: '<',
-  nbsp: ' ',
-  quot: '"',
-};
-
-/**
- * Reduce provider-authored prose to plain text. A few source notes carry HTML
- * (`SE.PRM.INPT` breaks a dash list with `</br>`), which reached both response
- * surfaces as literal tags. Breaks become line breaks, other tags are dropped
- * with their text kept, and entities are decoded after the tags are gone, so an
- * encoded `&lt;b&gt;` survives as text. Only a `<` followed by a letter reads as
- * a tag: literal brackets in prose (`<$2.15 a day`, `<-2 standard deviations`)
- * pass through, and a note without markup comes back unchanged.
- */
-function plainProse(value: string): string {
-  return value
-    .replace(/[ \t]*<\/?br\s*\/?>[ \t]*/gi, '\n')
-    .replace(/<\/?[A-Za-z][A-Za-z0-9-]*(?:\s[^<>]*)?\/?>/g, '')
-    .replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (entity, body: string) => {
-      if (!body.startsWith('#')) return NAMED_ENTITIES[body.toLowerCase()] ?? entity;
-      const codePoint = /^#x/i.test(body)
-        ? Number.parseInt(body.slice(2), 16)
-        : Number(body.slice(1));
-      return codePoint <= 0x10ffff ? String.fromCodePoint(codePoint) : entity;
-    });
-}
-
 function normalizeIndicator(raw: RawIndicator): Indicator {
   return {
     id: raw.id ?? '',
@@ -291,6 +262,10 @@ function normalizeIndicatorDetail(raw: RawIndicator): IndicatorDetail {
   };
 }
 
+/**
+ * Names are trimmed: upstream ends some in a space (`SSF` "Sub-Saharan Africa ",
+ * and the `LCN` and `SSF` region names on every member country's row).
+ */
 function normalizeCountry(raw: RawCountry): Country {
   const regionId = raw.region?.id ?? '';
   const incomeLevelId = raw.incomeLevel?.id ?? '';
@@ -299,15 +274,39 @@ function normalizeCountry(raw: RawCountry): Country {
   return {
     id: raw.id ?? '',
     iso2: raw.iso2Code ?? '',
-    name: raw.name ?? '',
-    region: { id: regionId, name: raw.region?.value ?? '' },
-    incomeLevel: { id: incomeLevelId, name: raw.incomeLevel?.value ?? '' },
+    name: raw.name?.trim() ?? '',
+    region: { id: regionId, name: raw.region?.value?.trim() ?? '' },
+    incomeLevel: { id: incomeLevelId, name: raw.incomeLevel?.value?.trim() ?? '' },
     lendingType: raw.lendingType?.value ?? '',
     capitalCity: raw.capitalCity ?? '',
     longitude: raw.longitude ?? '',
     latitude: raw.latitude ?? '',
     isAggregate,
   };
+}
+
+/**
+ * `value` in the form a listing `filter` compares: {@link normalizeForMatch}
+ * after decomposing it and dropping its combining marks, so diacritics fold
+ * (`Pärnu` → `parnu`, `Pacífico` → `pacifico`).
+ */
+function matchText(value: string): string {
+  return normalizeForMatch(value.normalize('NFKD').replace(/\p{M}+/gu, ''));
+}
+
+/**
+ * The entries whose id and name, read together, contain every word of
+ * `filter`, both in {@link matchText} form. A word may sit inside a longer one
+ * (`zm` matches `ZM.WE`) and order is free (`nairobi kenya`). Words are
+ * deduplicated, so a repeated word costs nothing and the work stays bounded by
+ * the listing whatever the filter's length.
+ */
+function matchingEntries<T>(entries: T[], filter: string, text: (entry: T) => string): T[] {
+  const words = [...new Set(matchText(filter).split(' '))].filter(Boolean);
+  return entries.filter((entry) => {
+    const haystack = matchText(text(entry));
+    return words.every((word) => haystack.includes(word));
+  });
 }
 
 /** Verified source-15 groupings absent from the global country index; historical economies are excluded. */
@@ -1244,10 +1243,13 @@ export class WorldBankApiService {
   /**
    * Choose the catalog source to query and the dimension value the caller named.
    * Candidates run live source first, the order `preferredRow` ranks them in. A
-   * named value routes to the first candidate whose listing carries it, which is
-   * how an ID published under a live and an archived source reaches the archive
-   * (`FPN 4.1` is listed only by FPN Datahub Archive). With no value named, the
-   * first addressable candidate is used.
+   * named value routes to the first candidate whose listing carries it as an id,
+   * which is how an ID published under a live and an archived source reaches the
+   * archive (`FPN 4.1` is listed only by FPN Datahub Archive). Only when no
+   * candidate lists it as an id is it read as a label, against the listings the id
+   * pass already loaded: the first candidate whose labels carry it decides, and a
+   * label that candidate gives several values is refused before any data request.
+   * With no value named, the first addressable candidate is used.
    */
   private async routeSource(
     indicatorId: string,
@@ -1279,7 +1281,34 @@ export class WorldBankApiService {
       addressable.push({ row, layout, values });
     }
 
-    if (addressable.length === 0) throw this.indicatorNotQueryable(indicatorId, rows, detail);
+    // Falling out of the loop with no value named means no candidate was addressable.
+    if (dimensionValue === undefined || addressable.length === 0)
+      throw this.indicatorNotQueryable(indicatorId, rows, detail);
+
+    /** Labels can carry commas (`005` "Germany, Fed. Rep. of"), so each is quoted. */
+    const pairs = (values: readonly DimensionValue[]) =>
+      values.map((v) => `${v.id} "${v.label}"`).join(', ');
+
+    for (const candidate of addressable) {
+      const matches = valuesWithLabel(candidate.values, dimensionValue);
+      const [match] = matches;
+      if (!match) continue;
+      if (matches.length === 1) return { ...candidate, requested: match };
+      const { layout } = candidate;
+      const ids = matches.map((v) => v.id);
+      throw validationError(
+        `dimension_value "${dimensionValue}" is the label of more than one value "${indicatorId}" can be queried at — ${layout.sourceName} (source ${layout.sourceId}) ${layout.dimension}: ${pairs(matches)}.`,
+        {
+          reason: 'ambiguous_dimension_value',
+          indicatorId,
+          dimensionValue,
+          sourceId: layout.sourceId,
+          concept: layout.dimension,
+          ids,
+        },
+        { literals: ids },
+      );
+    }
 
     const withDimension = addressable.filter((a) => a.layout.dimension);
     if (withDimension.length === 0) {
@@ -1291,7 +1320,7 @@ export class WorldBankApiService {
 
     const listings = withDimension.map(
       ({ layout, values }) =>
-        `${layout.sourceName} (source ${layout.sourceId}) ${layout.dimension}: ${values.map((v) => v.id).join(', ')}`,
+        `${layout.sourceName} (source ${layout.sourceId}) ${layout.dimension}: ${pairs(values)}`,
     );
     throw validationError(
       `dimension_value "${dimensionValue}" is not a value "${indicatorId}" can be queried at. Valid values — ${listings.join('; ')}.`,
@@ -1303,8 +1332,11 @@ export class WorldBankApiService {
           sourceId: layout.sourceId,
           concept: layout.dimension,
           ids: values.map((v) => v.id),
+          // Copies: `values` is the cached listing every later call validates against.
+          values: values.map((v) => ({ ...v })),
         })),
       },
+      { literals: withDimension.flatMap(({ values }) => values.map((v) => v.id)) },
     );
   }
 
@@ -1510,7 +1542,9 @@ export class WorldBankApiService {
 
   /**
    * One page of the country listing, at most {@link MAX_COUNTRIES_PER_PAGE}
-   * entries, with pages counted at the size served on either path.
+   * entries, with pages counted at the size served on either path. `filter`
+   * narrows either listing after its other filters and before the page is cut,
+   * so `total` and `pages` count matches.
    */
   async listCountries(
     opts: {
@@ -1520,6 +1554,8 @@ export class WorldBankApiService {
       /** A `/v2/lendingType` id: `IBD`, `IDB`, `IDX`, or `LNX`. */
       lendingType?: string;
       includeAggregates: boolean;
+      /** Words every entry's id and name must contain, matched by {@link matchingEntries}. */
+      filter?: string;
       page: number;
       perPage: number;
     },
@@ -1532,7 +1568,7 @@ export class WorldBankApiService {
     /** Page size actually served: the requested size, reduced to the page cap when larger. */
     perPage: number;
   }> {
-    const { region, incomeLevel, lendingType, includeAggregates, page } = opts;
+    const { region, incomeLevel, lendingType, includeAggregates, filter, page } = opts;
     const perPage = Math.min(opts.perPage, MAX_COUNTRIES_PER_PAGE);
     if (opts.sourceId !== undefined) {
       ctx = { ...ctx, signal: AbortSignal.any([ctx.signal, AbortSignal.timeout(50_000)]) };
@@ -1543,7 +1579,11 @@ export class WorldBankApiService {
         );
       await this.selectedSource(opts.sourceId, ctx);
       const sourceId = opts.sourceId;
-      const entities = await this.sourceValues(sourceId, 'country', ctx);
+      const listed = await this.sourceValues(sourceId, 'country', ctx);
+      const entities =
+        filter === undefined
+          ? listed
+          : matchingEntries(listed, filter, (entity) => `${entity.id} ${entity.label}`);
       const start = (page - 1) * perPage;
       return {
         countries: entities
@@ -1577,8 +1617,10 @@ export class WorldBankApiService {
      * `IDX` with every entry twice and counts both copies in `paging.total`
      * (118 rows for 59 `IDX` countries), so only a deduplicated local page is
      * right. No aggregate carries a lending type, so none survive that filter.
+     * `filter` matches locally — `/country` ignores `searchterm` — so it takes
+     * this path too.
      */
-    if (!includeAggregates || lendingType) {
+    if (!includeAggregates || lendingType || filter !== undefined) {
       const raw = await this.fetchAllPages<RawCountry>(
         '/country',
         filterParams,
@@ -1586,9 +1628,13 @@ export class WorldBankApiService {
         invalidFilter,
       );
       const unique = new Map(raw.map((country) => [country.id ?? '', country]));
-      const countries = [...unique.values()]
+      const kept = [...unique.values()]
         .map(normalizeCountry)
         .filter((c) => includeAggregates || !c.isAggregate);
+      const countries =
+        filter === undefined
+          ? kept
+          : matchingEntries(kept, filter, (country) => `${country.id} ${country.name}`);
       const start = (page - 1) * perPage;
       return {
         countries: countries.slice(start, start + perPage),

@@ -25,6 +25,12 @@ const ServerConfigSchema = z.object({
     .min(1)
     .default(50)
     .describe('Default page size for list/search operations.'),
+  clampLimits: z
+    .stringbool()
+    .default(true)
+    .describe(
+      "Serve a per_page above a tool's page maximum at that maximum, with a notice. false advertises the maximum in each tool's input schema and rejects a larger per_page instead. A server default above the maximum is served at the maximum either way.",
+    ),
   catalogCacheTtlMs: z.coerce
     .number()
     .int()
@@ -43,6 +49,7 @@ export function getServerConfig() {
     pipBaseUrl: 'WORLDBANK_PIP_BASE_URL',
     projectsBaseUrl: 'WORLDBANK_PROJECTS_BASE_URL',
     defaultPerPage: 'WORLDBANK_DEFAULT_PER_PAGE',
+    clampLimits: 'WORLDBANK_CLAMP_LIMITS',
     catalogCacheTtlMs: 'WORLDBANK_CATALOG_CACHE_TTL_MS',
   });
   return _config;

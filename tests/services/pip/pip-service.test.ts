@@ -1,8 +1,10 @@
 /**
  * @fileoverview Tests for PipService — the survey-first merge and the row grain
- * it keys on, normalization of PIP's flat row shape, local pagination, and the
- * classification of PIP's real HTTP status codes into domain errors, resolution
- * of the PPP vintage against the versions listing, and survey comparability.
+ * it keys on, the two passes running at once and the survey-only answer when
+ * the gap-filled pass fails, normalization of PIP's flat row shape, local
+ * pagination, and the classification of PIP's real HTTP status codes into
+ * domain errors, resolution of the PPP vintage against the versions listing,
+ * and survey comparability.
  * @module tests/services/pip/pip-service.test
  */
 
@@ -15,7 +17,10 @@ import ngaCapture from './fixtures/nga.json' with { type: 'json' };
 
 // ─── fetchWithTimeout mock ────────────────────────────────────────────────────
 // Hoisted so the mock is in place before the service module resolves the dep.
-vi.mock('@cyanheads/mcp-ts-core/utils', () => ({
+// The framework's transient classification stays real.
+vi.mock('@cyanheads/mcp-ts-core/utils', async (importOriginal) => ({
+  defaultIsTransient: (await importOriginal<typeof import('@cyanheads/mcp-ts-core/utils')>())
+    .defaultIsTransient,
   fetchWithTimeout: vi.fn(),
   withRetry: vi.fn().mockImplementation((fn: () => unknown) => fn()),
 }));
@@ -276,6 +281,14 @@ describe('PipService', () => {
     });
   }
 
+  /** Queue the per-attempt timeout `fetchWithTimeout` throws once PIP outlasts it. */
+  async function mockTimeout() {
+    const { timeout } = await import('@cyanheads/mcp-ts-core/errors');
+    pipQueue.push(async () => {
+      throw timeout('Fetch timed out.', { errorSource: 'FetchTimeout' });
+    });
+  }
+
   /** URLs of every request made so far, in order. */
   function fetchCalls(): string[] {
     return fetchWithTimeoutMock.mock.calls.map((call) => String(call[0]));
@@ -457,6 +470,7 @@ describe('PipService', () => {
       distributionType: null,
     });
     mockRows([surveyRow('BRA', 2022)]);
+    mockRows([gapFilledRow('BRA', 2022)]);
     const sparse = await service.getPoverty(
       { ...baseOpts, countries: ['BRA'] },
       createMockContext(),
@@ -464,16 +478,21 @@ describe('PipService', () => {
     expect(sparse.rows[0]).toMatchObject({ estimateType: null, distributionType: null });
   });
 
-  it('returns the inequality block on a survey year and asks upstream once', async () => {
+  it('returns the inequality block on a survey year in place of its gap-filled twin', async () => {
     mockRows([surveyRow('USA', 2022)]);
+    // PIP's gap-filled series answers a surveyed year too, from a different series.
+    mockRows([gapFilledRow('USA', 2022, { headcount: 0.0132, estimation_type: 'survey' })]);
     const result = await service.getPoverty(baseOpts, createMockContext());
 
-    expect(pipCalls()).toHaveLength(1);
-    expect(pipCalls()[0]).toContain('fill_gaps=false');
-    expect(result.gapFilled).toBe(false);
+    expect(pipCalls().map((url) => new URL(url).searchParams.get('fill_gaps'))).toEqual([
+      'false',
+      'true',
+    ]);
+    expect(result).toMatchObject({ total: 1, gapFilled: false, gapFillUnavailable: false });
     expect(result.rows[0]).toMatchObject({
       countryCode: 'USA',
       reportingYear: 2022,
+      headcount: 0.014,
       gini: 0.417,
       mld: 0.3475,
       polarization: 0.3757,
@@ -487,10 +506,346 @@ describe('PipService', () => {
     ]);
   });
 
-  it('does not gap-fill when the survey response already covers every country', async () => {
+  /**
+   * A surveyed year can lack a grain PIP's gap-filled series carries. BOL's 1990
+   * survey covers urban areas only and PIP's estimate for 1990 is national; the
+   * welfare-type case has no national instance in release 20260922, but nothing
+   * in PIP's model rules it out.
+   */
+  it.each([
+    [
+      'a reporting level',
+      surveyRow('BOL', 1990, { reporting_level: 'urban', headcount: 0.0582, gini: 0.4204 }),
+      gapFilledRow('BOL', 1990, { headcount: 0.2204, estimation_type: 'extrapolation' }),
+      [
+        ['national', 'income', 0.2204, 'extrapolation', null],
+        ['urban', 'income', 0.0582, 'survey', 0.4204],
+      ],
+    ],
+    [
+      'a welfare type',
+      surveyRow('BOL', 1990, { headcount: 0.0582, gini: 0.4204 }),
+      gapFilledRow('BOL', 1990, { welfare_type: 'consumption', headcount: 0.2204 }),
+      [
+        ['national', 'consumption', 0.2204, 'interpolation', null],
+        ['national', 'income', 0.0582, 'survey', 0.4204],
+      ],
+    ],
+  ])(
+    "adds a single year's gap-filled estimate at %s its survey does not cover",
+    async (_shape, survey, estimate, expected) => {
+      mockRows([survey]);
+      mockRows([estimate]);
+      const result = await service.getPoverty(
+        { ...baseOpts, countries: ['BOL'], year: '1990' },
+        createMockContext(),
+      );
+
+      expect(pipCalls()).toHaveLength(2);
+      expect(result).toMatchObject({ total: 2, gapFilled: true, gapFillUnavailable: false });
+      expect(
+        result.rows.map((row) => [
+          row.reportingLevel,
+          row.welfareType,
+          row.headcount,
+          row.estimationType,
+          row.gini,
+        ]),
+      ).toEqual(expected);
+    },
+  );
+
+  it("adds each listed economy's uncovered estimate for a single year", async () => {
+    mockRows([
+      surveyRow('URY', 1995, { reporting_level: 'urban', headcount: 0.0085 }),
+      surveyRow('ECU', 1995, { reporting_level: 'urban', headcount: 0.1808 }),
+    ]);
+    mockRows([
+      gapFilledRow('ECU', 1995, { headcount: 0.2238 }),
+      gapFilledRow('URY', 1995, { headcount: 0.019, estimation_type: 'extrapolation' }),
+    ]);
+    const result = await service.getPoverty(
+      { ...baseOpts, countries: ['URY', 'ECU'], year: '1995' },
+      createMockContext(),
+    );
+
+    expect(
+      result.rows.map((row) => [
+        row.countryCode,
+        row.reportingLevel,
+        row.headcount,
+        row.estimationType,
+      ]),
+    ).toEqual([
+      ['ECU', 'national', 0.2238, 'interpolation'],
+      ['ECU', 'urban', 0.1808, 'survey'],
+      ['URY', 'national', 0.019, 'extrapolation'],
+      ['URY', 'urban', 0.0085, 'survey'],
+    ]);
+    expect(result.gapFilled).toBe(true);
+  });
+
+  it('keeps both rows when one pass repeats a grain, dropping only a twin across passes', async () => {
+    mockRows([surveyRow('USA', 2022), surveyRow('USA', 2022, { headcount: 0.015 })]);
+    mockRows([
+      gapFilledRow('USA', 2022),
+      gapFilledRow('USA', 2022, { reporting_level: 'urban' }),
+      gapFilledRow('USA', 2022, { reporting_level: 'urban', headcount: 0.02 }),
+    ]);
+    const result = await service.getPoverty(baseOpts, createMockContext());
+
+    expect(result.rows.map((row) => [row.reportingLevel, row.headcount])).toEqual([
+      ['national', 0.014],
+      ['national', 0.015],
+      ['urban', 0.014],
+      ['urban', 0.02],
+    ]);
+  });
+
+  // ─── The two passes, concurrently ─────────────────────────────────────────
+
+  /** A `/pip` request held open by {@link holdPipRequests}. */
+  type HeldRequest = {
+    url: string;
+    signal: AbortSignal;
+    answer: (rows: unknown[]) => void;
+    fail: (error: unknown) => void;
+  };
+
+  /**
+   * Hold every `/pip` request open until the test answers or fails it.
+   * `started` resolves once the first request is in flight. A held request
+   * whose signal aborts first rejects with the McpError `fetchWithTimeout`
+   * raises for a caller abort.
+   */
+  async function holdPipRequests() {
+    const { requestCancelled } = await import('@cyanheads/mcp-ts-core/errors');
+    const held: HeldRequest[] = [];
+    const started = Promise.withResolvers<void>();
+    const serve = fetchWithTimeoutMock.getMockImplementation() as (
+      ...args: unknown[]
+    ) => Promise<unknown>;
+    fetchWithTimeoutMock.mockImplementation(
+      (url: string, timeout: number, ctx: unknown, options: { signal: AbortSignal }) => {
+        if (!url.includes('/pip?')) return serve(url, timeout, ctx, options);
+        return new Promise((resolve, reject) => {
+          options.signal.addEventListener(
+            'abort',
+            () => reject(requestCancelled('PIP estimates was aborted.')),
+            { once: true },
+          );
+          held.push({
+            url,
+            signal: options.signal,
+            answer: (rows) => resolve({ text: async () => JSON.stringify(rows) }),
+            fail: reject,
+          });
+          started.resolve();
+        });
+      },
+    );
+    return { held, started: started.promise };
+  }
+
+  it('has the survey and gap-filled requests in flight before either answers', async () => {
+    const { held, started } = await holdPipRequests();
+    const result = service.getPoverty(
+      { ...baseOpts, countries: ['BOL'], year: '1990' },
+      createMockContext(),
+    );
+    await started;
+    await drainMicrotasks();
+
+    expect(held.map(({ url }) => new URL(url).searchParams.get('fill_gaps'))).toEqual([
+      'false',
+      'true',
+    ]);
+    // Answered in the reverse order: the merge does not depend on which lands first.
+    held[1]?.answer([gapFilledRow('BOL', 1990, { estimation_type: 'extrapolation' })]);
+    held[0]?.answer([surveyRow('BOL', 1990, { reporting_level: 'urban' })]);
+    await expect(result).resolves.toMatchObject({ total: 2, gapFilled: true });
+  });
+
+  describe('once the survey pass has answered every economy of a single year', () => {
+    beforeEach(() => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    /** Start a request with both `/pip` passes held, and answer the survey pass. */
+    async function surveyAnswered(year: string) {
+      const { held, started } = await holdPipRequests();
+      let settled = false;
+      const request = service.getPoverty(
+        { ...baseOpts, countries: ['BOL'], year },
+        createMockContext(),
+      );
+      void request.then(
+        () => {
+          settled = true;
+        },
+        () => {
+          settled = true;
+        },
+      );
+      await started;
+      await drainMicrotasks();
+      held[0]?.answer([surveyRow('BOL', 1990, { reporting_level: 'urban' })]);
+      await drainMicrotasks();
+      return { held, request, settled: () => settled };
+    }
+
+    it('answers from the survey rows 10 s later when the gap-filled pass is still out, abandoning it', async () => {
+      const { held, request, settled } = await surveyAnswered('1990');
+
+      await vi.advanceTimersByTimeAsync(9_999);
+      expect(settled()).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await drainMicrotasks();
+      expect(settled()).toBe(true);
+
+      await expect(request).resolves.toMatchObject({
+        total: 1,
+        gapFilled: false,
+        gapFillUnavailable: true,
+      });
+      expect(held[1]?.signal.aborted).toBe(true);
+    });
+
+    it('merges a gap-filled answer that lands inside those 10 s', async () => {
+      const { held, request } = await surveyAnswered('1990');
+
+      await vi.advanceTimersByTimeAsync(9_999);
+      held[1]?.answer([gapFilledRow('BOL', 1990, { estimation_type: 'extrapolation' })]);
+
+      await expect(request).resolves.toMatchObject({
+        total: 2,
+        gapFilled: true,
+        gapFillUnavailable: false,
+      });
+    });
+
+    it('keeps waiting on a shape that needs the gap-filled rows', async () => {
+      const { held, request, settled } = await surveyAnswered('all');
+
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(settled()).toBe(false);
+      held[1]?.answer([gapFilledRow('BOL', 1991, { estimation_type: 'interpolation' })]);
+
+      await expect(request).resolves.toMatchObject({
+        total: 2,
+        gapFilled: true,
+        gapFillUnavailable: false,
+      });
+    });
+  });
+
+  /**
+   * The survey request already accepted the same parameters, so any upstream
+   * failure of the gap-filled one — an error status, a bot-check page, an
+   * unreadable body — is PIP's, and the survey rows still hold every economy.
+   */
+  it.each([
+    ['an HTTP 503', () => mockHttpError(503, '{"error":["Service Unavailable"]}')],
+    ['a timeout', () => mockTimeout()],
+    [
+      'an HTTP 404 naming a parameter',
+      () => mockHttpError(404, validationBody('fill_gaps', ['true', 'false'])),
+    ],
+    ['an HTTP 403 page', () => mockHttpError(403, '<html><title>Just a moment...</title></html>')],
+    ['a 200 body that is not JSON', () => mockBody('[{"country_code":"BOL","reporting_year":19')],
+  ])(
+    'answers a fully surveyed single year from its survey rows when the gap-filled pass meets %s',
+    async (_failure, fail) => {
+      mockRows([surveyRow('BOL', 1990, { reporting_level: 'urban', headcount: 0.0582 })]);
+      await fail();
+      const result = await service.getPoverty(
+        { ...baseOpts, countries: ['BOL'], year: '1990' },
+        createMockContext(),
+      );
+
+      expect(pipCalls()).toHaveLength(2);
+      expect(result).toMatchObject({ total: 1, gapFilled: false, gapFillUnavailable: true });
+      expect(result.rows.map((row) => [row.reportingLevel, row.estimationType])).toEqual([
+        ['urban', 'survey'],
+      ]);
+    },
+  );
+
+  /**
+   * Every shape but a fully surveyed single year needs the gap-filled rows for
+   * whole economies or years, so its failure fails the call, as it always has.
+   */
+  it.each([
+    ['an economy no survey covers that year', { countries: ['USA', 'IND'] }],
+    ['every economy', { countries: ['all'] }],
+    ['the whole window', { year: 'all' }],
+    ['the most recent year', { year: 'MRV' }],
+  ])('fails when the gap-filled pass fails for %s', async (_shape, opts) => {
     mockRows([surveyRow('USA', 2022)]);
-    await service.getPoverty(baseOpts, createMockContext());
-    expect(pipCalls()).toHaveLength(1);
+    await mockHttpError(503, '{"error":["Service Unavailable"]}');
+
+    await expect(
+      service.getPoverty({ ...baseOpts, ...opts }, createMockContext()),
+    ).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      data: { reason: 'upstream_unavailable', status: 503 },
+    });
+  });
+
+  it('answers a fully surveyed single year from its survey rows when the gap-filled response is malformed', async () => {
+    mockRows([surveyRow('USA', 2022)]);
+    mockBody('{"unexpected":"object"}');
+
+    await expect(service.getPoverty(baseOpts, createMockContext())).resolves.toMatchObject({
+      total: 1,
+      gapFilled: false,
+      gapFillUnavailable: true,
+    });
+  });
+
+  it('rejects with the cancellation, never survey rows alone, when the caller aborts the gap-filled pass', async () => {
+    const { held, started } = await holdPipRequests();
+    const cancelled = new AbortController();
+    const request = service.getPoverty(
+      { ...baseOpts, countries: ['BOL'], year: '1990' },
+      createMockContext({ signal: cancelled.signal }),
+    );
+    await started;
+    await drainMicrotasks();
+    held[0]?.answer([surveyRow('BOL', 1990, { reporting_level: 'urban' })]);
+    await drainMicrotasks();
+    cancelled.abort();
+
+    const outcome = await request.then(
+      (value) => ({ settled: 'resolved', value }),
+      (error: unknown) => ({ settled: 'rejected', error }),
+    );
+    expect(outcome).toMatchObject({
+      settled: 'rejected',
+      error: { code: JsonRpcErrorCode.RequestCancelled, message: 'PIP estimates was aborted.' },
+    });
+    expect(outcome).not.toHaveProperty('value');
+  });
+
+  it('fails with the survey error and abandons the gap-filled request still in flight', async () => {
+    const { held, started } = await holdPipRequests();
+    const ctx = createMockContext();
+    const request = service.getPoverty({ ...baseOpts, countries: ['BOL'], year: '1990' }, ctx);
+    await started;
+    await drainMicrotasks();
+    const [survey, filled] = held;
+
+    const { serviceUnavailable } = await import('@cyanheads/mcp-ts-core/errors');
+    survey?.fail(serviceUnavailable('Fetch failed with status 502.', { status: 502 }));
+
+    await expect(request).rejects.toMatchObject({
+      data: { reason: 'upstream_unavailable', status: 502 },
+    });
+    expect(filled?.signal.aborted).toBe(true);
+    expect(ctx.signal.aborted).toBe(false);
   });
 
   // ─── Gap-filled rows ──────────────────────────────────────────────────────
@@ -534,8 +889,21 @@ describe('PipService', () => {
     expect(result.gapFilled).toBe(false);
   });
 
+  it('keeps a single year at its survey rows alone, from one request, when fillGaps is false', async () => {
+    mockRows([surveyRow('BOL', 1990, { reporting_level: 'urban' })]);
+    const result = await service.getPoverty(
+      { ...baseOpts, countries: ['BOL'], year: '1990', fillGaps: false },
+      createMockContext(),
+    );
+
+    expect(pipCalls()).toHaveLength(1);
+    expect(result).toMatchObject({ total: 1, gapFilled: false });
+    expect(result.rows.map((row) => row.reportingLevel)).toEqual(['urban']);
+  });
+
   it('drops a partial decile run rather than reporting shares against the wrong deciles', async () => {
     mockRows([surveyRow('USA', 2022, { decile7: null })]);
+    mockRows([gapFilledRow('USA', 2022)]);
     const result = await service.getPoverty(baseOpts, createMockContext());
     expect(result.rows[0]?.decileShares).toBeNull();
     expect(result.rows[0]?.gini).toBe(0.417);
@@ -591,8 +959,8 @@ describe('PipService', () => {
       createMockContext(),
     );
 
-    // Covered by a survey row, but the years around it are not — the country
-    // key alone would have skipped the second request and returned two rows.
+    // Covered by a survey row, but the years around it are not — the gap-filled
+    // pass adds them, so both passes run and four rows come back.
     expect(pipCalls()).toHaveLength(2);
     expect(result.total).toBe(4);
     expect(result.gapFilled).toBe(true);
@@ -761,8 +1129,9 @@ describe('PipService', () => {
 
   // ─── Query construction ───────────────────────────────────────────────────
 
-  it('sends only the filters the caller supplied', async () => {
+  it('sends only the filters the caller supplied, on both passes', async () => {
     mockRows([surveyRow('USA', 2022)]);
+    mockRows([gapFilledRow('USA', 2022)]);
     await service.getPoverty(
       {
         ...baseOpts,
@@ -773,17 +1142,21 @@ describe('PipService', () => {
       createMockContext(),
     );
 
-    const url = String(pipCalls()[0]);
-    expect(url).toContain('https://api.worldbank.org/pip/v1/pip?');
-    expect(url).toContain('povline=2.15');
-    expect(url).toContain('welfare_type=income');
-    expect(url).toContain('reporting_level=national');
+    expect(pipCalls()).toHaveLength(2);
+    for (const url of pipCalls()) {
+      expect(url).toContain('https://api.worldbank.org/pip/v1/pip?');
+      expect(url).toContain('povline=2.15');
+      expect(url).toContain('welfare_type=income');
+      expect(url).toContain('reporting_level=national');
+    }
   });
 
   it('omits povline entirely when the caller did not pick a poverty line', async () => {
     mockRows([surveyRow('USA', 2022)]);
+    mockRows([gapFilledRow('USA', 2022)]);
     await service.getPoverty(baseOpts, createMockContext());
-    expect(String(pipCalls()[0])).not.toContain('povline');
+    expect(pipCalls()).toHaveLength(2);
+    for (const url of pipCalls()) expect(url).not.toContain('povline');
   });
 
   // ─── Error classification ─────────────────────────────────────────────────
@@ -989,6 +1362,7 @@ describe('PipService', () => {
   it('fails only the caller that cancels while a concurrent caller shares the reference loads', async () => {
     const gate = holdReferenceListings();
     mockRows([surveyRow('USA', 2022)]);
+    mockRows([gapFilledRow('USA', 2022)]);
     const cancelled = new AbortController();
 
     const first = service.getPoverty(baseOpts, createMockContext({ signal: cancelled.signal }));
@@ -1007,6 +1381,7 @@ describe('PipService', () => {
   it('keeps a reference load every caller abandoned, and serves the next caller from it', async () => {
     const gate = holdReferenceListings();
     mockRows([surveyRow('USA', 2022)]);
+    mockRows([gapFilledRow('USA', 2022)]);
     const cancelled = new AbortController();
 
     const abandoned = service.getPoverty(baseOpts, createMockContext({ signal: cancelled.signal }));
@@ -1042,10 +1417,15 @@ describe('PipService', () => {
 
   it('names only the codes neither list carries, and asks for no all-economy response', async () => {
     await mockHttpError(404, validationBody('country', ['USA', 'IND']));
+    await mockHttpError(404, validationBody('country', ['USA', 'IND']));
     await expect(
       service.getPoverty({ ...baseOpts, countries: ['USA', 'ZZZ'] }, createMockContext()),
     ).rejects.toMatchObject({ data: { reason: 'country_not_found', countryCodes: 'ZZZ' } });
-    expect(pipCalls()).toHaveLength(1);
+    // The survey request and the gap-filled one beside it, both for the codes sent.
+    expect(pipCalls().map((url) => new URL(url).searchParams.get('country'))).toEqual([
+      'USA,ZZZ',
+      'USA,ZZZ',
+    ]);
   });
 
   it('keeps country_not_found for the whole batch when the rejection carries no list', async () => {
@@ -1078,6 +1458,19 @@ describe('PipService', () => {
     await expect(service.getPoverty(baseOpts, createMockContext())).rejects.toThrow(
       /not the expected array/,
     );
+  });
+
+  it('throws a serialization error, without a retry, when a 200 body is not JSON', async () => {
+    mockBody('[{"country_code":"BRA","reporting_year":20');
+    mockRows([surveyRow('BRA', 2022)]);
+
+    await expect(
+      service.getPoverty({ ...baseOpts, countries: ['BRA'], fillGaps: false }, createMockContext()),
+    ).rejects.toMatchObject({
+      code: JsonRpcErrorCode.SerializationError,
+      message: 'PIP returned a response that is not JSON.',
+    });
+    expect(pipCalls()).toHaveLength(1);
   });
 
   // ─── PPP vintage ──────────────────────────────────────────────────────────
@@ -1118,6 +1511,7 @@ describe('PipService', () => {
   it('picks the newest release by its date stamp, not by where the listing puts it', async () => {
     versionsListing = [...VERSIONS].reverse();
     mockRows([surveyRow('USA', 2022)]);
+    mockRows([gapFilledRow('USA', 2022)]);
 
     const result = await service.getPoverty(baseOpts, createMockContext());
     expect(result).toMatchObject({ pppVersion: '2021', releaseVersion: '20260324' });
@@ -1140,15 +1534,17 @@ describe('PipService', () => {
   });
 
   it('reads the versions listing once and reuses it across requests', async () => {
-    mockRows([surveyRow('USA', 2022)]);
-    mockRows([surveyRow('USA', 2022)]);
+    for (let call = 0; call < 2; call++) {
+      mockRows([surveyRow('USA', 2022)]);
+      mockRows([gapFilledRow('USA', 2022)]);
+    }
     const ctx = createMockContext();
 
     await service.getPoverty(baseOpts, ctx);
     await service.getPoverty({ ...baseOpts, pppVersion: '2017' }, ctx);
 
     expect(versionsCalls()).toHaveLength(1);
-    expect(pipCalls()).toHaveLength(2);
+    expect(pipCalls()).toHaveLength(4);
   });
 
   it('rereads the versions listing on every request when caching is disabled', async () => {
@@ -1160,8 +1556,10 @@ describe('PipService', () => {
     } as never);
     const { PipService } = await import('@/services/pip/pip-service.js');
     const uncached = new PipService({} as never, createInMemoryStorage());
-    mockRows([surveyRow('USA', 2022)]);
-    mockRows([surveyRow('USA', 2022)]);
+    for (let call = 0; call < 2; call++) {
+      mockRows([surveyRow('USA', 2022)]);
+      mockRows([gapFilledRow('USA', 2022)]);
+    }
 
     await uncached.getPoverty(baseOpts, createMockContext());
     await uncached.getPoverty(baseOpts, createMockContext());
@@ -1206,6 +1604,7 @@ describe('PipService', () => {
   it('reports comparability as null when a row omits the fields entirely', async () => {
     const { survey_comparability: _a, comparable_spell: _b, ...sparse } = surveyRow('USA', 2022);
     mockRows([sparse]);
+    mockRows([gapFilledRow('USA', 2022)]);
     const result = await service.getPoverty(baseOpts, createMockContext());
     expect(result.rows[0]).toMatchObject({ surveyComparability: null, comparableSpell: null });
   });

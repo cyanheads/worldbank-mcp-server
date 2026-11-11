@@ -7,9 +7,9 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
-import { getServerConfig } from '@/config/server-config.js';
 import { pagePastEndNotice } from '@/mcp-server/tools/page-past-end-notice.js';
 import { pageSizeReducedNotice } from '@/mcp-server/tools/page-size-reduced-notice.js';
+import { perPageInput, resolvePerPage } from '@/mcp-server/tools/per-page.js';
 import { MAX_OBSERVATIONS_PER_PAGE } from '@/services/response-budget.js';
 import {
   CATALOG_FILTER_ID,
@@ -189,17 +189,10 @@ export const worldbankGetData = tool('worldbank_get_data', {
       .string()
       .optional()
       .describe(
-        'For indicators answered from their own dataset (the response carries sourceScoped), the id of the value of that dataset\'s extra dimension to query, matched case-insensitively: a WDI Database Archives release ("202503"), an ICP or Food Prices for Nutrition classification ("PPPGlob", "FPN 5.0"), a GDLD sector ("WHT"), or an International Debt Statistics counterpart area ("265"). Omit it for the default, which sourceScoped.dimension reports: the only value when the dataset has one, "WLD" (World) for counterpart areas, the newest WDI Database Archives release holding data for the requested countries and periods (the newest release when none does), or otherwise every value with each row labelled. A value the dataset does not list is rejected with the valid ids, and a value for an indicator the standard data endpoint serves is rejected too.',
+        'For indicators answered from their own dataset (the response carries sourceScoped), the value of that dataset\'s extra dimension to query, by id or by label, matched case-insensitively: a WDI Database Archives release ("202503" or "2025 Mar"), an ICP or Food Prices for Nutrition classification ("PPPGlob", "FPN 5.0"), a GDLD sector ("WHT"), or an International Debt Statistics counterpart area ("730" or "China"). Ids are matched first, across every dataset that carries the indicator; a label must match in full, ignoring case and spacing, and a label several values share is rejected with their ids. Omit it for the default, which sourceScoped.dimension reports: the only value when the dataset has one, "WLD" (World) for counterpart areas, the newest WDI Database Archives release holding data for the requested countries and periods (the newest release when none does), or otherwise every value with each row labelled. A value the dataset lists neither as an id nor as a label is rejected with every valid id beside its label, and a value for an indicator the standard data endpoint serves is rejected too.',
       ),
     page: z.number().int().min(1).default(1).describe('Pagination page number (1-based).'),
-    per_page: z
-      .number()
-      .int()
-      .min(1)
-      .optional()
-      .describe(
-        'Results per page (default: server default). Positive integers above 1000 are served at that maximum with the requested and served sizes echoed and a notice. totalPages uses the served size.',
-      ),
+    per_page: perPageInput(MAX_OBSERVATIONS_PER_PAGE),
   }),
   output: z.object({
     sourceId: z
@@ -480,9 +473,17 @@ export const worldbankGetData = tool('worldbank_get_data', {
       reason: 'unknown_dimension_value',
       severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
-      when: "dimension_value is not a value the indicator's dataset lists for its extra dimension.",
+      when: "dimension_value is neither an id nor a label the indicator's dataset lists for its extra dimension.",
       recovery:
-        'Pass one of the dimension ids the error message lists for this indicator, or omit dimension_value to use the default the response reports.',
+        'Pass one of the ids the error message lists for this indicator, or the label quoted beside one in full, or omit dimension_value to use the default the response reports.',
+    },
+    {
+      reason: 'ambiguous_dimension_value',
+      severity: 'notice',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'dimension_value matches no id, and the first dataset whose labels carry it gives that label to more than one value.',
+      recovery:
+        'Pass one of the ids the error message names in place of the label; each id selects one of the values sharing it.',
     },
     {
       reason: 'dimension_not_applicable',
@@ -559,7 +560,6 @@ export const worldbankGetData = tool('worldbank_get_data', {
     }
 
     const dimensionValue = input.dimension_value?.trim() ? input.dimension_value.trim() : undefined;
-    const perPage = input.per_page ?? getServerConfig().defaultPerPage;
     const codes = splitCountryCodes(input.countries);
     const countryCodes = codes.join(';');
 
@@ -598,6 +598,10 @@ export const worldbankGetData = tool('worldbank_get_data', {
       page: input.page,
     });
 
+    const pageSize = resolvePerPage(
+      { tool: 'worldbank_get_data', cap: MAX_OBSERVATIONS_PER_PAGE, perPage: input.per_page },
+      ctx,
+    );
     let result: DataResult;
     try {
       result = await getWorldBankApiService().getData(
@@ -611,7 +615,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
           ...(frequency !== undefined && { frequency: FREQUENCY_FORM[frequency] }),
           ...(dimensionValue !== undefined && { dimensionValue }),
           page: input.page,
-          perPage: Math.min(perPage, MAX_OBSERVATIONS_PER_PAGE),
+          perPage: pageSize.served,
         },
         ctx,
       );
@@ -645,12 +649,14 @@ export const worldbankGetData = tool('worldbank_get_data', {
             countries: codes,
           });
         }
-        if (reason === 'unknown_dimension_value') {
-          throw ctx.fail('unknown_dimension_value', err.message, {
-            ...err.data,
-            indicatorId: input.indicator_id,
-            dimensionValue,
-          });
+        // The ids these messages list render as code spans: the values to send back.
+        if (reason === 'unknown_dimension_value' || reason === 'ambiguous_dimension_value') {
+          throw ctx.fail(
+            reason,
+            err.message,
+            { ...err.data, indicatorId: input.indicator_id, dimensionValue },
+            err.literals && { literals: err.literals },
+          );
         }
         if (reason === 'dimension_not_applicable') {
           throw ctx.fail('dimension_not_applicable', err.message, {
@@ -687,7 +693,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
         ...(dimensionValue !== undefined && { dimensionValue }),
         page: input.page,
         perPage: result.perPage,
-        ...(result.perPage < perPage && { requestedPerPage: perPage }),
+        ...(result.perPage < pageSize.requested && { requestedPerPage: pageSize.requested }),
       },
     });
     ctx.enrich({ totalCount: result.total, currentPage: result.page, totalPages: result.pages });
@@ -748,7 +754,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
       );
     }
     const reduced = pageSizeReducedNotice({
-      requested: perPage,
+      requested: pageSize.requested,
       served: result.perPage,
       page: result.page,
       pages: result.pages,

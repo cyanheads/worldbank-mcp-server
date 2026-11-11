@@ -20,6 +20,18 @@ export const MAX_PROJECTS_PER_PAGE = 1000;
 export const MAX_ESTIMATES_PER_PAGE = 1000;
 
 /**
+ * Most indicators one worldbank_search_indicators page holds — about 1 MB on
+ * each surface (`population`: 975 KB `structuredContent`, 837 KB `content[]`),
+ * and enough for all of World Development Indicators (1,498) or WDI Database
+ * Archives (2,794) on one page. A keyword search slices matches held in full,
+ * and a topic or source browse is one upstream request at this size.
+ */
+export const MAX_INDICATORS_PER_PAGE = 3000;
+
+/** Most sources one worldbank_list_sources page holds — every one of the 71 the API lists. */
+export const MAX_SOURCES_PER_PAGE = 100;
+
+/**
  * Characters of `sourceNote` a worldbank_search_indicators row carries. Matching
  * still reads the whole note, and worldbank_get_indicator returns it whole.
  */

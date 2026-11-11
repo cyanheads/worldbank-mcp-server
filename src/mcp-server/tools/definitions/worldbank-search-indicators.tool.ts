@@ -7,9 +7,14 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
-import { getServerConfig } from '@/config/server-config.js';
 import { pagePastEndNotice } from '@/mcp-server/tools/page-past-end-notice.js';
-import { INDICATOR_NOTE_EXCERPT_CHARS, shorten } from '@/services/response-budget.js';
+import { pageSizeReducedNotice } from '@/mcp-server/tools/page-size-reduced-notice.js';
+import { perPageInput, resolvePerPage } from '@/mcp-server/tools/per-page.js';
+import {
+  INDICATOR_NOTE_EXCERPT_CHARS,
+  MAX_INDICATORS_PER_PAGE,
+  shorten,
+} from '@/services/response-budget.js';
 import {
   CATALOG_FILTER_ID,
   SOURCE_ID_MESSAGE,
@@ -44,13 +49,7 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
         'Filter by data source ID (e.g. "2" for World Development Indicators). Use worldbank_list_sources to browse valid IDs.',
       ),
     page: z.number().int().min(1).default(1).describe('Pagination page number (1-based).'),
-    per_page: z
-      .number()
-      .int()
-      .min(1)
-      .max(100)
-      .optional()
-      .describe('Results per page (default: server default, max: 100).'),
+    per_page: perPageInput(MAX_INDICATORS_PER_PAGE),
   }),
   output: z.object({
     indicators: z
@@ -104,9 +103,20 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
           .string()
           .optional()
           .describe('Source ID the results were scoped to, omitted when none was given.'),
+        perPage: z
+          .number()
+          .describe(
+            'Results per page actually served — the requested size or server default, reduced to the page cap when larger. totalPages is counted at this size.',
+          ),
+        requestedPerPage: z
+          .number()
+          .optional()
+          .describe(
+            'Page size asked for, requested or server default, present only when it exceeded the page cap and perPage was reduced.',
+          ),
       })
       .describe(
-        'The effective search parameters, field by field — confirms which filter combination produced these results without parsing the effectiveQuery string.',
+        'The effective search parameters, field by field — confirms which filter combination produced these results without parsing the effectiveQuery string, and the page size served.',
       ),
     effectiveQuery: z
       .string()
@@ -119,7 +129,7 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
       .string()
       .optional()
       .describe(
-        'Recovery hint for an empty page — how to broaden the search when no indicators matched, or the page range that exists when the requested page is past the end.',
+        'Recovery hint for an empty page — how to broaden the search when no indicators matched, or the page range that exists when the requested page is past the end — or for a page size reduced to the page cap.',
       ),
   },
 
@@ -145,6 +155,7 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
           ...(filters.sourceId === undefined
             ? []
             : [`source_id=${escapeMarkdownInline(filters.sourceId)}`]),
+          `per_page=${filters.perPage}${filters.requestedPerPage === undefined ? '' : ` (requested ${filters.requestedPerPage})`}`,
         ].join(', ')}`,
     },
   },
@@ -188,7 +199,15 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
       );
     }
 
-    const perPage = input.per_page ?? getServerConfig().defaultPerPage;
+    const pageSize = resolvePerPage(
+      {
+        tool: 'worldbank_search_indicators',
+        cap: MAX_INDICATORS_PER_PAGE,
+        perPage: input.per_page,
+      },
+      ctx,
+    );
+    const perPage = pageSize.served;
 
     ctx.log.info('Searching indicators', { query, topicId, sourceId, page: input.page, perPage });
 
@@ -231,6 +250,8 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
         ...(query !== undefined && { query }),
         ...(topicId !== undefined && { topicId }),
         ...(sourceId !== undefined && { sourceId }),
+        perPage,
+        ...(perPage < pageSize.requested && { requestedPerPage: pageSize.requested }),
       },
       effectiveQuery: filterParts.join(', '),
     });
@@ -239,28 +260,41 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
     // A search that matched nothing is a valid answer, not a failure: return an
     // empty list with a recovery notice rather than throwing. An empty page of a
     // non-empty result set is a different problem and gets its own hint.
+    const notices: string[] = [];
     if (result.indicators.length === 0) {
-      let hint: string;
       if (result.total > 0) {
-        hint = pagePastEndNotice({
-          noun: ['indicator', 'indicators'],
-          page: result.page,
-          pages: result.pages,
-          perPage,
-          total: result.total,
-        });
+        notices.push(
+          pagePastEndNotice({
+            noun: ['indicator', 'indicators'],
+            page: result.page,
+            pages: result.pages,
+            perPage,
+            total: result.total,
+          }),
+        );
       } else if (query) {
-        hint = `No indicators matched "${query}". Try a synonym or browse by topic using worldbank_list_topics.`;
+        notices.push(
+          `No indicators matched "${query}". Try a synonym or browse by topic using worldbank_list_topics.`,
+        );
       } else {
-        hint = 'No indicators found for the specified filter. Try a different topic or source ID.';
+        notices.push(
+          'No indicators found for the specified filter. Try a different topic or source ID.',
+        );
       }
-      ctx.enrich.notice(hint);
     }
+    const reduced = pageSizeReducedNotice({
+      requested: pageSize.requested,
+      served: perPage,
+      page: result.page,
+      pages: result.pages,
+    });
+    if (reduced) notices.push(reduced);
+    if (notices.length > 0) ctx.enrich.notice(notices.join(' '));
 
     /**
      * A note runs up to ~4,000 characters, so a 100-row page of whole notes
-     * reaches ~148 KB. Matching has already read every note in full; the rows
-     * returned carry an excerpt.
+     * reaches ~148 KB, and a full page several MB. Matching has already read
+     * every note in full; the rows returned carry an excerpt.
      */
     return {
       indicators: result.indicators.map((indicator) => ({

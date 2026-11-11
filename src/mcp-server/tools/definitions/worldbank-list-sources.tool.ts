@@ -6,8 +6,10 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
-import { getServerConfig } from '@/config/server-config.js';
 import { pagePastEndNotice } from '@/mcp-server/tools/page-past-end-notice.js';
+import { pageSizeReducedNotice } from '@/mcp-server/tools/page-size-reduced-notice.js';
+import { perPageInput, resolvePerPage } from '@/mcp-server/tools/per-page.js';
+import { MAX_SOURCES_PER_PAGE } from '@/services/response-budget.js';
 import { getWorldBankApiService } from '@/services/worldbank/worldbank-service.js';
 
 export const worldbankListSources = tool('worldbank_list_sources', {
@@ -18,13 +20,7 @@ export const worldbankListSources = tool('worldbank_list_sources', {
   inputAliases: { limit: 'per_page' },
   input: z.object({
     page: z.number().int().min(1).default(1).describe('Pagination page number (1-based).'),
-    per_page: z
-      .number()
-      .int()
-      .min(1)
-      .max(100)
-      .optional()
-      .describe('Results per page (default: server default, max: 100).'),
+    per_page: perPageInput(MAX_SOURCES_PER_PAGE),
   }),
   output: z.object({
     sources: z
@@ -48,9 +44,24 @@ export const worldbankListSources = tool('worldbank_list_sources', {
       .describe('World Bank data sources for this page.'),
   }),
 
-  // Agent-facing context: pagination totals. Kept out of the domain return so it
-  // reaches both structuredContent and content[] automatically.
+  // Agent-facing context: the page size served and pagination totals. Kept out of
+  // the domain return so it reaches both structuredContent and content[] automatically.
   enrichment: {
+    appliedFilters: z
+      .object({
+        perPage: z
+          .number()
+          .describe(
+            'Results per page actually served — the requested size or server default, reduced to the page cap when larger. totalPages is counted at this size.',
+          ),
+        requestedPerPage: z
+          .number()
+          .optional()
+          .describe(
+            'Page size asked for, requested or server default, present only when it exceeded the page cap and perPage was reduced.',
+          ),
+      })
+      .describe('The page size served, and the size asked for when it was reduced.'),
     totalCount: z.number().describe('Total number of sources.'),
     currentPage: z
       .number()
@@ -60,23 +71,43 @@ export const worldbankListSources = tool('worldbank_list_sources', {
       .string()
       .optional()
       .describe(
-        'Context for an empty page: the page range that exists when the requested page is past the end.',
+        'Context for an empty page — the page range that exists when the requested page is past the end — or for a page size reduced to the page cap.',
       ),
   },
 
+  enrichmentTrailer: {
+    appliedFilters: {
+      /**
+       * A per-field `render` replaces the whole trailer line, `label` included,
+       * so the heading has to be part of what it returns.
+       */
+      render: (filters) =>
+        `**Applied Filters:** per_page=${filters.perPage}${filters.requestedPerPage === undefined ? '' : ` (requested ${filters.requestedPerPage})`}`,
+    },
+  },
+
   async handler(input, ctx) {
-    const perPage = input.per_page ?? getServerConfig().defaultPerPage;
+    const pageSize = resolvePerPage(
+      { tool: 'worldbank_list_sources', cap: MAX_SOURCES_PER_PAGE, perPage: input.per_page },
+      ctx,
+    );
+    const perPage = pageSize.served;
     ctx.log.info('Listing World Bank sources', { page: input.page, perPage });
     const result = await getWorldBankApiService().listSources(input.page, perPage, ctx);
     ctx.enrich({
+      appliedFilters: {
+        perPage,
+        ...(perPage < pageSize.requested && { requestedPerPage: pageSize.requested }),
+      },
       totalCount: result.total,
       currentPage: result.page,
       totalPages: result.pages,
     });
+    const notices: string[] = [];
     if (result.total === 0) {
-      ctx.enrich.notice('The World Bank returned no data sources.');
+      notices.push('The World Bank returned no data sources.');
     } else if (result.sources.length === 0) {
-      ctx.enrich.notice(
+      notices.push(
         pagePastEndNotice({
           noun: ['source', 'sources'],
           page: result.page,
@@ -86,6 +117,14 @@ export const worldbankListSources = tool('worldbank_list_sources', {
         }),
       );
     }
+    const reduced = pageSizeReducedNotice({
+      requested: pageSize.requested,
+      served: perPage,
+      page: result.page,
+      pages: result.pages,
+    });
+    if (reduced) notices.push(reduced);
+    if (notices.length > 0) ctx.enrich.notice(notices.join(' '));
     return { sources: result.sources };
   },
 

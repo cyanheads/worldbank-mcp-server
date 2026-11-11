@@ -21,6 +21,7 @@ vi.mock('@/config/server-config.js', () => ({
     pipBaseUrl: 'https://api.worldbank.org/pip/v1',
     projectsBaseUrl: 'https://search.worldbank.org/api/v3',
     defaultPerPage: 50,
+    clampLimits: true,
     catalogCacheTtlMs: 60_000,
   }),
 }));
@@ -29,6 +30,7 @@ vi.mock('@/config/server-config.js', () => ({
 const project = {
   id: 'P513080',
   name: 'MPA Phase III - Progestão Sergipe: Public Sector Management Efficiency Project',
+  objective: 'To improve the efficiency of public sector management in Sergipe.' as string | null,
   status: 'Active',
   countryCodes: ['BR'],
   countryName: 'Federative Republic of Brazil',
@@ -41,15 +43,30 @@ const project = {
   grantAmount: null as number | null,
   financialTypes: ['IBRD', 'Other'],
   majorSectors: ['Public Administration', 'Education'],
+  sectors: [
+    {
+      name: 'Central Government (Central Agencies)',
+      code: 'BCA',
+      majorSector: 'Public Administration',
+      percent: 85,
+    },
+    {
+      name: 'Public Administration - Education',
+      code: 'EEF',
+      majorSector: 'Education',
+      percent: 15,
+    },
+  ] as Array<{ name: string; code: string; majorSector: string; percent: number | null }>,
   abstract: null as string | null,
   url: 'https://projects.worldbank.org/en/projects-operations/project-detail/P513080',
 };
 
-/** A sparse project: the portfolio publishes no amount, closing date, or sectors for it. */
+/** A sparse project: the portfolio publishes no objective, amount, closing date, or sectors for it. */
 const sparseProject = {
   ...project,
   id: 'P072339',
   name: 'African Distance Learning Multi-Country Credit',
+  objective: null,
   status: 'Dropped',
   countryCodes: [] as string[],
   countryName: 'Other',
@@ -61,6 +78,7 @@ const sparseProject = {
   grantAmount: null,
   financialTypes: [] as string[],
   majorSectors: [] as string[],
+  sectors: [],
   url: 'https://projects.worldbank.org/en/projects-operations/project-detail/P072339',
 };
 
@@ -266,7 +284,7 @@ describe('worldbankSearchProjects', () => {
   it('accepts the digit-bearing regional codes the portfolio files multi-country operations under', async () => {
     const tool = await loadTool();
 
-    // 3A (Africa), 4E (East Asia and Pacific), 1W (World) are real filter values
+    // 3A (pre-split Africa), 4E (East Asia and Pacific), 1W (World) are real filter values
     // — a letters-only rule would make them unreachable.
     for (const code of ['3A', '4E', '7E', '8S', '1W', 'E2', 'P3']) {
       expect(tool.input.safeParse({ countries: code }).success).toBe(true);
@@ -884,7 +902,13 @@ describe('worldbankSearchProjects', () => {
       '**totalCommitment:** 49,300,000 USD (ibrdCommitment 41,800,000 · idaCommitment 5,000,000 · grantAmount 2,500,000)',
     );
     expect(text).toContain('**financialTypes:** IBRD, Other');
-    expect(text).toContain('**majorSectors:** Public Administration, Education');
+    expect(text).toContain('**majorSectors:** Public Administration; Education');
+    expect(text).toContain(
+      '- **sectors:** Central Government (Central Agencies) (BCA · Public Administration · 85%); Public Administration - Education (EEF · Education · 15%)\n',
+    );
+    expect(text).toContain(
+      'Public Sector Management Efficiency Project (P513080)\n- **objective:** To improve the efficiency of public sector management in Sergipe.\n- **status:** Active',
+    );
     expect(text).toContain('projects.worldbank.org/en/projects-operations/project-detail/P513080');
     expect(text).toContain('**abstract:** Rehabilitation of the dam.');
 
@@ -893,7 +917,7 @@ describe('worldbankSearchProjects', () => {
     expect(text).toContain(
       '**totalCommitment:** null (ibrdCommitment null · idaCommitment null · grantAmount null) | **financialTypes:** none',
     );
-    expect(text).toContain('**majorSectors:** none');
+    expect(text).toContain('**majorSectors:** none\n- **sectors:** none\n');
     expect(text).toContain('**countryCodes:** none | **regionName:** Other');
   });
 
@@ -908,6 +932,173 @@ describe('worldbankSearchProjects', () => {
     expect(text).not.toContain('**abstract:** null');
     expect(text.match(/\*\*abstract:\*\*/g)).toHaveLength(1);
     expect(text).not.toMatch(/^- \*\*regionName:\*\*/m);
+  });
+
+  // ─── Objective and sub-sectors ────────────────────────────────────────────
+
+  it('carries the same objective on both surfaces, under its heading, and no line for a null one', async () => {
+    // Plain text with a line break from an upstream paragraph, a prose `<`, and Markdown-active characters.
+    const objective =
+      'Support the strategy through:\n(i) *green* growth for children < 5 years [phase 1]';
+    await stubService({
+      projects: [{ ...project, objective }, sparseProject],
+      total: 2,
+    });
+    const tool = await loadTool();
+    const result = await runToolContract(tool, { countries: 'BR' });
+
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({
+      projects: [{ objective }, { objective: null }],
+    });
+    const text = textOf(result);
+    expect(text).toContain(
+      '(P513080)\n- **objective:** Support the strategy through:\\\n(i) \\*green\\* growth for children < 5 years \\[phase 1\\]\n- **status:** Active',
+    );
+    expect(text).toContain('(P072339)\n- **status:** Dropped');
+    expect(text.match(/\*\*objective:\*\*/g)).toHaveLength(1);
+  });
+
+  it('carries the same sub-sectors on both surfaces, with null shares and an empty list', async () => {
+    const unsplit = {
+      ...project,
+      id: 'P514519',
+      majorSectors: ['Water, Sanitation and Waste Management', 'Social Protection'],
+      sectors: [
+        {
+          name: 'Public Administration - Water, Sanitation, and Solid Waste Management',
+          code: 'WWF',
+          majorSector: 'Water, Sanitation and Waste Management',
+          percent: null,
+        },
+        { name: 'Social Protection', code: 'SSA', majorSector: 'Social Protection', percent: null },
+      ],
+    };
+    const split = {
+      ...project,
+      id: 'P507029',
+      majorSectors: ['Transportation'],
+      sectors: [
+        { name: 'Urban Transport', code: 'TTC', majorSector: 'Transportation', percent: 53 },
+        {
+          name: 'Public Administration - Transportation',
+          code: 'TTF',
+          majorSector: 'Transportation',
+          percent: 0,
+        },
+      ],
+    };
+    await stubService({ projects: [unsplit, split, sparseProject], total: 3 });
+    const tool = await loadTool();
+    const result = await runToolContract(tool, {});
+
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({
+      projects: [{ sectors: unsplit.sectors }, { sectors: split.sectors }, { sectors: [] }],
+    });
+    const text = textOf(result);
+    // Names and major sectors carry commas, so items join with `; `.
+    expect(text).toContain(
+      '- **majorSectors:** Water, Sanitation and Waste Management; Social Protection\n- **sectors:** Public Administration - Water, Sanitation, and Solid Waste Management (WWF · Water, Sanitation and Waste Management · percent null); Social Protection (SSA · Social Protection · percent null)\n',
+    );
+    expect(text).toContain(
+      '- **sectors:** Urban Transport (TTC · Transportation · 53%); Public Administration - Transportation (TTF · Transportation · 0%)\n',
+    );
+    expect(text).toContain('- **majorSectors:** none\n- **sectors:** none\n');
+  });
+
+  it('escapes Markdown in sub-sector fields on content[] only', async () => {
+    const hostile = { name: 'A *b* [c]', code: 'X|Y', majorSector: '`m`', percent: 12.5 };
+    await stubService({ projects: [{ ...project, sectors: [hostile] }], total: 1 });
+    const tool = await loadTool();
+    const result = await runToolContract(tool, {});
+
+    expect(result.structuredContent).toMatchObject({ projects: [{ sectors: [hostile] }] });
+    expect(textOf(result)).toContain(
+      '- **sectors:** A \\*b\\* \\[c\\] (X\\|Y · \\`m\\` · 12.5%)\n',
+    );
+  });
+
+  // ─── Descriptions ─────────────────────────────────────────────────────────
+
+  /** Sub-sector names that return active operations through the sector filter, measured 2026-11-11. */
+  const SECTOR_NAMES_WITH_ACTIVE_OPERATIONS = new Set([
+    'Primary Education',
+    'Secondary Education',
+    'Tertiary Education',
+    'Public Administration - Education',
+    'Social Protection',
+    'FY17 - Social Protection',
+    'Health',
+  ]);
+
+  it('cites only sector names that return operations, and points at sectors[].name', async () => {
+    const tool = await loadTool();
+    const sectorInput = (tool.input.shape.sector as unknown as { description: string }).description;
+    const cited = [
+      ...[...tool.description.matchAll(/sector: (\[[^\]]*\])/g)].flatMap(
+        ([, list]) => JSON.parse(list as string) as string[],
+      ),
+      ...(/such as (.+?) or (.+?)(?: —|,|\.)/.exec(sectorInput)?.slice(1) ?? []),
+    ];
+
+    expect(cited.length).toBeGreaterThan(2);
+    for (const name of cited) expect(SECTOR_NAMES_WITH_ACTIVE_OPERATIONS).toContain(name);
+    expect(tool.description).toMatch(/sectors\[\]\.name/);
+    expect(sectorInput).toMatch(/sectors\[\]\.name/);
+    expect(sectorInput).toMatch(/at any share/);
+
+    await stubService({ projects: [], total: 0 });
+    const ctx = createMockContext({ errors: tool.errors });
+    await tool.handler(tool.input.parse({ sector: ['Invented Sector'] }), ctx);
+    const notice = getEnrichment(ctx).notice as string;
+    expect(notice).toMatch(/sectors\[\]\.name/);
+    expect(notice).toMatch(/not the majorSectors names/);
+  });
+
+  /**
+   * Regional codes with at least one active operation, from a sweep of all
+   * 28,238 projects (2026-11-11). 3A, the pre-split Africa code, has none.
+   */
+  const REGIONAL_CODES_WITH_ACTIVE_OPERATIONS = new Set(
+    '1M 1W 3E 3S 3T 3W 4E 5M 6C 6L 6O 6R 7B 7C 7E 8S'.split(' '),
+  );
+
+  it('presents no retired regional code or region as current in any text it shows the caller', async () => {
+    const tool = await loadTool();
+    const { z } = await import('@cyanheads/mcp-ts-core');
+    const malformed = await runToolContract(tool, { countries: 'B-' });
+    await stubService({ projects: [], total: 0, countryOnlyTotal: 0 });
+    const noSuchCode = await runToolContract(tool, { countries: 'QQ' });
+    /** Every description string in a JSON Schema, nested ones included. */
+    const descriptions = (node: unknown): string[] =>
+      typeof node !== 'object' || node === null
+        ? []
+        : Object.entries(node).flatMap(([key, value]) =>
+            key === 'description' && typeof value === 'string' ? [value] : descriptions(value),
+          );
+    const texts = [
+      tool.description,
+      ...descriptions(z.toJSONSchema(tool.input)),
+      ...descriptions(z.toJSONSchema(tool.output)),
+      ...(tool.errors ?? []).flatMap((entry) => [entry.when, entry.recovery]),
+      textOf(malformed),
+      textOf(noSuchCode),
+    ];
+
+    const sentences = texts.flatMap((text) => text.split(/(?<=[.;:])\s+/));
+    const citing = sentences.filter((sentence) => /\b\d[A-Z]\b/.test(sentence));
+    expect(citing.length).toBeGreaterThan(4);
+    for (const sentence of citing) {
+      if (/pre-split/.test(sentence)) continue;
+      for (const [code] of sentence.matchAll(/\b\d[A-Z]\b/g)) {
+        expect(REGIONAL_CODES_WITH_ACTIVE_OPERATIONS, sentence).toContain(code);
+      }
+    }
+    const describe = (field: 'countries' | 'region') =>
+      (tool.input.shape[field] as unknown as { description: string }).description;
+    expect(describe('countries')).toMatch(/3A is the pre-split Africa code/);
+    expect(describe('region')).toMatch(/Africa is the pre-split region/);
   });
 
   it('carries the commitment breakdown on both surfaces, a grant-only operation included', async () => {

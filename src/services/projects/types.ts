@@ -6,11 +6,25 @@
  * @module services/projects/types
  */
 
+/**
+ * One sub-sector a project lists under a major sector. Measured over all 57,987
+ * entries (2026-11-11): every entry carries all three fields, and the share is a
+ * numeric string (`"38.0"`, `"0"`). Eight current names are stored with a
+ * trailing space (`"Other - Industry, Trade, and Services "`), which the
+ * `sector_exact` filter matches only as stored.
+ */
+export interface RawSector {
+  sector_code?: string | null;
+  sector_name?: string | null;
+  sector_percent?: string | null;
+}
+
 /** One entry of a project's `major_sectors` array, nested a level deeper than it needs to be. */
 export interface RawMajorSector {
   major_sector?: {
     major_sector_code?: string | null;
     major_sector_name?: string | null;
+    sectors?: RawSector[] | null;
   } | null;
 }
 
@@ -22,7 +36,10 @@ export interface RawMajorSector {
  * present on every row; `boardapprovaldate` is absent on 2%, `major_sectors` on
  * 17%, `projectfinancialtype` on 36%, `closingdate` on 44%, and
  * `project_abstract` on 48%. `curr_total_commitment` and `grantamt` are absent
- * on 35.8% of 28,153 records (2026-09-25), always on the same rows.
+ * on 35.8% of 28,153 records (2026-09-25), always on the same rows. `pdo`, the
+ * development objective, comes back only when `fl` names it, and is absent on
+ * 42% of 28,238 records (2026-11-11) — on 6% of active operations; 163 values
+ * carry HTML tags or entities.
  *
  * `curr_total_commitment` is the project page's "Commitment Amount": IBRD plus
  * IDA (`curr_ibrd_commitment` + `curr_ida_commitment`, IDA grants included)
@@ -43,6 +60,7 @@ export interface RawProject {
   grantamt?: string | null;
   id?: string | null;
   major_sectors?: RawMajorSector[] | null;
+  pdo?: string | null;
   project_abstract?: string | null;
   project_name?: string | null;
   projectfinancialtype?: string[] | null;
@@ -63,11 +81,28 @@ export interface RawProjectsEnvelope {
   total?: string;
 }
 
+/** One sub-sector of a project, as the tool layer consumes it. */
+export interface ProjectSector {
+  /** Sector code, e.g. `EEP`. */
+  code: string;
+  /** The major sector name it is listed under, as `majorSectors` spells it. */
+  majorSector: string;
+  /** Sector name, trimmed, any `FY17 - ` prefix kept: the value the `sector` filter takes. */
+  name: string;
+  /**
+   * Share of the project's commitment, in percent. Null on every entry of a
+   * project whose shares are all zero, which publishes no split — 6,227 of
+   * 23,377 sectored projects (2026-11-11); a zero inside a published split stays 0.
+   */
+  percent: number | null;
+}
+
 /** One project as the tool layer consumes it. */
 export interface ProjectSummary {
   /**
-   * Project abstract. Null when `includeAbstract` was not requested and when the
-   * project publishes none, which the echoed `includeAbstract` filter separates.
+   * Project abstract as plain text. Null when `includeAbstract` was not
+   * requested and when the project publishes none, which the echoed
+   * `includeAbstract` filter separates.
    */
   abstract: string | null;
   /** Board approval date as `YYYY-MM-DD`, narrowed from the upstream timestamp. */
@@ -76,7 +111,7 @@ export interface ProjectSummary {
   /**
    * Two-character codes: the WDI ISO2 code for an economy — the four legacy
    * portfolio codes (`RY`, `ZR`, `GZ`, `TP`) translated back to it — or a World
-   * Bank regional code such as `3A` for a multi-country operation. Upstream
+   * Bank regional code such as `3W` for a multi-country operation. Upstream
    * publishes a list; every project in the portfolio carries exactly one entry.
    */
   countryCodes: string[];
@@ -97,7 +132,11 @@ export interface ProjectSummary {
   /** Major sector names, deduplicated, in the order upstream lists them. */
   majorSectors: string[];
   name: string;
+  /** Project development objective (`pdo`) as plain text, trimmed; null when none is published. */
+  objective: string | null;
   regionName: string;
+  /** Sub-sectors in upstream order, each under its major sector; empty when none are published. */
+  sectors: ProjectSector[];
   /** `Active`, `Closed`, `Dropped`, or `Pipeline`. */
   status: string;
   /**

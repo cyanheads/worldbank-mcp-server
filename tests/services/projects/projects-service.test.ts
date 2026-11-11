@@ -55,10 +55,37 @@ function rawProject(id: string, overrides: Record<string, unknown> = {}) {
     // sector that rolls up to it.
     projectfinancialtype: ['IBRD', 'Other', 'Other'],
     major_sectors: [
-      { major_sector: { major_sector_code: 'HHX', major_sector_name: 'Health' } },
-      { major_sector: { major_sector_code: 'HHX', major_sector_name: 'Health' } },
-      { major_sector: { major_sector_code: 'EEX', major_sector_name: 'Education' } },
+      {
+        major_sector: {
+          major_sector_code: 'HHX',
+          major_sector_name: 'Health',
+          sectors: [{ sector_name: 'Health', sector_code: 'HHG', sector_percent: '60.0' }],
+        },
+      },
+      {
+        major_sector: {
+          major_sector_code: 'HHX',
+          major_sector_name: 'Health',
+          sectors: [
+            {
+              sector_name: 'Public Administration - Health',
+              sector_code: 'HHF',
+              sector_percent: '20.0',
+            },
+          ],
+        },
+      },
+      {
+        major_sector: {
+          major_sector_code: 'EEX',
+          major_sector_name: 'Education',
+          sectors: [
+            { sector_name: 'Primary Education', sector_code: 'EEP', sector_percent: '20.0' },
+          ],
+        },
+      },
     ],
+    pdo: 'To improve the quality of primary health care and schooling.',
     project_abstract: 'Rehabilitation of the dam and the associated irrigation perimeter.',
     ...overrides,
   };
@@ -163,8 +190,8 @@ describe('ProjectsService', () => {
     );
     expect(requestedUrl().searchParams.get('sector_exact')).toBe(
       sectors.length === 3
-        ? 'Social Protection^FY17 - Social Protection^Primary Education^FY17 - Primary Education'
-        : 'Social Protection^FY17 - Social Protection',
+        ? 'Social Protection^Social Protection ^FY17 - Social Protection^Primary Education^Primary Education ^FY17 - Primary Education'
+        : 'Social Protection^Social Protection ^FY17 - Social Protection',
     );
     expect(requestedUrl().searchParams.get('regionname_exact')).toBe('South Asia');
     expect(requestedUrl().searchParams.get('status_exact')).toBe('Active');
@@ -191,7 +218,7 @@ describe('ProjectsService', () => {
       createMockContext(),
     );
     expect(requestedUrl().searchParams.get('sector_exact')).toBe(
-      'Invented Sector^FY17 - Invented Sector',
+      'Invented Sector^Invented Sector ^FY17 - Invented Sector',
     );
     expect(result).toMatchObject({ projects: [], total: 0, pages: 1 });
     expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(1);
@@ -210,10 +237,12 @@ describe('ProjectsService', () => {
   it('keeps sector filtering on a page past the end', async () => {
     mockBody(envelope([], 3));
     const result = await service.searchProjects(
-      { ...baseOpts, sectors: ['Education'], perPage: 2, page: 3 },
+      { ...baseOpts, sectors: ['Primary Education'], perPage: 2, page: 3 },
       createMockContext(),
     );
-    expect(requestedUrl().searchParams.get('sector_exact')).toBe('Education^FY17 - Education');
+    expect(requestedUrl().searchParams.get('sector_exact')).toBe(
+      'Primary Education^Primary Education ^FY17 - Primary Education',
+    );
     expect(requestedUrl().searchParams.get('os')).toBe('4');
     expect(result).toMatchObject({ projects: [], total: 3, pages: 2, page: 3 });
   });
@@ -238,6 +267,7 @@ describe('ProjectsService', () => {
     expect(result.projects[0]).toEqual({
       id: 'P100',
       name: 'Project P100',
+      objective: 'To improve the quality of primary health care and schooling.',
       status: 'Active',
       countryCodes: ['BR'],
       countryName: 'Federative Republic of Brazil',
@@ -251,9 +281,36 @@ describe('ProjectsService', () => {
       grantAmount: 0,
       financialTypes: ['IBRD', 'Other'],
       majorSectors: ['Health', 'Education'],
+      // Flattened in upstream order, each beside the major sector it sits under.
+      sectors: [
+        { name: 'Health', code: 'HHG', majorSector: 'Health', percent: 60 },
+        { name: 'Public Administration - Health', code: 'HHF', majorSector: 'Health', percent: 20 },
+        { name: 'Primary Education', code: 'EEP', majorSector: 'Education', percent: 20 },
+      ],
       abstract: 'Rehabilitation of the dam and the associated irrigation perimeter.',
       url: 'https://projects.worldbank.org/en/projects-operations/project-detail/P100',
     });
+    // The row keys run in the order both surfaces present them.
+    expect(Object.keys(result.projects[0] ?? {})).toEqual([
+      'id',
+      'name',
+      'objective',
+      'status',
+      'countryCodes',
+      'countryName',
+      'regionName',
+      'boardApprovalDate',
+      'closingDate',
+      'totalCommitment',
+      'ibrdCommitment',
+      'idaCommitment',
+      'grantAmount',
+      'financialTypes',
+      'majorSectors',
+      'sectors',
+      'abstract',
+      'url',
+    ]);
   });
 
   it('reports an absent amount as null rather than zero, and tolerates a sparse row', async () => {
@@ -276,10 +333,12 @@ describe('ProjectsService', () => {
 
     expect(result.projects[0]).toMatchObject({
       id: 'P900',
+      objective: null,
       closingDate: null,
       totalCommitment: null,
       financialTypes: [],
       majorSectors: [],
+      sectors: [],
       abstract: null,
     });
   });
@@ -441,6 +500,204 @@ describe('ProjectsService', () => {
       createMockContext(),
     );
     expect(included.projects[0]?.abstract).toContain('Rehabilitation');
+  });
+
+  // ─── Objective, abstract, and sub-sectors ─────────────────────────────────
+
+  it('requests the development objective, which upstream returns only when fl lists it', async () => {
+    mockBody(envelope([rawProject('P100')]));
+    await service.searchProjects(baseOpts, createMockContext());
+    expect(requestedUrl().searchParams.get('fl')?.split(',')).toEqual(
+      expect.arrayContaining(['pdo', 'major_sectors']),
+    );
+  });
+
+  /**
+   * Objective markup as upstream stores it (2026-11-11): P150475's paragraphs,
+   * P145251's list closers with no openers, P065200's SGML-style `<NC>…</>`,
+   * P149189's entities and stray closer, P143032's styled span, and P096482's
+   * prose `<`.
+   */
+  it.each([
+    [
+      '<p>Support the green growth strategy through:</p><p>(i) establishing measures</p>',
+      'Support the green growth strategy through:\n(i) establishing measures',
+    ],
+    [
+      ' \t improve trade</li>\t increase agricultural productivity</li></ol>',
+      'improve trade\nincrease agricultural productivity',
+    ],
+    [
+      '<NC>The objective is to conserve biodiversity.</>',
+      'The objective is to conserve biodiversity.',
+    ],
+    [
+      ' The Project&#39;s objective is TERRA-MA&sup2; monitoring</em>.&nbsp; ',
+      "The Project's objective is TERRA-MA² monitoring.",
+    ],
+    ["<span style='font-size:10.5pt'>GoHP&rsquo;s plan</span>", 'GoHP’s plan'],
+    ['60% of malaria of < 5 years old cases', '60% of malaria of < 5 years old cases'],
+  ])('reports the objective %j as trimmed plain text', async (pdo, objective) => {
+    mockBody(envelope([rawProject('P100', { pdo })]));
+    const result = await service.searchProjects(baseOpts, createMockContext());
+    expect(result.projects[0]?.objective).toBe(objective);
+  });
+
+  it.each([[undefined], [null], [''], ['  \t '], ['<p>&nbsp;</p>']])(
+    'reports the objective %j, which publishes no text, as null',
+    async (pdo) => {
+      mockBody(envelope([rawProject('P100', { pdo })]));
+      const result = await service.searchProjects(baseOpts, createMockContext());
+      expect(result.projects[0]?.objective).toBeNull();
+    },
+  );
+
+  it('reduces the abstract by the same rule, so a <BR> becomes a line break', async () => {
+    // P144893, cut to the break: upstream joins the words across it.
+    mockBody(
+      envelope([
+        rawProject('P144893', {
+          project_abstract: ' eHealth - Information<BR>Systems Development, Public Health. ',
+        }),
+      ]),
+    );
+    const result = await service.searchProjects(
+      { ...baseOpts, includeAbstract: true },
+      createMockContext(),
+    );
+    expect(result.projects[0]?.abstract).toBe(
+      'eHealth - Information\nSystems Development, Public Health.',
+    );
+  });
+
+  it.each([[''], ['  \t '], ['<BR>'], ['<p>&nbsp;</p>']])(
+    'reports the abstract %j, which publishes no text, as null when abstracts are requested',
+    async (project_abstract) => {
+      mockBody(envelope([rawProject('P100', { project_abstract })]));
+      const result = await service.searchProjects(
+        { ...baseOpts, includeAbstract: true },
+        createMockContext(),
+      );
+      expect(result.projects[0]?.abstract).toBeNull();
+    },
+  );
+
+  it('reports the shares of a project that publishes no split as null, a real zero as 0', async () => {
+    const sector = (sector_name: string, sector_code: string, sector_percent: string) => ({
+      sector_name,
+      sector_code,
+      sector_percent,
+    });
+    mockBody(
+      envelope([
+        // P507029 (2026-11-11): a published 0.0 inside a 100% split.
+        rawProject('P507029', {
+          major_sectors: [
+            {
+              major_sector: {
+                major_sector_code: 'TTX',
+                major_sector_name: 'Transportation',
+                sectors: [
+                  sector('Urban Transport', 'TTC', '53.0'),
+                  sector('Public Administration - Transportation', 'TTF', '0.0'),
+                  sector('Other - Transportation', 'TTZ', '47.0'),
+                ],
+              },
+            },
+          ],
+        }),
+        // Every share zero across two major sectors: no split is published.
+        rawProject('P200', {
+          major_sectors: [
+            {
+              major_sector: {
+                major_sector_code: 'HHX',
+                major_sector_name: 'Health',
+                sectors: [
+                  sector('Health', 'HHG', '0'),
+                  sector('Public Administration - Health', 'HHF', '0'),
+                ],
+              },
+            },
+            {
+              major_sector: {
+                major_sector_code: 'SSX',
+                major_sector_name: 'Social Protection',
+                sectors: [sector('Social Protection', 'SSA', '0.0')],
+              },
+            },
+          ],
+        }),
+        // A major sector that lists no sub-sectors, and one with no major sector at all.
+        rawProject('P300', {
+          major_sectors: [
+            { major_sector: { major_sector_code: 'EEX', major_sector_name: 'Education' } },
+            { major_sector: null },
+          ],
+        }),
+      ]),
+    );
+    const result = await service.searchProjects(baseOpts, createMockContext());
+
+    expect(result.projects[0]?.sectors.map((entry) => entry.percent)).toEqual([53, 0, 47]);
+    expect(result.projects[1]?.sectors).toEqual([
+      { name: 'Health', code: 'HHG', majorSector: 'Health', percent: null },
+      { name: 'Public Administration - Health', code: 'HHF', majorSector: 'Health', percent: null },
+      { name: 'Social Protection', code: 'SSA', majorSector: 'Social Protection', percent: null },
+    ]);
+    expect(result.projects[2]).toMatchObject({ majorSectors: ['Education'], sectors: [] });
+  });
+
+  /**
+   * The round trip #81 asks for, over a live capture: every sub-sector name a
+   * row reports, passed back to `sector`, has to reach upstream in the exact
+   * spelling the index stores — trailing space included, since `sector_exact`
+   * matches whitespace exactly and the trimmed name matches nothing.
+   */
+  it('sends back every stored spelling of the sub-sector names a captured page reports', async () => {
+    mockBody(JSON.stringify(socialUnionCapture));
+    const page = await service.searchProjects(
+      { ...baseOpts, sectors: ['Social Protection'], perPage: 2 },
+      createMockContext(),
+    );
+    const stored = Object.values(socialUnionCapture.projects).flatMap((project) =>
+      project.major_sectors.flatMap((entry) =>
+        entry.major_sector.sectors.map((sector) => sector.sector_name),
+      ),
+    );
+    const reported = page.projects.flatMap((project) =>
+      project.sectors.map((sector) => sector.name),
+    );
+    expect(stored).toContain(
+      'Public Administration - Water, Sanitation, and Solid Waste Management ',
+    );
+    expect(reported).toContain(
+      'Public Administration - Water, Sanitation, and Solid Waste Management',
+    );
+    expect(reported).toHaveLength(stored.length);
+
+    for (const [index, name] of reported.entries()) {
+      mockBody(envelope([]));
+      await service.searchProjects({ ...baseOpts, sectors: [name] }, createMockContext());
+      const sent = requestedUrl(fetchWithTimeoutMock.mock.calls.length - 1)
+        .searchParams.get('sector_exact')
+        ?.split('^');
+      expect(sent, `sector_exact for ${JSON.stringify(name)}`).toContain(stored[index]);
+    }
+  });
+
+  it.each([
+    'Other - Industry, Trade, and Services',
+    'Other - Industry, Trade, and Services ',
+    'FY17 - Other - Industry, Trade, and Services',
+  ])('reaches a name stored with a trailing space from %j', async (name) => {
+    mockBody(envelope([]));
+    await service.searchProjects({ ...baseOpts, sectors: [name] }, createMockContext());
+    expect(requestedUrl().searchParams.get('sector_exact')?.split('^')).toEqual([
+      'Other - Industry, Trade, and Services',
+      'Other - Industry, Trade, and Services ',
+      'FY17 - Other - Industry, Trade, and Services',
+    ]);
   });
 
   // ─── Query construction ───────────────────────────────────────────────────

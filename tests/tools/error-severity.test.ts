@@ -29,6 +29,7 @@ const cases: Array<[AnyToolDefinition, string[], string[]]> = [
       'source_not_found',
       'source_not_queryable',
       'unknown_dimension_value',
+      'ambiguous_dimension_value',
       'dimension_not_applicable',
       'source_scope_too_large',
       'country_not_found',

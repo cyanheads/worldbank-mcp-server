@@ -248,6 +248,67 @@ describe('worldbank_search_projects country resolution', () => {
     },
   );
 
+  it('reports a wire row’s objective and sub-sectors on both surfaces and takes a reported name back', async () => {
+    // P514519's sectors as upstream stored them (2026-11-11): one name with a trailing space, no split.
+    const row = {
+      ...project('P514519', 'IN'),
+      pdo: ' <p>To improve water supply&rsquo;s reliability.</p> ',
+      major_sectors: [
+        {
+          major_sector: {
+            major_sector_code: 'WWX',
+            major_sector_name: 'Water, Sanitation and Waste Management',
+            sectors: [
+              {
+                sector_name:
+                  'Public Administration - Water, Sanitation, and Solid Waste Management ',
+                sector_code: 'WWF',
+                sector_percent: '0',
+              },
+              { sector_name: 'Water Supply', sector_code: 'WWC', sector_percent: '0.0' },
+            ],
+          },
+        },
+      ],
+    };
+    serve([row]);
+    const first = await runToolContract(worldbankSearchProjects, { countries: 'IN' });
+
+    expect(requests().projects[0]?.get('fl')?.split(',')).toContain('pdo');
+    const sectors = [
+      {
+        name: 'Public Administration - Water, Sanitation, and Solid Waste Management',
+        code: 'WWF',
+        majorSector: 'Water, Sanitation and Waste Management',
+        percent: null,
+      },
+      {
+        name: 'Water Supply',
+        code: 'WWC',
+        majorSector: 'Water, Sanitation and Waste Management',
+        percent: null,
+      },
+    ];
+    expect(first.structuredContent).toMatchObject({
+      projects: [{ objective: 'To improve water supply’s reliability.', sectors }],
+    });
+    const text = first.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+    expect(text).toContain(
+      '(P514519)\n- **objective:** To improve water supply’s reliability.\n- **status:** Active',
+    );
+    expect(text).toContain(
+      '- **sectors:** Public Administration - Water, Sanitation, and Solid Waste Management (WWF · Water, Sanitation and Waste Management · percent null); Water Supply (WWC · Water, Sanitation and Waste Management · percent null)\n',
+    );
+
+    const reported = (first.structuredContent as { projects: Array<{ sectors: typeof sectors }> })
+      .projects[0]?.sectors[0]?.name as string;
+    const second = await runToolContract(worldbankSearchProjects, { sector: [reported] });
+    expect(second.isError).toBeFalsy();
+    expect(requests().projects[1]?.get('sector_exact')?.split('^')).toContain(
+      'Public Administration - Water, Sanitation, and Solid Waste Management ',
+    );
+  });
+
   it('no longer tells the caller to convert ISO3 to ISO2 when a code matches nothing', async () => {
     serve([]);
     const result = await runToolContract(worldbankSearchProjects, { countries: 'QQ' });

@@ -9,9 +9,9 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
-import { getServerConfig } from '@/config/server-config.js';
 import { pagePastEndNotice } from '@/mcp-server/tools/page-past-end-notice.js';
 import { pageSizeReducedNotice } from '@/mcp-server/tools/page-size-reduced-notice.js';
+import { perPageInput, resolvePerPage } from '@/mcp-server/tools/per-page.js';
 import { getPipService } from '@/services/pip/pip-service.js';
 import { MAX_ESTIMATES_PER_PAGE } from '@/services/response-budget.js';
 import { COUNTRY_LIST_CONTENT, splitCountryCodes } from '@/services/worldbank/identifiers.js';
@@ -43,7 +43,7 @@ function listedValuesHint(parameters: readonly string[], listed: readonly string
 export const worldbankGetPoverty = tool('worldbank_get_poverty', {
   title: 'Get World Bank Poverty and Inequality Estimates',
   description:
-    'Query poverty and inequality estimates from the World Bank Poverty and Inequality Platform (PIP) for economies and for PIP\'s own aggregates — World, World Bank regions, income groups, lending groups, and fragility groups. Returns the poverty headcount ratio, poverty gap, and poverty severity at any poverty line, plus mean and median welfare and population. Use it for inequality and distribution questions too — survey-based economy rows carry the Gini coefficient, mean log deviation, polarization, and the ten decile income/consumption shares, because PIP returns poverty and inequality in the same row. PIP is a separate dataset from the WDI series worldbank_get_data reads: it measures welfare in PPP dollars per person per day, at a PPP vintage ppp_version selects, and computes its aggregates at any poverty line, where worldbank_get_data carries only the published lines. Every row reports how it was produced. Nullable estimateType separately identifies actual, nowcast, or projection estimates, while distributionType preserves the source distribution classification (micro, group, or imputed); missing upstream classifications remain null. On an economy, estimationType "survey" rows carry the full inequality block; "interpolation", "extrapolation", and "CMD estimation" rows are gap-filled estimates for years no survey covers, and their gini, mld, polarization, and decileShares are null — a documented gap in the source data, not an error. Aggregate rows (isAggregate true) are "actual", "nowcast", or "projection", add popInPoverty, and carry no distributional block.',
+    'Query poverty and inequality estimates from the World Bank Poverty and Inequality Platform (PIP) for economies and for PIP\'s own aggregates — World, World Bank regions, income groups, lending groups, and fragility groups. Returns the poverty headcount ratio, poverty gap, and poverty severity at any poverty line, plus mean and median welfare and population. Use it for inequality and distribution questions too — survey-based economy rows carry the Gini coefficient, mean log deviation, polarization, and the ten decile income/consumption shares, because PIP returns poverty and inequality in the same row. PIP is a separate dataset from the WDI series worldbank_get_data reads: it measures welfare in PPP dollars per person per day, at a PPP vintage ppp_version selects, and computes its aggregates at any poverty line, where worldbank_get_data carries only the published lines. Every row reports how it was produced. Nullable estimateType separately identifies actual, nowcast, or projection estimates, while distributionType preserves the source distribution classification (micro, group, or imputed); missing upstream classifications remain null. On an economy, estimationType "survey" rows carry the full inequality block; "interpolation", "extrapolation", and "CMD estimation" rows are gap-filled estimates where no survey covers the year, reporting level, and welfare type, and their gini, mld, polarization, and decileShares are null — a documented gap in the source data, not an error. Aggregate rows (isAggregate true) are "actual", "nowcast", or "projection", add popInPoverty, and carry no distributional block.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   inputAliases: { limit: 'per_page' },
   input: z.object({
@@ -108,7 +108,7 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
       ])
       .optional()
       .describe(
-        'Restrict results to one welfare measure. Surveys measure either income or consumption and the two are not directly comparable, so a cross-country comparison is safer pinned to one. Omitted returns whichever each economy publishes, and both where an economy publishes both — thirty-five do, and those return two rows per year.',
+        "Restrict results to one welfare measure. Surveys measure either income or consumption and the two are not directly comparable, so a cross-country comparison is safer pinned to one. Omitted returns whichever measure each economy publishes, with a row for each measure in a year surveyed both ways; PIP's gap-filled estimates use one measure per year.",
       ),
     reporting_level: z
       .union([
@@ -119,7 +119,7 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
       ])
       .optional()
       .describe(
-        'Restrict results to one reporting level. Most economies publish a national figure only; ten publish a split and return an extra row per year for it, China with all three levels and the rest pairing national with either urban or rural. Every row states its own reportingLevel.',
+        'Restrict results to one reporting level. Most economies publish a national figure only. China alone publishes national, urban, and rural figures for the same year. Several others publish urban or rural figures in some years and national figures in others, and with fill_gaps true a year surveyed only in urban or rural areas also returns PIP\'s national estimate where PIP publishes one. Argentina publishes urban figures only, so "national" leaves it out. Every row states its own reportingLevel.',
       ),
     ppp_version: z
       .union([
@@ -137,17 +137,10 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
       .boolean()
       .default(true)
       .describe(
-        'When true (the default), any year the surveys do not cover falls back to PIP\'s own estimate for it instead of being left out — so a single-year query still answers, and a full-history query returns a row per year rather than only the survey years. Those fallback rows carry no inequality data. Set false to return survey-derived rows only, accepting an empty result for years no survey covers and for economies PIP publishes only as model estimates. It also decides what "MRV" resolves to, and has no effect on aggregate rows.',
+        'When true (the default), PIP\'s own estimate fills in whatever the surveys do not cover instead of leaving it out: a year with no survey, so a single-year query still answers and a full-history query returns a row per year rather than only the survey years, and a reporting level or welfare type a surveyed year lacks, such as a national estimate beside an urban-only survey. Those estimated rows carry no inequality data. Set false to return survey-derived rows only, accepting an empty result for years no survey covers and for economies PIP publishes only as model estimates. It also decides what "MRV" resolves to, and has no effect on aggregate rows.',
       ),
     page: z.number().int().min(1).default(1).describe('Pagination page number (1-based).'),
-    per_page: z
-      .number()
-      .int()
-      .min(1)
-      .optional()
-      .describe(
-        'Results per page (default: server default). Positive integers above 1000 are served at that maximum with the requested and served sizes echoed and a notice. totalPages uses the served size.',
-      ),
+    per_page: perPageInput(MAX_ESTIMATES_PER_PAGE),
   }),
   output: z.object({
     estimates: z
@@ -376,7 +369,7 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
       .string()
       .optional()
       .describe(
-        'Context for an empty result set, for a page past the end of the results, for a page size reduced to the page cap, for a result carrying gap-filled or aggregate rows with no inequality data, and for economies fill_gaps false left out.',
+        'Context for an empty result set, for a page past the end of the results, for a page size reduced to the page cap, for a result carrying gap-filled or aggregate rows with no inequality data, for survey rows returned without the gap-filled estimates PIP failed to serve, and for economies fill_gaps false left out.',
       ),
   },
 
@@ -472,7 +465,6 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
     const welfareType = input.welfare_type || undefined;
     const reportingLevel = input.reporting_level || undefined;
     const pppVersion = input.ppp_version || undefined;
-    const perPage = input.per_page ?? getServerConfig().defaultPerPage;
 
     ctx.log.info('Fetching PIP poverty estimates', {
       countries: codes,
@@ -545,6 +537,10 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
       return entity.id;
     });
 
+    const pageSize = resolvePerPage(
+      { tool: 'worldbank_get_poverty', cap: MAX_ESTIMATES_PER_PAGE, perPage: input.per_page },
+      ctx,
+    );
     let result: Awaited<ReturnType<ReturnType<typeof getPipService>['getPoverty']>>;
     try {
       result = await getPipService().getPoverty(
@@ -557,7 +553,7 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
           ...(pppVersion !== undefined && { pppVersion }),
           fillGaps: input.fill_gaps,
           page: input.page,
-          perPage: Math.min(perPage, MAX_ESTIMATES_PER_PAGE),
+          perPage: pageSize.served,
         },
         ctx,
       );
@@ -630,7 +626,7 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
         fillGaps: input.fill_gaps,
         page: input.page,
         perPage: result.perPage,
-        ...(result.perPage < perPage && { requestedPerPage: perPage }),
+        ...(result.perPage < pageSize.requested && { requestedPerPage: pageSize.requested }),
       },
     });
     ctx.enrich({ totalCount: result.total, currentPage: result.page, totalPages: result.pages });
@@ -656,13 +652,18 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
       }
       if (result.rows.length > 0 && result.gapFilled) {
         notices.push(
-          'Some rows are gap-filled: no survey covers those years, so PIP estimated the poverty measures and published no distributional data alongside them. Their gini, mld, polarization, and decileShares are null by design. Read estimationType per row to tell a survey-derived row from an estimated one — the two come from different upstream series, so their poverty figures are close but not on the same footing.',
+          'Some rows are gap-filled: no survey covers their year, reporting level, and welfare type, so PIP estimated the poverty measures and published no distributional data alongside them. Their gini, mld, polarization, and decileShares are null by design. Read estimationType per row to tell a survey-derived row from an estimated one — the two come from different upstream series, so their poverty figures are close but not on the same footing.',
         );
         if (year?.toLowerCase() === 'mrv') {
           notices.push(
             'year "MRV" resolved each economy to PIP\'s latest estimate year; set fill_gaps to false for each economy\'s latest survey year, which carries the inequality block.',
           );
         }
+      }
+      if (result.gapFillUnavailable) {
+        notices.push(
+          'PIP did not return its gap-filled estimates for the surveyed economies, so their rows come from surveys alone. An estimate the surveys do not cover, such as a national figure for a year surveyed only in urban areas, may be missing; retry the same request to include it.',
+        );
       }
       if (result.rows.some((row) => row.isAggregate)) {
         notices.push(
@@ -671,7 +672,7 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
       }
     }
     const reduced = pageSizeReducedNotice({
-      requested: perPage,
+      requested: pageSize.requested,
       served: result.perPage,
       page: result.page,
       pages: result.pages,

@@ -66,6 +66,7 @@ const projects = {
     {
       id: raw,
       name: raw,
+      objective: raw,
       status: raw,
       countryName: raw,
       countryCodes: [raw],
@@ -78,6 +79,7 @@ const projects = {
       grantAmount: null,
       financialTypes: [raw],
       majorSectors: [raw],
+      sectors: [{ name: raw, code: raw, majorSector: raw, percent: null }],
       url: raw,
       abstract: raw,
     },
@@ -88,7 +90,7 @@ it.each([
   ['data', () => worldbankGetData.format!(data), 7],
   ['countries', () => worldbankListCountries.format!(country), 3],
   ['poverty', () => worldbankGetPoverty.format!(poverty), 11],
-  ['projects', () => worldbankSearchProjects.format!(projects), 13],
+  ['projects', () => worldbankSearchProjects.format!(projects), 17],
 ] as const)('preserves each hostile %s field at its rendering boundary', (_name, render, count) => {
   const before = JSON.stringify([data, country, poverty, projects]);
   const text = render()

@@ -15,6 +15,7 @@ vi.mock('@/config/server-config.js', () => ({
   getServerConfig: vi.fn().mockReturnValue({
     apiBaseUrl: 'https://api.worldbank.org/v2',
     defaultPerPage: 50,
+    clampLimits: true,
     catalogCacheTtlMs: 60_000,
   }),
 }));

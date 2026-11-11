@@ -3,9 +3,10 @@
  * only the network stubbed: how each requested code is resolved and routed —
  * ISO2 codes through the country index, aggregate codes to PIP's group
  * aggregates, model-estimate-only economies to the all-economy response — how
- * `MRV` resolves, and how rows from several upstream requests merge into one
- * paginated list. The fake answers each upstream request from fixed fixtures and
- * never builds rows out of the request it was sent, and any request it does not
+ * `MRV` resolves, how rows from several upstream requests merge into one
+ * paginated list, and what a surveyed year returns when its gap-filled request
+ * fails. The fake answers each upstream request from fixed fixtures and never
+ * builds rows out of the request it was sent, and any request it does not
  * recognize fails the test.
  * @module tests/tools/worldbank-get-poverty-routing.test
  */
@@ -76,7 +77,7 @@ const REGIONS = [
 ].map(([region_code, region, grouping_type]) => ({ region_code, region, grouping_type }));
 
 /** Surveyed economies in these fixtures — the ones `/pip` accepts by code. */
-const SURVEYED = ['CHN', 'IND', 'KEN', 'NGA', 'PHL', 'SSD', 'USA'];
+const SURVEYED = ['BOL', 'CHN', 'IND', 'KEN', 'NGA', 'PHL', 'SSD', 'USA'];
 
 /** Economies PIP publishes only as model estimates: in `country=all`, never accepted by code. */
 const MODEL_ONLY = ['AFG', 'GUM'];
@@ -181,6 +182,16 @@ function estimateRow(countryCode: string, reportingYear: number, overrides = {})
     estimation_type: 'extrapolation',
     ...overrides,
   };
+}
+
+/**
+ * A surveyed year as each pass answers it: the survey row, or its gap-filled
+ * twin at the same grain when `params` asks for gap-filling.
+ */
+function surveyedYear(params: URLSearchParams, countryCode: string, reportingYear: number) {
+  return params.get('fill_gaps') === 'false'
+    ? surveyRow(countryCode, reportingYear)
+    : estimateRow(countryCode, reportingYear);
 }
 
 /** A `/pip-grp` row, as PIP publishes an aggregate. */
@@ -341,23 +352,79 @@ describe('worldbank_get_poverty routing', () => {
     vi.unstubAllGlobals();
   });
 
-  // ─── Surveyed economies (the fast path) ───────────────────────────────────
+  // ─── Surveyed economies, one year ─────────────────────────────────────────
 
-  it('answers a surveyed economy for one year from one /pip request and nothing else', async () => {
+  it('answers a surveyed year with its survey row in place of the gap-filled twin, and no gap-filled notice', async () => {
+    // Release 20260922, PPP 2021: USA 2022 is 0.014 in the survey series, 0.0132 gap-filled.
     serve((params) =>
-      params.get('country') === 'NGA' && params.get('fill_gaps') === 'false'
-        ? [surveyRow('NGA', 2018)]
+      params.get('country') === 'USA' && params.get('year') === '2022'
+        ? params.get('fill_gaps') === 'false'
+          ? [surveyRow('USA', 2022, { welfare_type: 'income', headcount: 0.014, gini: 0.417 })]
+          : [
+              estimateRow('USA', 2022, {
+                welfare_type: 'income',
+                headcount: 0.0132,
+                estimation_type: 'survey',
+              }),
+            ]
         : undefined,
     );
-    const { structured, text } = await call({ countries: 'NGA', year: '2018' });
+    const { structured, text } = await call({ countries: 'USA', year: '2022' });
 
-    expect(summary(structured)).toEqual([['NGA', 2018, 'survey']]);
-    expect(pipRequests()).toHaveLength(1);
+    expect(structured.estimates).toEqual([
+      expect.objectContaining({ headcount: 0.014, gini: 0.417, estimationType: 'survey' }),
+    ]);
+    expect(pipRequests().map((url) => url.searchParams.get('fill_gaps'))).toEqual([
+      'false',
+      'true',
+    ]);
     expect(groupRequests()).toHaveLength(0);
     expect(requested().some((url) => url.searchParams.get('country') === 'all')).toBe(false);
     expect(requestsTo('/v2/country')).toHaveLength(0);
-    expect(structured.appliedFilters.countries).toBe('NGA');
-    expect(text).toContain('Economy NGA (NGA) — 2018, national');
+    expect(structured.appliedFilters.countries).toBe('USA');
+    expect(structured.notice).toBeUndefined();
+    expect(text).toContain('Economy USA (USA) — 2022, national');
+    expect(text).toContain('**headcount:** 0.014 |');
+    expect(text).not.toContain('0.0132');
+    expect(text).not.toMatch(/gap-filled/);
+  });
+
+  it("returns a surveyed year's national estimate beside its urban-only survey row, on both surfaces", async () => {
+    // Release 20260922, PPP 2021: BOL's 1990 survey covers urban areas only.
+    serve((params) => {
+      if (params.get('country') !== 'BOL' || params.get('year') !== '1990') return;
+      return params.get('fill_gaps') === 'false'
+        ? [
+            surveyRow('BOL', 1990, {
+              reporting_level: 'urban',
+              welfare_type: 'income',
+              headcount: 0.0582,
+              gini: 0.4204,
+            }),
+          ]
+        : [estimateRow('BOL', 1990, { welfare_type: 'income', headcount: 0.2204 })];
+    });
+    const { structured, text } = await call({ countries: 'BOL', year: '1990' });
+
+    expect(
+      structured.estimates.map((row) => [
+        row.reportingLevel,
+        row.welfareType,
+        row.headcount,
+        row.estimationType,
+        row.gini,
+      ]),
+    ).toEqual([
+      ['national', 'income', 0.2204, 'extrapolation', null],
+      ['urban', 'income', 0.0582, 'survey', 0.4204],
+    ]);
+    expect(structured.totalCount).toBe(2);
+    expect(structured.notice).toMatch(/Some rows are gap-filled/);
+    expect(text).toContain('Economy BOL (BOL) — 1990, national');
+    expect(text).toContain('Economy BOL (BOL) — 1990, urban');
+    expect(text).toContain('**headcount:** 0.2204 |');
+    expect(text).toContain('**gini:** 0.4204 |');
+    expect(text).toContain('Some rows are gap-filled');
   });
 
   it('asks no reference table again once the regions table is cached', async () => {
@@ -366,8 +433,171 @@ describe('worldbank_get_poverty routing', () => {
     const before = requested().length;
     await call({ countries: 'NGA', year: '2018' });
 
+    // The survey request and the gap-filled one beside it, and nothing else.
     const second = requested().slice(before);
-    expect(second.map((url) => url.pathname)).toEqual(['/pip/v1/pip']);
+    expect(second.map((url) => url.pathname)).toEqual(['/pip/v1/pip', '/pip/v1/pip']);
+  });
+
+  // ─── The gap-filled pass failing ──────────────────────────────────────────
+
+  /**
+   * Hold every gap-filled `/pip` request open until its signal aborts — the
+   * per-attempt timeout, the service abandoning it, or the caller — and reject
+   * it then with the abort reason, as `fetch` does. `started` resolves when the
+   * first is in flight.
+   */
+  function holdGapFilled() {
+    const serveRest = fetchMock.getMockImplementation() as typeof fetch;
+    const started = Promise.withResolvers<void>();
+    fetchMock.mockImplementation((input, init) => {
+      const url = new URL(String(input instanceof Request ? input.url : input));
+      if (url.pathname !== '/pip/v1/pip' || url.searchParams.get('fill_gaps') !== 'true') {
+        return serveRest(input, init);
+      }
+      started.resolve();
+      return new Promise<Response>((_, reject) => {
+        const signal = init?.signal;
+        signal?.addEventListener('abort', () => reject(signal?.reason), { once: true });
+      });
+    });
+    return { started: started.promise };
+  }
+
+  /** Run `pending` to completion under fake timers, stepping past retry backoffs and timeouts. */
+  async function settle<T>(pending: () => Promise<T>): Promise<T> {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    try {
+      let settled = false;
+      const run = pending().finally(() => {
+        settled = true;
+      });
+      while (!settled) await vi.advanceTimersByTimeAsync(500);
+      return await run;
+    } finally {
+      vi.useRealTimers();
+    }
+  }
+
+  /** KEN's 2020 survey row, and nothing else, from the survey pass. */
+  const kenSurvey = (params: URLSearchParams) =>
+    params.get('fill_gaps') === 'false' && params.get('country') === 'KEN'
+      ? [surveyRow('KEN', 2020)]
+      : undefined;
+
+  const UNAVAILABLE_NOTICE =
+    /PIP did not return its gap-filled estimates for the surveyed economies, so their rows come from surveys alone\./;
+
+  it.each([
+    [
+      'an HTTP 503',
+      () =>
+        serve((params) =>
+          params.get('fill_gaps') === 'true'
+            ? new Response('{"error":["Service Unavailable"]}', { status: 503 })
+            : kenSurvey(params),
+        ),
+      // The first attempt and its one retry, both failing.
+      2,
+    ],
+    [
+      'no answer',
+      () => {
+        serve(kenSurvey);
+        holdGapFilled();
+      },
+      // Abandoned 10 s after the survey rows, inside its first attempt.
+      1,
+    ],
+  ])(
+    'answers a fully surveyed year from its survey rows, with a notice, when the gap-filled request meets %s',
+    async (_failure, arrange, attempts) => {
+      arrange();
+      const { structured, text } = await settle(() => call({ countries: 'KEN', year: '2020' }));
+
+      expect(summary(structured)).toEqual([['KEN', 2020, 'survey']]);
+      expect(structured.estimates[0]?.gini).toBe(0.351);
+      expect(
+        pipRequests().filter((url) => url.searchParams.get('fill_gaps') === 'true'),
+      ).toHaveLength(attempts);
+      expect(structured.notice).toMatch(UNAVAILABLE_NOTICE);
+      expect(structured.notice).toMatch(/may be missing; retry the same request to include it\.$/);
+      expect(structured.notice).not.toMatch(/Some rows are gap-filled/);
+      expect(text).toMatch(UNAVAILABLE_NOTICE);
+      expect(text).toContain('Economy KEN (KEN) — 2020, national');
+    },
+  );
+
+  it('carries the survey-only notice beside the gap-filled one when a model-estimate economy rides along', async () => {
+    serve((params) => {
+      if (params.get('country') === 'all' && params.get('fill_gaps') === 'true') {
+        return [
+          estimateRow('AFG', 2020, { estimation_type: 'CMD estimation', is_interpolated: false }),
+          estimateRow('KEN', 2020),
+        ];
+      }
+      if (params.get('country') === 'KEN' && params.get('fill_gaps') === 'true') {
+        return new Response('{"error":["Internal Server Error"]}', { status: 500 });
+      }
+      return kenSurvey(params);
+    });
+    const { structured, text } = await settle(() =>
+      call({ countries: ['AFG', 'KEN'], year: '2020' }),
+    );
+
+    expect(summary(structured)).toEqual([
+      ['AFG', 2020, 'CMD estimation'],
+      ['KEN', 2020, 'survey'],
+    ]);
+    expect(structured.notice).toMatch(/Some rows are gap-filled/);
+    expect(structured.notice).toMatch(UNAVAILABLE_NOTICE);
+    expect(text).toMatch(/Some rows are gap-filled/);
+    expect(text).toMatch(UNAVAILABLE_NOTICE);
+  });
+
+  it('still fails when an economy no survey covers that year needed the gap-filled request', async () => {
+    serve((params) =>
+      params.get('fill_gaps') === 'true'
+        ? new Response('{"error":["Service Unavailable"]}', { status: 503 })
+        : params.get('country') === 'KEN,IND'
+          ? [surveyRow('KEN', 2020)]
+          : undefined,
+    );
+    const { error, text } = await settle(() =>
+      failure({ countries: ['KEN', 'IND'], year: '2020' }),
+    );
+
+    expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+    expect(error.data).toMatchObject({ reason: 'upstream_unavailable', status: 503 });
+    expect(text).not.toContain('Economy KEN');
+  });
+
+  it('settles a caller abort during the gap-filled request as the cancellation, with no rows', async () => {
+    serve(kenSurvey);
+    const { started } = holdGapFilled();
+    const controller = new AbortController();
+    const pending = runToolContract(
+      worldbankGetPoverty,
+      { countries: 'KEN', year: '2020' },
+      { context: { signal: controller.signal } },
+    );
+    // A call that never asks for gap-filled estimates settles first and fails below.
+    await Promise.race([started, pending]);
+    controller.abort();
+    const result = await pending;
+
+    expect(result.isError).toBe(true);
+    const structured = result.structuredContent as {
+      error: { code: number; message: string };
+      estimates?: unknown;
+      notice?: unknown;
+    };
+    expect(structured.error.code).toBe(JsonRpcErrorCode.RequestCancelled);
+    expect(structured.error.message).toMatch(/abort/i);
+    expect(structured).not.toHaveProperty('estimates');
+    expect(structured).not.toHaveProperty('notice');
+    const content = result.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+    expect(content).not.toContain('Economy KEN');
+    expect(content).not.toMatch(UNAVAILABLE_NOTICE);
   });
 
   it('keeps MRV at the latest survey year per economy when fill_gaps is false', async () => {
@@ -399,9 +629,7 @@ describe('worldbank_get_poverty routing', () => {
     ['NG,NGA', ['NGA'], 'NGA'],
   ])('resolves %j through the country index before querying PIP', async (countries, sent, echo) => {
     serve((params) =>
-      params.get('fill_gaps') === 'false'
-        ? (params.get('country') ?? '').split(',').map((code) => surveyRow(code, 2018))
-        : undefined,
+      (params.get('country') ?? '').split(',').map((code) => surveyedYear(params, code, 2018)),
     );
     const { structured } = await call({ countries, year: '2018' });
 
@@ -481,9 +709,7 @@ describe('worldbank_get_poverty routing', () => {
   it('merges an economy and a region into one list at one pinned version', async () => {
     serve(
       (params) =>
-        params.get('country') === 'NGA' && params.get('fill_gaps') === 'false'
-          ? [surveyRow('NGA', 2022)]
-          : undefined,
+        params.get('country') === 'NGA' ? [surveyedYear(params, 'NGA', 2022)] : undefined,
       (params) =>
         params.get('country') === 'SSF' ? [groupRow('SSF', 'Sub-Saharan Africa', 2022)] : undefined,
     );
@@ -812,9 +1038,7 @@ describe('worldbank_get_poverty routing', () => {
   it('still answers an economy when the regions table is down, and retries the table next time', async () => {
     serve(
       (params) =>
-        params.get('country') === 'NGA' && params.get('fill_gaps') === 'false'
-          ? [surveyRow('NGA', 2018)]
-          : undefined,
+        params.get('country') === 'NGA' ? [surveyedYear(params, 'NGA', 2018)] : undefined,
       () => undefined,
       { regionsDown: true },
     );
@@ -945,10 +1169,7 @@ describe('worldbank_get_poverty routing', () => {
 
   it('pages one merged list, the last page short', async () => {
     serve(
-      (params) =>
-        params.get('fill_gaps') === 'false'
-          ? [surveyRow('KEN', 2021), surveyRow('NGA', 2021)]
-          : undefined,
+      (params) => [surveyedYear(params, 'KEN', 2021), surveyedYear(params, 'NGA', 2021)],
       () => [groupRow('SSF', 'Sub-Saharan Africa', 2021)],
     );
     const { structured, text } = await call({
@@ -965,7 +1186,7 @@ describe('worldbank_get_poverty routing', () => {
 
   it('reports a page past the end of a merged list', async () => {
     serve(
-      (params) => (params.get('fill_gaps') === 'false' ? [surveyRow('KEN', 2021)] : undefined),
+      (params) => [surveyedYear(params, 'KEN', 2021)],
       () => [groupRow('SSF', 'Sub-Saharan Africa', 2021)],
     );
     const { structured, text } = await call({
@@ -1023,7 +1244,7 @@ describe('worldbank_get_poverty routing', () => {
   it('answers a model-estimate-only economy and a surveyed one together', async () => {
     serve((params) => {
       const country = params.get('country');
-      if (country === 'KEN' && params.get('fill_gaps') === 'false') return [surveyRow('KEN', 2020)];
+      if (country === 'KEN') return [surveyedYear(params, 'KEN', 2020)];
       if (country === 'all' && params.get('fill_gaps') === 'true') {
         return [
           estimateRow('AFG', 2020, { estimation_type: 'CMD estimation', is_interpolated: false }),

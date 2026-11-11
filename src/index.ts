@@ -5,6 +5,7 @@
  */
 
 import { createApp } from '@cyanheads/mcp-ts-core';
+import { getServerConfig } from './config/server-config.js';
 import { worldbankCountryResource } from './mcp-server/resources/definitions/worldbank-country.resource.js';
 import { worldbankIndicatorResource } from './mcp-server/resources/definitions/worldbank-indicator.resource.js';
 import { worldbankGetCountry } from './mcp-server/tools/definitions/worldbank-get-country.tool.js';
@@ -42,6 +43,7 @@ await createApp({
   prompts: [],
   landing: { requireAuth: false },
   setup(core) {
+    getServerConfig();
     initWorldBankApiService(core.config, core.storage);
     initPipService(core.config, core.storage);
     initProjectsService(core.config, core.storage);

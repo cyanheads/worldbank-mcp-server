@@ -48,11 +48,31 @@ export function layoutFromConcepts(
   return { sourceId, sourceName: (source?.name ?? '').trim(), dimension: extra[0] };
 }
 
-/** Flatten a value listing (`/sources/{id}/{concept}`) into id/label pairs. */
+/**
+ * Trim a label and collapse each whitespace run to one space. Upstream pads some
+ * labels — International Debt Statistics' `905` "World Bank-IDA" carries 25
+ * non-breaking spaces — and doubles spaces inside others; `\s` covers U+00A0.
+ */
+export function normalizeLabel(label: string): string {
+  return label.replace(/\s+/g, ' ').trim();
+}
+
+/** Flatten a value listing (`/sources/{id}/{concept}`) into id/label pairs, labels normalized. */
 export function valuesFromListing(listing: RawSourceListing): DimensionValue[] {
   return (listing.source?.[0]?.concept?.[0]?.variable ?? [])
     .filter((v): v is RawSourceVariable & { id: string } => typeof v.id === 'string' && v.id !== '')
-    .map((v) => ({ id: v.id, label: v.value ?? '' }));
+    .map((v) => ({ id: v.id, label: normalizeLabel(v.value ?? '') }));
+}
+
+/**
+ * The values whose label is `text`, compared exactly but case-insensitively once
+ * `text` is normalized the way {@link valuesFromListing} normalizes labels. More
+ * than one match means the label is shared (WDI Database Archives labels both
+ * `199309` and `199409` "1994 Sep").
+ */
+export function valuesWithLabel(values: readonly DimensionValue[], text: string): DimensionValue[] {
+  const wanted = normalizeLabel(text).toLowerCase();
+  return values.filter((v) => v.label.toLowerCase() === wanted);
 }
 
 /**
@@ -95,8 +115,9 @@ export type ScopedRow = {
 
 /**
  * Pick a row's country, time, and dimension out of its `variable[]` by concept
- * name — upstream orders the tuple differently from one request to the next. A
- * row without a country or a time can't be placed and yields `undefined`.
+ * name — upstream orders the tuple differently from one request to the next — with
+ * the country name and dimension label normalized as listings are. A row without a
+ * country or a time can't be placed and yields `undefined`.
  */
 export function readRow(
   raw: RawSourceObservation,
@@ -111,9 +132,9 @@ export function readRow(
   const extra = dimensionConcept ? byConcept.get(dimensionConcept.toLowerCase()) : undefined;
   return {
     countryId: country.id,
-    countryName: country.value ?? '',
+    countryName: normalizeLabel(country.value ?? ''),
     period: periodFromToken(time.id),
-    dimension: extra?.id ? { id: extra.id, label: extra.value ?? '' } : undefined,
+    dimension: extra?.id ? { id: extra.id, label: normalizeLabel(extra.value ?? '') } : undefined,
     value: typeof raw.value === 'number' ? raw.value : null,
   };
 }
