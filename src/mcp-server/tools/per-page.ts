@@ -48,7 +48,7 @@ export function perPageInput(cap: number) {
       },
       get description() {
         return clamping()
-          ? `Results per page (default: server default). Positive integers above ${cap} are served at that maximum with the requested and served sizes echoed and a notice. totalPages uses the served size.`
+          ? `Results per page (default: server default); sizes above ${cap} are served at that maximum, with a notice.`
           : `Results per page (default: server default, max: ${cap}).`;
       },
     });

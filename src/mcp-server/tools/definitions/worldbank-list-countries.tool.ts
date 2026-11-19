@@ -21,7 +21,7 @@ const LENDING_TYPES = ['IBD', 'IDB', 'IDX', 'LNX'] as const;
 export const worldbankListCountries = tool('worldbank_list_countries', {
   title: 'List World Bank Countries',
   description:
-    'List countries and regional aggregates with metadata: ISO codes, region, income level, lending type, capital, and coordinates. Filter by region code (e.g. EAS, SSF, NAC), income level (LIC, LMC, UMC, HIC), and lending type (IDX for IDA, IBD for IBRD, IDB for Blend), or by text with filter, which matches words in each entry\'s id and name; filters combine by AND. Aggregate entries are excluded by default, leaving individual countries only; set include_aggregates=true to also return region, income group, and world aggregate entities. With source_id, lists that dataset\'s own entities instead, and filter finds them by name or code (source_id=50 with filter="Kenya" returns Kenya and its provinces).',
+    'List countries with ISO codes, region, income level, lending type, capital, and coordinates, narrowed by region, income_level, lending_type, and text (filter), combined by AND. With source_id, lists that dataset\'s own entities instead (source_id=50 with filter="Kenya" returns Kenya and its provinces).',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   inputAliases: { limit: 'per_page' },
   input: z.object({
@@ -30,44 +30,39 @@ export const worldbankListCountries = tool('worldbank_list_countries', {
       .regex(CATALOG_FILTER_ID, SOURCE_ID_MESSAGE)
       .optional()
       .describe(
-        "Select a source-specific entity listing. Entries carry canonical id, name and sourceId only. region, income_level, lending_type, and include_aggregates=true are unavailable here (include_aggregates' default false keeps every source entity); filter applies.",
+        'Source ID (from worldbank_list_sources) whose own entities to list, as id, name, and sourceId only. region, income_level, lending_type, and include_aggregates=true are rejected with it (the default false keeps every entity); filter applies.',
       ),
     region: z
       .string()
       .optional()
       .describe(
-        "Filter by World Bank region code. A country's region.id is one of EAS (East Asia & Pacific), ECS (Europe & Central Asia), LCN (Latin America & Caribbean), MEA (Middle East, North Africa, Afghanistan & Pakistan), NAC (North America), SAS (South Asia), or SSF (Sub-Saharan Africa). Any other World Bank region or grouping code also filters, by membership: AFE (Africa Eastern and Southern), AFW (Africa Western and Central), ARB (Arab World), EUU (European Union), LDC (Least developed countries), and the rest of the codes the World Bank publishes for regions.",
+        'Region code, as region.id reports: EAS (East Asia & Pacific), ECS (Europe & Central Asia), LCN (Latin America & Caribbean), MEA (Middle East, North Africa, Afghanistan & Pakistan), NAC (North America), SAS (South Asia), or SSF (Sub-Saharan Africa). Other World Bank region and grouping codes (AFE, AFW, ARB, EUU, LDC, …) filter by membership.',
       ),
     income_level: z
       .string()
       .optional()
       .describe(
-        'Filter by income group code: LIC (Low income), LMC (Lower middle income), UMC (Upper middle income), HIC (High income).',
+        'Income group code: LIC (Low), LMC (Lower middle), UMC (Upper middle), or HIC (High income).',
       ),
     lending_type: z
-      .union([
-        z.literal(''),
-        z
-          .enum(LENDING_TYPES)
-          .describe('IDX (IDA), IBD (IBRD), IDB (Blend), or LNX (Not classified).'),
-      ])
+      .union([z.literal(''), z.enum(LENDING_TYPES).describe('A lending type code.')])
       .optional()
       .describe(
-        "Filter by World Bank lending type code: IDX (IDA), IBD (IBRD), IDB (Blend — eligible for both), or LNX (Not classified). IDX, IBD, and IDB are also the codes worldbank_get_poverty takes for its lending groups; a country's lendingType field reports the name (IDA, IBRD, Blend, Not classified).",
+        'Lending type code: IDX (IDA), IBD (IBRD), IDB (Blend, eligible for both), or LNX (Not classified). worldbank_get_poverty takes IDX, IBD, and IDB for its lending groups.',
       ),
     include_aggregates: z
       .boolean()
       .default(false)
       .describe(
-        'When true, includes regional, income-group, and world aggregate entries alongside individual countries. Default false (individual countries only). No aggregate is returned under region, income_level, or lending_type, whichever code is given, so this changes nothing when any of them is set.',
+        'Also return regional, income-group, and world aggregates (default false: countries only). No effect with region, income_level, or lending_type, which never return aggregates.',
       ),
     filter: z
       .string()
       .optional()
       .describe(
-        'Text that narrows either listing to entries whose id and name, together, contain every word of it. Case, diacritics, punctuation, and word order are ignored, and a word may be part of a longer one: "nairobi kenya" matches KEN_Nairobi_Province_KE.NP_51328_KEN004, and "ZM" matches ZM.WE. Aggregate names such as Sub-Saharan Africa match only with include_aggregates=true. Applied after the other filters and before pagination, so totalCount and totalPages count matches. A filter with no letter or digit, blank included, is absent.',
+        'Text whose every word must appear in an entry\'s id and name together, ignoring case, diacritics, punctuation, and order; a word may be part of a longer one ("nairobi kenya" matches KEN_Nairobi_Province_KE.NP_51328_KEN004). Aggregates match only with include_aggregates=true. Applied before paging, so the totals count matches; one with no letter or digit is ignored.',
       ),
-    page: z.number().int().min(1).default(1).describe('Pagination page number (1-based).'),
+    page: z.number().int().min(1).default(1).describe('Page number, 1-based.'),
     per_page: perPageInput(MAX_COUNTRIES_PER_PAGE),
   }),
   output: z.object({
@@ -77,51 +72,43 @@ export const worldbankListCountries = tool('worldbank_list_countries', {
           .union([
             z
               .object({
-                id: z
-                  .string()
-                  .describe(
-                    'Canonical source entity ID, accepted unchanged by worldbank_get_data.',
-                  ),
-                name: z.string().describe('Source entity name.'),
+                id: z.string().describe('Entity ID, which worldbank_get_data takes unchanged.'),
+                name: z.string().describe('Entity name.'),
                 sourceId: z.string().describe('Source owning this entity.'),
               })
-              .describe('An entity from a selected source.'),
+              .describe('A source entity.'),
             z
               .object({
-                id: z.string().describe('Country or aggregate ID (ISO2 or WB aggregate code).'),
-                iso2: z.string().describe('ISO2 country code.'),
+                id: z.string().describe('Three-character code (USA; SSF for an aggregate).'),
+                iso2: z.string().describe('ISO2 code.'),
                 name: z.string().describe('Country or aggregate name.'),
                 region: z
                   .object({
                     id: z.string().describe('Region code.'),
                     name: z.string().describe('Region name.'),
                   })
-                  .describe('World Bank region this country belongs to.'),
+                  .describe('World Bank region.'),
                 incomeLevel: z
                   .object({
                     id: z.string().describe('Income level code.'),
                     name: z.string().describe('Income level name.'),
                   })
-                  .describe('World Bank income classification.'),
+                  .describe('Income classification.'),
                 lendingType: z
                   .string()
-                  .describe(
-                    'World Bank lending type name: IDA, IBRD, Blend, or Not classified (lending_type filters by the codes IDX, IBD, IDB, LNX). Aggregates report Aggregates.',
-                  ),
-                capitalCity: z.string().describe('Capital city name (empty for aggregates).'),
-                longitude: z.string().describe('Capital longitude (empty for aggregates).'),
-                latitude: z.string().describe('Capital latitude (empty for aggregates).'),
-                isAggregate: z
-                  .boolean()
-                  .describe(
-                    'True when this entry is a regional or income-group aggregate rather than an individual country.',
-                  ),
+                  .describe('Lending type name: IDA, IBRD, Blend, Not classified, or Aggregates.'),
+                capitalCity: z
+                  .string()
+                  .describe('Capital city; empty for aggregates, as are the coordinates.'),
+                longitude: z.string().describe('Capital longitude.'),
+                latitude: z.string().describe('Capital latitude.'),
+                isAggregate: z.boolean().describe('True for a regional or income-group aggregate.'),
               })
-              .describe('A country or aggregate entry.'),
+              .describe('A country or aggregate.'),
           ])
-          .describe('A global country or aggregate, or an entity from the selected source.'),
+          .describe('A country or aggregate, or a source entity.'),
       )
-      .describe('Countries (and optionally aggregates) matching the filters.'),
+      .describe('Matching entries on this page.'),
   }),
 
   // Agent-facing context: the applied filters and pagination totals. Kept out of
@@ -129,53 +116,32 @@ export const worldbankListCountries = tool('worldbank_list_countries', {
   enrichment: {
     appliedFilters: z
       .object({
-        sourceId: z
-          .string()
-          .optional()
-          .describe('Source dataset requested, omitted for the global country listing.'),
-        region: z.string().optional().describe('Region code applied, omitted when none.'),
-        incomeLevel: z
-          .string()
-          .optional()
-          .describe('Income level code applied, omitted when none.'),
-        lendingType: z
-          .string()
-          .optional()
-          .describe('Lending type code applied, omitted when none.'),
-        includeAggregates: z
-          .boolean()
-          .describe('Whether aggregates were requested, including the default of false.'),
-        filter: z.string().optional().describe('Text filter applied, trimmed; omitted when none.'),
-        page: z.number().describe('Page number requested.'),
-        perPage: z
-          .number()
-          .describe(
-            'Results per page actually served — the requested size or server default, reduced to the page cap when larger. totalPages is counted at this size.',
-          ),
+        sourceId: z.string().optional().describe('source_id requested.'),
+        region: z.string().optional().describe('region applied.'),
+        incomeLevel: z.string().optional().describe('income_level applied.'),
+        lendingType: z.string().optional().describe('lending_type applied.'),
+        includeAggregates: z.boolean().describe('include_aggregates in force.'),
+        filter: z.string().optional().describe('filter applied, trimmed.'),
+        page: z.number().describe('Page requested.'),
+        perPage: z.number().describe('Page size served, after any reduction to the page maximum.'),
         requestedPerPage: z
           .number()
           .optional()
           .describe(
-            'Page size asked for, present only when it exceeded the page cap and perPage was reduced.',
+            'Page size asked for, or the server default; present only when perPage was reduced.',
           ),
       })
-      .describe(
-        'The effective listing parameters — which filters were in force and the page size served.',
-      ),
-    totalCount: z
-      .number()
-      .describe(
-        'Total matching entries before pagination (includes aggregates if include_aggregates=true).',
-      ),
+      .describe('Parameters in force for this listing; a filter not applied is omitted.'),
+    totalCount: z.number().describe('Matching entries before pagination.'),
     currentPage: z
       .number()
-      .describe('Page number requested — past totalPages when the request ran off the end.'),
-    totalPages: z.number().describe('Total number of pages.'),
+      .describe('Page number; past totalPages when the request ran off the end.'),
+    totalPages: z.number().describe('Total pages at perPage.'),
     notice: z
       .string()
       .optional()
       .describe(
-        'Context for an empty page — which filters matched nothing, or the page range that exists when the requested page is past the end — or for a page size reduced to the page cap.',
+        'Explains an empty result (which filters matched nothing), a page past the end, or a reduced page size.',
       ),
   },
 
@@ -225,14 +191,14 @@ export const worldbankListCountries = tool('worldbank_list_countries', {
       reason: 'source_not_queryable',
       severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'The selected source has no supported country/series/time layout.',
+      when: 'The source lacks a country/series/time layout.',
       recovery: 'Choose another source with worldbank_list_sources.',
     },
     {
       reason: 'unsupported_source_filter',
       severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'Global classification filters are combined with source_id.',
+      when: 'Classification filters are combined with source_id.',
       recovery:
         'Remove region, income_level, lending_type and include_aggregates=true when selecting source_id.',
     },
@@ -240,9 +206,18 @@ export const worldbankListCountries = tool('worldbank_list_countries', {
       reason: 'invalid_filter',
       severity: 'notice',
       code: JsonRpcErrorCode.NotFound,
-      when: 'An invalid region or income_level code was provided.',
+      when: 'Unknown region or income_level code.',
       recovery:
         'Use worldbank_list_countries without filters to browse valid region and income-level codes.',
+    },
+    {
+      reason: 'upstream_timeout',
+      code: JsonRpcErrorCode.Timeout,
+      retryable: true,
+      thrownBy: 'service',
+      when: "The World Bank Indicators API did not answer within the call's 50-second budget.",
+      recovery:
+        'The request is valid. Repeat the same call unchanged after about a minute: the World Bank Indicators API finishes a request after this server stops waiting and caches the answer, so the repeat is usually served from that cache. A changed call starts a new computation.',
     },
   ],
 

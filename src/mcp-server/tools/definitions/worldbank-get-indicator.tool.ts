@@ -16,24 +16,22 @@ import { getWorldBankApiService } from '@/services/worldbank/worldbank-service.j
 export const worldbankGetIndicator = tool('worldbank_get_indicator', {
   title: 'Get World Bank Indicator',
   description:
-    'Fetch metadata for one World Bank indicator by ID: name, description, unit, source dataset, source organization, and thematic topics. Use worldbank_search_indicators to find the ID when only the concept is known; "all" and lists of IDs are rejected.',
+    'Fetch metadata for one World Bank indicator: name, description, unit, source dataset, source organization, and topics. Find IDs with worldbank_search_indicators.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     indicator_id: z
       .string()
       .regex(INDICATOR_ID, INDICATOR_ID_MESSAGE)
-      .describe(
-        'One indicator code (e.g. NY.GDP.PCAP.CD, SP.POP.TOTL) — not "all" or a list of codes. Use worldbank_search_indicators to find valid IDs.',
-      ),
+      .describe('One indicator ID (NY.GDP.PCAP.CD); not "all" or a list.'),
   }),
   output: z.object({
     id: z.string().describe('Indicator ID.'),
     name: z.string().describe('Indicator name.'),
-    unit: z.string().describe('Unit of measurement (empty when not specified).'),
+    unit: z.string().describe('Unit; empty when unspecified.'),
     sourceId: z.string().describe('Source dataset ID.'),
     sourceName: z.string().describe('Source dataset name.'),
-    sourceNote: z.string().describe('Detailed indicator description from the source.'),
-    sourceOrganization: z.string().describe('Organization that collects or publishes this data.'),
+    sourceNote: z.string().describe("The source's description of the indicator."),
+    sourceOrganization: z.string().describe('Organization that collects or publishes the data.'),
     topics: z
       .array(
         z
@@ -41,9 +39,9 @@ export const worldbankGetIndicator = tool('worldbank_get_indicator', {
             id: z.string().describe('Topic ID.'),
             name: z.string().describe('Topic name.'),
           })
-          .describe('A thematic topic entry.'),
+          .describe('A topic.'),
       )
-      .describe('Thematic topics this indicator belongs to.'),
+      .describe('Thematic topics of the indicator.'),
   }),
 
   errors: [
@@ -51,16 +49,25 @@ export const worldbankGetIndicator = tool('worldbank_get_indicator', {
       reason: 'indicator_not_found',
       severity: 'notice',
       code: JsonRpcErrorCode.NotFound,
-      when: 'The indicator ID does not exist in the World Bank API.',
+      when: 'No indicator has this ID.',
       recovery: 'Use worldbank_search_indicators to find valid indicator IDs by keyword or topic.',
     },
     {
       reason: 'multiple_indicators',
       severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'The ID is "all", or another selector the World Bank resolves to more than one indicator.',
+      when: 'The ID selects more than one indicator, as "all" does.',
       recovery:
         'Pass a single indicator ID, or use worldbank_search_indicators to list several indicators.',
+    },
+    {
+      reason: 'upstream_timeout',
+      code: JsonRpcErrorCode.Timeout,
+      retryable: true,
+      thrownBy: 'service',
+      when: "The World Bank Indicators API did not answer within the call's 50-second budget.",
+      recovery:
+        'The request is valid. Repeat the same call unchanged after about a minute: the World Bank Indicators API finishes a request after this server stops waiting and caches the answer, so the repeat is usually served from that cache. A changed call starts a new computation.',
     },
   ],
 

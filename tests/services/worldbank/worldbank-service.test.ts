@@ -17,10 +17,27 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 // ─── fetchWithTimeout mock ────────────────────────────────────────────────────
 // We need to intercept HTTP calls before importing the service. The mock must
 // be hoisted so it's defined before any import that resolves the dep.
+
+/**
+ * `withRetry` stand-in: one attempt, handed the attempt handle the real one
+ * passes — the caller's signal, and the deadline as the time left. The call
+ * deadline tests swap the real `withRetry` in.
+ */
+const { singleAttempt } = vi.hoisted(() => ({
+  singleAttempt: (
+    fn: (attempt: { signal: AbortSignal; remainingMs: number }) => unknown,
+    options?: { signal?: AbortSignal; deadlineMs?: number },
+  ) =>
+    fn({
+      signal: options?.signal ?? new AbortController().signal,
+      remainingMs: options?.deadlineMs ?? Number.POSITIVE_INFINITY,
+    }),
+}));
+
 vi.mock('@cyanheads/mcp-ts-core/utils', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@cyanheads/mcp-ts-core/utils')>()),
   fetchWithTimeout: vi.fn(),
-  withRetry: vi.fn().mockImplementation((fn: () => unknown) => fn()),
+  withRetry: vi.fn().mockImplementation(singleAttempt),
 }));
 
 vi.mock('@/config/server-config.js', () => ({
@@ -750,6 +767,277 @@ describe('WorldBankApiService', () => {
       ['Angola', 'Sub-Saharan Africa'],
       ['Aruba', 'Latin America & Caribbean'],
     ]);
+  });
+
+  // ─── Catalog names: trimmed where they are normalized ─────────────────────
+
+  describe('catalog names', () => {
+    /** One `/v2/indicator` row: its ID, name, source, organization, and topics as given. */
+    function catalogRow(
+      id: string,
+      name: string,
+      source: [id: string, name: string],
+      sourceOrganization: string,
+      topics: Array<[id: string, name: string]>,
+    ) {
+      return {
+        id,
+        name,
+        unit: '',
+        source: { id: source[0], value: source[1] },
+        // Not upstream's note: it lets one query reach every row.
+        sourceNote: 'Padded catalog row.',
+        sourceOrganization,
+        topics: topics.map(([topicId, value]) => ({ id: topicId, value })),
+      };
+    }
+
+    /**
+     * Rows of the live catalog (2026-11-19), each padded where upstream pads it:
+     * source 81's name opens with a space and source 46's ends in one, as do 13
+     * topic names on indicator rows, 644 indicator names (205 at the start), and
+     * 78 `sourceOrganization` values. `trimmed` is how each reads once normalized.
+     */
+    const PADDED = [
+      {
+        row: catalogRow(
+          'BX.GRT.EXTA.CD.DT',
+          'Grants, excluding technical cooperation (current US$)',
+          ['81', ' International Debt Statistics: DSSI'],
+          'World Bank, International Debt Statistics.',
+          [['20', 'External Debt']],
+        ),
+        trimmed: {
+          name: 'Grants, excluding technical cooperation (current US$)',
+          sourceName: 'International Debt Statistics: DSSI',
+          topics: ['External Debt'],
+          sourceOrganization: 'World Bank, International Debt Statistics.',
+        },
+      },
+      {
+        row: catalogRow(
+          'SI.POV.MDIM',
+          'Multidimensional poverty headcount ratio (% of total population)',
+          ['46', 'Sustainable Development Goals '],
+          'Government statistical agencies. Data for EU countires are from the EUROSTAT',
+          [['11', 'Poverty ']],
+        ),
+        trimmed: {
+          name: 'Multidimensional poverty headcount ratio (% of total population)',
+          sourceName: 'Sustainable Development Goals',
+          topics: ['Poverty'],
+          sourceOrganization:
+            'Government statistical agencies. Data for EU countires are from the EUROSTAT',
+        },
+      },
+      {
+        row: catalogRow(
+          'IC.FRM.BKWC.ZS',
+          'Firms using banks to finance working capital (% of firms) ',
+          ['2', 'World Development Indicators'],
+          'Enterprise Surveys, World Bank (WB), uri: https://www.enterprisesurveys.org/en/data',
+          [['12', 'Private Sector']],
+        ),
+        trimmed: {
+          name: 'Firms using banks to finance working capital (% of firms)',
+          sourceName: 'World Development Indicators',
+          topics: ['Private Sector'],
+          sourceOrganization:
+            'Enterprise Surveys, World Bank (WB), uri: https://www.enterprisesurveys.org/en/data',
+        },
+      },
+      {
+        row: catalogRow(
+          'SP.DYN.TFRT.Q1',
+          ' Total fertility rate (TFR) (births per woman): Q1 (lowest)',
+          ['39', 'Health Nutrition and Population Statistics by Wealth Quintile'],
+          'Household Surveys (DHS, MICS)',
+          [['8', 'Health ']],
+        ),
+        trimmed: {
+          name: 'Total fertility rate (TFR) (births per woman): Q1 (lowest)',
+          sourceName: 'Health Nutrition and Population Statistics by Wealth Quintile',
+          topics: ['Health'],
+          sourceOrganization: 'Household Surveys (DHS, MICS)',
+        },
+      },
+      {
+        row: catalogRow(
+          'AG.AGR.TRAC.NO',
+          'Agricultural machinery, tractors',
+          ['57', 'WDI Database Archives'],
+          'Food and Agriculture Organization, electronic files and web site.',
+          [['1', 'Agriculture & Rural Development  ']],
+        ),
+        trimmed: {
+          name: 'Agricultural machinery, tractors',
+          sourceName: 'WDI Database Archives',
+          topics: ['Agriculture & Rural Development'],
+          sourceOrganization: 'Food and Agriculture Organization, electronic files and web site.',
+        },
+      },
+      {
+        row: catalogRow(
+          '1.1_TOTAL.FINAL.ENERGY.CONSUM',
+          'Total final energy consumption (TFEC)',
+          ['35', 'Sustainable Energy for All'],
+          'World Bank and International Energy Agency (IEA Statistics © OECD/IEA, http://www.iea.org/stats/index.asp).  ',
+          [],
+        ),
+        trimmed: {
+          name: 'Total final energy consumption (TFEC)',
+          sourceName: 'Sustainable Energy for All',
+          topics: [],
+          sourceOrganization:
+            'World Bank and International Energy Agency (IEA Statistics © OECD/IEA, http://www.iea.org/stats/index.asp).',
+        },
+      },
+    ];
+
+    const PADDED_ROWS = PADDED.map(({ row }) => row);
+
+    /** Each indicator's name, source name, and topic names, by ID. */
+    function namesOf(
+      indicators: Array<{
+        id: string;
+        name: string;
+        sourceName: string;
+        topics: Array<{ name: string }>;
+      }>,
+    ) {
+      return new Map(
+        indicators.map((i) => [
+          i.id,
+          { name: i.name, sourceName: i.sourceName, topics: i.topics.map((t) => t.name) },
+        ]),
+      );
+    }
+
+    const TRIMMED_NAMES = new Map(
+      PADDED.map(({ row, trimmed: { sourceOrganization: _, ...names } }) => [row.id, names]),
+    );
+
+    it('listSources: trims the edge spaces upstream leaves on source names', async () => {
+      // `/v2/source` rows 46 and 81 as upstream sends them (2026-11-19).
+      mockResponse([
+        { page: '1', pages: '1', per_page: '100', total: '2' },
+        [
+          {
+            id: '46',
+            name: 'Sustainable Development Goals ',
+            code: 'SDG',
+            lastupdated: '2022-07-22',
+          },
+          {
+            id: '81',
+            name: ' International Debt Statistics: DSSI',
+            code: 'DSI',
+            lastupdated: '2026-11-05',
+          },
+        ],
+      ]);
+      const result = await service.listSources(1, 100, createMockContext());
+      expect(result.sources.map((s) => [s.id, s.name])).toEqual([
+        ['46', 'Sustainable Development Goals'],
+        ['81', 'International Debt Statistics: DSSI'],
+      ]);
+    });
+
+    it.each([
+      ['the whole catalog, by keyword', { query: 'padded' }],
+      ['a selected source, by keyword', { query: 'padded', sourceId: '81' }],
+      ['a selected source, browsed', { sourceId: '81' }],
+    ])(
+      'searchIndicators: trims names, source names, and topic names over %s',
+      async (_path, filters) => {
+        mockResponse([pagingObj({ total: PADDED_ROWS.length }), PADDED_ROWS]);
+        const result = await service.searchIndicators(
+          { ...filters, page: 1, perPage: 50 },
+          createMockContext(),
+        );
+        expect(namesOf(result.indicators)).toEqual(TRIMMED_NAMES);
+      },
+    );
+
+    it('searchIndicators: matches a padded name exactly, as its trimmed form', async () => {
+      mockResponse([pagingObj({ total: PADDED_ROWS.length }), PADDED_ROWS]);
+      const result = await service.searchIndicators(
+        {
+          query: 'Firms using banks to finance working capital (% of firms)',
+          page: 1,
+          perPage: 50,
+        },
+        createMockContext(),
+      );
+      expect(result.indicators.map((i) => [i.id, i.name])).toEqual([
+        ['IC.FRM.BKWC.ZS', 'Firms using banks to finance working capital (% of firms)'],
+      ]);
+    });
+
+    it.each(PADDED.map(({ row, trimmed }) => [row.id, row, trimmed] as const))(
+      'getIndicator: trims every name and the source organization of %s',
+      async (id, row, trimmed) => {
+        mockResponse([pagingObj(), [row]]);
+        const result = await service.getIndicator(id, createMockContext());
+        expect({
+          name: result.name,
+          sourceName: result.sourceName,
+          topics: result.topics.map((t) => t.name),
+          sourceOrganization: result.sourceOrganization,
+        }).toEqual(trimmed);
+      },
+    );
+  });
+
+  // ─── Page counts of an empty result ───────────────────────────────────────
+
+  describe('page count of an empty result', () => {
+    it.each([
+      ['the whole catalog', {}],
+      ['a selected source', { sourceId: '81' }],
+      ['a selected topic', { topicId: '1' }],
+    ])(
+      'searchIndicators: counts a keyword search of %s that matched nothing as one page',
+      async (_scope, scope) => {
+        mockResponse([pagingObj({ total: 1 }), [rawIndicator('SP.POP.TOTL', 'Population, total')]]);
+        const result = await service.searchIndicators(
+          { query: 'zzzzqqq', ...scope, page: 1, perPage: 50 },
+          createMockContext(),
+        );
+        expect(result).toMatchObject({ indicators: [], total: 0, page: 1, pages: 1 });
+      },
+    );
+
+    it('searchIndicators: counts an empty topic-and-source browse as one page, not upstream pages: 0', async () => {
+      // `/v2/topic/1/indicator?source=81` as upstream answers it (2026-11-19).
+      mockResponse([{ page: 1, pages: 0, per_page: '50', total: 0 }, []]);
+      const result = await service.searchIndicators(
+        { topicId: '1', sourceId: '81', page: 1, perPage: 50 },
+        createMockContext(),
+      );
+      expect(result).toMatchObject({ indicators: [], total: 0, page: 1, pages: 1 });
+    });
+
+    it('searchIndicators: keeps counting a non-empty keyword result at ceil(total / perPage)', async () => {
+      mockResponse([
+        pagingObj({ total: 5 }),
+        ['A', 'B', 'C', 'D', 'E'].map((suffix) => rawIndicator(`SP.POP.${suffix}`, 'Population')),
+      ]);
+      const result = await service.searchIndicators(
+        { query: 'population', page: 1, perPage: 2 },
+        createMockContext(),
+      );
+      expect(result).toMatchObject({ total: 5, pages: 3 });
+    });
+
+    it('getData: counts an empty whole-series read as one page, not upstream pages: 0', async () => {
+      mockResponse([pagingObj({ page: 1, pages: 0, total: 0 }), null]);
+      const result = await service.getData(
+        { indicatorId: 'SP.POP.TOTL', countries: 'all', page: 1, perPage: 50 },
+        createMockContext(),
+      );
+      expect(result).toMatchObject({ data: [], total: 0, page: 1, pages: 1 });
+    });
   });
 
   // ─── lookupCountry ────────────────────────────────────────────────────────
@@ -1816,6 +2104,242 @@ describe('WorldBankApiService', () => {
       'EG.ELC.ACCS.FE.ZS',
     ]);
     expect(result.total).toBe(6);
+  });
+
+  // ─── searchIndicators: the "…, total" headline within a tier ──────────────
+
+  describe('a name continuing the phrase with ", total"', () => {
+    /** Search `rows`, given as `[id, name, sourceId, sourceName]` in catalog order. */
+    async function rank(query: string, rows: Array<[string, string, string, string]>) {
+      mockResponse([
+        pagingObj({ total: rows.length }),
+        rows.map(([id, name, sourceId, sourceName]) =>
+          rawIndicatorFrom(id, name, sourceId, sourceName),
+        ),
+      ]);
+      const result = await service.searchIndicators(
+        { query, page: 1, perPage: 50 },
+        createMockContext(),
+      );
+      return result.indicators.map((i) => i.id);
+    }
+
+    const WDI = ['2', 'World Development Indicators'] as const;
+    const ADI = ['11', 'Africa Development Indicators'] as const;
+
+    /**
+     * Live catalog rows (2026-11-19), in catalog order. The headline series sits
+     * in a `TOTL` family of its own, behind sibling families the catalog lists
+     * first; `Unemployment, youth total` continues the phrase with `, youth`, so
+     * it stays a breakdown.
+     */
+    it.each([
+      [
+        'unemployment',
+        [
+          [
+            'SL.UEM.1524.FE.ZS',
+            'Unemployment, youth female (% of female labor force ages 15-24) (modeled ILO estimate)',
+          ],
+          [
+            'SL.UEM.1524.ZS',
+            'Unemployment, youth total (% of total labor force ages 15-24) (modeled ILO estimate)',
+          ],
+          [
+            'SL.UEM.ADVN.ZS',
+            'Unemployment with advanced education (% of total labor force with advanced education)',
+          ],
+          [
+            'SL.UEM.TOTL.FE.ZS',
+            'Unemployment, female (% of female labor force) (modeled ILO estimate)',
+          ],
+          ['SL.UEM.TOTL.NE.ZS', 'Unemployment, total (% of total labor force) (national estimate)'],
+          ['SL.UEM.TOTL.ZS', 'Unemployment, total (% of total labor force) (modeled ILO estimate)'],
+        ],
+        [
+          'SL.UEM.TOTL.ZS',
+          'SL.UEM.TOTL.NE.ZS',
+          'SL.UEM.TOTL.FE.ZS',
+          'SL.UEM.1524.ZS',
+          'SL.UEM.1524.FE.ZS',
+          'SL.UEM.ADVN.ZS',
+        ],
+      ],
+      [
+        'labor force',
+        [
+          [
+            'SL.TLF.ACTI.ZS',
+            'Labor force participation rate, total (% of total population ages 15-64) (modeled ILO estimate)',
+          ],
+          [
+            'SL.TLF.CACT.ZS',
+            'Labor force participation rate, total (% of total population ages 15+) (modeled ILO estimate)',
+          ],
+          ['SL.TLF.TOTL.FE.ZS', 'Labor force, female (% of total labor force)'],
+          ['SL.TLF.TOTL.IN', 'Labor force, total'],
+        ],
+        ['SL.TLF.TOTL.IN', 'SL.TLF.TOTL.FE.ZS', 'SL.TLF.ACTI.ZS', 'SL.TLF.CACT.ZS'],
+      ],
+    ] as const)(
+      'searchIndicators: leads %j with its ", total" series, its breakdowns behind it',
+      async (query, rows, expected) => {
+        const ids = await rank(
+          query,
+          rows.map(([id, name]): [string, string, string, string] => [id, name, ...WDI]),
+        );
+        expect(ids).toEqual(expected);
+      },
+    );
+
+    /**
+     * Two exact `Population` matches from other sources keep tier 0; within
+     * WDI's starts-with group `Population, total` leads and gathers its family,
+     * and the other sources and the archive keep their places.
+     */
+    const POPULATION: Array<[string, string, string, string]> = [
+      ['C1.2', 'Population', '82', 'Global Public Procurement'],
+      ['EN.POP.DNST', 'Population density (people per sq. km of land area)', ...WDI],
+      [
+        'IN.EC.POP.TOTL',
+        'Population (Thousands)',
+        '41',
+        'Country Partnership Strategy for India (FY2013 - 17)',
+      ],
+      ['Pop', 'Population', '88', 'Food Prices for Nutrition'],
+      ['Pop', 'Population', '93', 'FPN Datahub Archive'],
+      ['SP.POP.0014.TO.ZS', 'Population ages 0-14 (% of total population)', ...WDI],
+      ['SP.POP.GROW', 'Population growth (annual %)', ...WDI],
+      ['SP.POP.LAND.ZS', 'Population density (people per sq km)', '57', 'WDI Database Archives'],
+      ['SP.POP.TOTL', 'Population, total', ...WDI],
+      ['SP.POP.TOTL.FE.IN', 'Population, female', ...WDI],
+      ['SP.POP.TOTL.FE.ZS', 'Population, female (% of total population)', ...WDI],
+      ['SP.POP.TOTL.ZS', 'Population (% of total)', '50', 'Subnational Population'],
+    ];
+
+    it('searchIndicators: leads WDI\'s "population" hits with Population, total, behind the exact matches', async () => {
+      expect(await rank('population', POPULATION)).toEqual([
+        'C1.2',
+        'Pop',
+        'SP.POP.TOTL',
+        'SP.POP.TOTL.FE.IN',
+        'SP.POP.TOTL.FE.ZS',
+        'EN.POP.DNST',
+        'SP.POP.0014.TO.ZS',
+        'SP.POP.GROW',
+        'IN.EC.POP.TOTL',
+        'SP.POP.TOTL.ZS',
+        'SP.POP.LAND.ZS',
+      ]);
+    });
+
+    it.each([
+      ['Population, total', 'SP.POP.TOTL'],
+      ['SP.POP.TOTL', 'SP.POP.TOTL'],
+      ['Population', 'C1.2'],
+    ])('searchIndicators: keeps the exact match first for %j', async (query, first) => {
+      expect((await rank(query, POPULATION))[0]).toBe(first);
+    });
+
+    it('searchIndicators: pages "population" without repeating or skipping an ID, total unchanged', async () => {
+      const whole = await rank('population', POPULATION);
+      const walked: string[] = [];
+      for (let page = 1; page <= 4; page++) {
+        mockResponse([
+          pagingObj({ total: POPULATION.length }),
+          POPULATION.map(([id, name, sourceId, sourceName]) =>
+            rawIndicatorFrom(id, name, sourceId, sourceName),
+          ),
+        ]);
+        const result = await service.searchIndicators(
+          { query: 'population', page, perPage: 3 },
+          createMockContext(),
+        );
+        expect(result).toMatchObject({ total: 11, pages: 4 });
+        walked.push(...result.indicators.map((i) => i.id));
+      }
+      expect(walked).toEqual(whole);
+    });
+
+    /**
+     * `Taxes, total` is constructed: no live series carries an `es` plural before
+     * `, total`. Each row sits in a series family of its own, so only the headline
+     * can lift the last-listed row to the front.
+     */
+    it.each<[string, Array<[string, string, string, string]>, string[]]>([
+      [
+        'road',
+        [
+          ['IS.ROD.DNST.K2', 'Road density (km of road per 100 sq. km of land area)', ...ADI],
+          ['IS.ROD.GOOD.MT.K6', 'Roads, goods transported (million ton-km)', ...ADI],
+          ['IS.ROD.PAVE.ZS', 'Roads, paved (% of total roads)', ...ADI],
+          ['IS.ROD.TOTL.KM', 'Roads, total network (km)', ...ADI],
+        ],
+        ['IS.ROD.TOTL.KM', 'IS.ROD.DNST.K2', 'IS.ROD.GOOD.MT.K6', 'IS.ROD.PAVE.ZS'],
+      ],
+      [
+        'tax',
+        [
+          ['GC.TAX.TOTL.GD.ZS', 'Tax revenue (% of GDP)', ...WDI],
+          [
+            'GC.TAX.YPKG.ZS',
+            'Taxes on income, profits and capital gains (% of total taxes)',
+            ...WDI,
+          ],
+          ['GC.TAX.ALLT.CN', 'Taxes, total (current LCU)', ...WDI],
+        ],
+        ['GC.TAX.ALLT.CN', 'GC.TAX.TOTL.GD.ZS', 'GC.TAX.YPKG.ZS'],
+      ],
+    ])(
+      'searchIndicators: lets the last word of %j take a plural before ", total"',
+      async (query, rows, expected) => {
+        expect(await rank(query, rows)).toEqual(expected);
+      },
+    );
+
+    /**
+     * Read with its punctuation stripped, `Internet total monthly price` would
+     * continue `internet` with `total`; the comma is what marks a headline.
+     */
+    it('searchIndicators: needs the comma, so "Internet total monthly price" keeps its place', async () => {
+      const ARCHIVE = ['57', 'WDI Database Archives'] as const;
+      const rows: Array<[string, string, string, string]> = [
+        ['IT.NET.HOST.P4', 'Internet hosts (per 10,000 people)', ...ARCHIVE],
+        [
+          'IT.NET.ISPC.CD',
+          'Internet service provider access charges ($ per 30 off-peak hours)',
+          ...ARCHIVE,
+        ],
+        [
+          'IT.NET.USEC.ZS',
+          'Internet total monthly price (% of monthly GNI per capita)',
+          ...ARCHIVE,
+        ],
+        ['IT.NET.USER.P2', 'Internet users (per 100 people)', ...ARCHIVE],
+      ];
+      expect(await rank('internet', rows)).toEqual(rows.map(([id]) => id));
+    });
+
+    it('searchIndicators: keeps an archived ", total" series behind the live sources of its tier', async () => {
+      const ARCHIVE = ['57', 'WDI Database Archives'] as const;
+      expect(
+        await rank('health expenditure', [
+          ['SH.XPD.PCAP', 'Health expenditure per capita (current US$)', ...ARCHIVE],
+          ['SH.XPD.PRIV', 'Health expenditure, private (% of total health expenditure)', ...ADI],
+          ['SH.XPD.PRIV.ZS', 'Health expenditure, private (% of GDP)', ...ARCHIVE],
+          ['SH.XPD.PUBL.ZS', 'Health expenditure, public (% of GDP)', ...ARCHIVE],
+          ['SH.XPD.TOTL.CD', 'Health expenditure (current US$)', ...ADI],
+          ['SH.XPD.TOTL.ZS', 'Health expenditure, total (% of GDP)', ...ARCHIVE],
+        ]),
+      ).toEqual([
+        'SH.XPD.PRIV',
+        'SH.XPD.TOTL.CD',
+        'SH.XPD.TOTL.ZS',
+        'SH.XPD.PCAP',
+        'SH.XPD.PRIV.ZS',
+        'SH.XPD.PUBL.ZS',
+      ]);
+    });
   });
 
   it('searchIndicators: orders the description-only tier by source too, after every ID/name hit', async () => {
@@ -3124,7 +3648,7 @@ describe('WorldBankApiService', () => {
   // reported; tests/services/worldbank/source-scoped-data.test.ts covers that path.
   // What stays here is the rejection when no catalog source can be resolved.
 
-  it('getData: still reports indicator_not_queryable on id 175 when the catalog lookup fails', async () => {
+  it('getData: surfaces a failed catalog lookup on an id-175 rejection as unavailable', async () => {
     mockResponse(WB_NOT_SERVED_BODY);
     fetchWithTimeoutMock.mockResolvedValueOnce({
       text: async () => '<!DOCTYPE html><html><body>503 Service Unavailable</body></html>',
@@ -3134,13 +3658,10 @@ describe('WorldBankApiService', () => {
       .getData({ indicatorId: 'SM.POP.REFG.OR', countries: 'SDN', page: 1, perPage: 50 }, ctx)
       .catch((e: unknown) => e);
 
-    expect(err).toMatchObject({
-      code: JsonRpcErrorCode.NotFound,
-      data: { reason: 'indicator_not_queryable', indicatorId: 'SM.POP.REFG.OR' },
-    });
-    expect((err as McpError).data?.sourceNames).toBeUndefined();
-    expect((err as McpError).message).not.toContain('SDN');
-    expect((err as McpError).message).toContain('worldbank_search_indicators');
+    // The indicator may well be servable: a retry gets the lookup another chance.
+    expect(err).toMatchObject({ code: JsonRpcErrorCode.ServiceUnavailable });
+    expect((err as McpError).data?.reason).not.toBe('indicator_not_queryable');
+    expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(2);
   });
 
   it('getData: reports indicator_not_queryable on id 175 when the catalog no longer lists the ID', async () => {
@@ -3289,7 +3810,9 @@ describe('WorldBankApiService', () => {
     [200, 200],
     [201, 201],
     [1000, 1000],
-    [1001, 1000],
+    [1001, 1001],
+    [4000, 4000],
+    [4001, 4000],
   ])(
     'getData: asks upstream for per_page=%i as %i rows of the whole span, one page',
     async (perPage, served) => {
@@ -3833,6 +4356,724 @@ describe('upstream 404 on a lookup path, end to end', () => {
       data: { reason: 'indicator_not_found' },
     });
     expect(JSON.stringify(err)).not.toMatch(/XHTML|Fetch failed/);
+  });
+});
+
+// ─── Catalog names and empty searches through the tool and resource contracts ──
+
+describe('catalog names and empty indicator searches, end to end', () => {
+  beforeEach(async () => {
+    const { fetchWithTimeout } = await import('@cyanheads/mcp-ts-core/utils');
+    vi.mocked(fetchWithTimeout).mockReset();
+    vi.mocked(fetchWithTimeout).mockRejectedValue(new Error('unmocked fetch'));
+    const { getServerConfig } = await import('@/config/server-config.js');
+    vi.mocked(getServerConfig).mockReturnValue({
+      apiBaseUrl: 'https://api.worldbank.org/v2',
+      defaultPerPage: 50,
+      catalogCacheTtlMs: 60_000,
+    } as never);
+    const { initWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    initWorldBankApiService(makeConfig() as never, createInMemoryStorage());
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  /** Queue one upstream JSON response. */
+  async function respond(body: unknown) {
+    const { fetchWithTimeout } = await import('@cyanheads/mcp-ts-core/utils');
+    vi.mocked(fetchWithTimeout).mockResolvedValueOnce({
+      text: async () => JSON.stringify(body),
+    } as never);
+  }
+
+  function textOf(result: { content: Array<{ type: string; text?: string }> }) {
+    return result.content.map((block) => block.text ?? '').join('\n');
+  }
+
+  /**
+   * `content[]` escapes a space at the edge of an inline value as `&#32;`, so a
+   * name that kept its padding would show one there.
+   */
+  it('worldbank_list_sources names sources 46 and 81 without their padding on both surfaces', async () => {
+    await respond([
+      { page: '1', pages: '1', per_page: '100', total: '2' },
+      [
+        {
+          id: '46',
+          name: 'Sustainable Development Goals ',
+          code: 'SDG',
+          lastupdated: '2022-07-22',
+        },
+        {
+          id: '81',
+          name: ' International Debt Statistics: DSSI',
+          code: 'DSI',
+          lastupdated: '2026-11-05',
+        },
+      ],
+    ]);
+    const { worldbankListSources } = await import(
+      '@/mcp-server/tools/definitions/worldbank-list-sources.tool.js'
+    );
+    const result = await runToolContract(worldbankListSources, { per_page: 100 });
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({
+      sources: [
+        { id: '46', name: 'Sustainable Development Goals' },
+        { id: '81', name: 'International Debt Statistics: DSSI' },
+      ],
+    });
+    const text = textOf(result);
+    expect(text).toContain('Sustainable Development Goals (ID: 46, Code: SDG)');
+    expect(text).toContain('\nInternational Debt Statistics: DSSI (ID: 81, Code: DSI)');
+    expect(text).not.toContain('&#32;');
+  });
+
+  it('worldbank_search_indicators carries the trimmed source and topic names on both surfaces', async () => {
+    await respond([
+      { page: 1, pages: 266, per_page: '2', total: 532 },
+      [
+        {
+          id: 'BX.GRT.EXTA.CD.DT',
+          name: 'Grants, excluding technical cooperation (current US$)',
+          source: { id: '81', value: ' International Debt Statistics: DSSI' },
+          sourceNote: '',
+          topics: [{ id: '20', value: 'External Debt' }],
+        },
+        {
+          id: 'SI.POV.MDIM',
+          name: 'Multidimensional poverty headcount ratio (% of total population)',
+          source: { id: '46', value: 'Sustainable Development Goals ' },
+          sourceNote: '',
+          topics: [{ id: '11', value: 'Poverty ' }],
+        },
+      ],
+    ]);
+    const { worldbankSearchIndicators } = await import(
+      '@/mcp-server/tools/definitions/worldbank-search-indicators.tool.js'
+    );
+    const result = await runToolContract(
+      worldbankSearchIndicators,
+      { source_id: '81', per_page: 2 },
+      { context: { errors: worldbankSearchIndicators.errors } },
+    );
+    expect(result.structuredContent).toMatchObject({
+      indicators: [
+        { sourceName: 'International Debt Statistics: DSSI' },
+        { sourceName: 'Sustainable Development Goals', topics: [{ id: '11', name: 'Poverty' }] },
+      ],
+    });
+    const text = textOf(result);
+    expect(text).toContain('**Source:** International Debt Statistics: DSSI (ID: 81)');
+    expect(text).toContain('**Source:** Sustainable Development Goals (ID: 46)');
+    expect(text).toContain('**Topics:** Poverty (11)');
+    expect(text).not.toContain('&#32;');
+  });
+
+  it('worldbank_get_indicator carries one trimmed name and organization on both surfaces', async () => {
+    // `/v2/indicator/IC.FRM.BKWC.ZS` (2026-11-19), with an organization padded as 78 are.
+    await respond([
+      pagingObj(),
+      [
+        {
+          id: 'IC.FRM.BKWC.ZS',
+          name: 'Firms using banks to finance working capital (% of firms) ',
+          unit: '',
+          source: { id: '2', value: 'World Development Indicators' },
+          sourceNote: '',
+          sourceOrganization: 'Enterprise Surveys, World Bank (WB) ',
+          topics: [{ id: '12', value: 'Private Sector' }],
+        },
+      ],
+    ]);
+    const { worldbankGetIndicator } = await import(
+      '@/mcp-server/tools/definitions/worldbank-get-indicator.tool.js'
+    );
+    const result = await runToolContract(
+      worldbankGetIndicator,
+      { indicator_id: 'IC.FRM.BKWC.ZS' },
+      { context: { errors: worldbankGetIndicator.errors } },
+    );
+    expect(result.structuredContent).toMatchObject({
+      name: 'Firms using banks to finance working capital (% of firms)',
+      sourceOrganization: 'Enterprise Surveys, World Bank (WB)',
+    });
+    const text = textOf(result);
+    expect(text.split('\n')[0]).toBe('Firms using banks to finance working capital (% of firms)');
+    expect(text).toContain('**Organization:** Enterprise Surveys, World Bank (WB)\n');
+    expect(text).not.toContain('&#32;');
+  });
+
+  it('the worldbank://indicator resource carries the trimmed source and topic names', async () => {
+    await respond([
+      pagingObj(),
+      [
+        {
+          id: 'SI.POV.MDIM',
+          name: 'Multidimensional poverty headcount ratio (% of total population)',
+          unit: '',
+          source: { id: '46', value: 'Sustainable Development Goals ' },
+          sourceNote: '',
+          sourceOrganization: 'Government statistical agencies.',
+          topics: [{ id: '11', value: 'Poverty ' }],
+        },
+      ],
+    ]);
+    const { worldbankIndicatorResource } = await import(
+      '@/mcp-server/resources/definitions/worldbank-indicator.resource.js'
+    );
+    const ctx = createMockContext({ errors: worldbankIndicatorResource.errors });
+    await expect(
+      Promise.resolve(worldbankIndicatorResource.handler({ indicatorId: 'SI.POV.MDIM' }, ctx)),
+    ).resolves.toMatchObject({
+      sourceName: 'Sustainable Development Goals',
+      topics: [{ id: '11', name: 'Poverty' }],
+    });
+  });
+
+  it.each([
+    [
+      'a keyword nothing matches',
+      { query: 'zzzzqqq' },
+      [pagingObj({ total: 1 }), [rawIndicator('SP.POP.TOTL', 'Population, total')]],
+      'No indicators matched "zzzzqqq"',
+    ],
+    [
+      'a topic and source with no indicator in common',
+      { topic_id: '1', source_id: '81' },
+      // `/v2/topic/1/indicator?source=81` as upstream answers it (2026-11-19).
+      [{ page: 1, pages: 0, per_page: '50', total: 0 }, []],
+      'No indicators found for the specified filter',
+    ],
+  ])(
+    'worldbank_search_indicators counts %s as one page on both surfaces',
+    async (_case, args, body, notice) => {
+      await respond(body);
+      const { worldbankSearchIndicators } = await import(
+        '@/mcp-server/tools/definitions/worldbank-search-indicators.tool.js'
+      );
+      const result = await runToolContract(worldbankSearchIndicators, args, {
+        context: { errors: worldbankSearchIndicators.errors },
+      });
+      expect(result.isError).toBeFalsy();
+      expect(result.structuredContent).toMatchObject({
+        indicators: [],
+        totalCount: 0,
+        currentPage: 1,
+        totalPages: 1,
+        notice: expect.stringContaining(notice),
+      });
+      const text = textOf(result);
+      expect(text).toContain('**totalPages:** 1');
+      expect(text).toContain(`**Notice:** ${notice}`);
+    },
+  );
+});
+
+// ─── Call deadline ────────────────────────────────────────────────────────────
+
+/**
+ * Every request a call makes — each attempt, backoff, chained read, and wait on a
+ * shared load — spends one 50 s deadline. These run the framework's real
+ * `withRetry` and `fetchWithTimeout` over a stubbed global `fetch` that answers by
+ * URL path or holds a request until its signal aborts, under fake `setTimeout` and
+ * `Date`. The fake has no stall timeout of its own, so whatever settles a held call
+ * is the service's.
+ */
+describe('call deadline', () => {
+  const GDP = 'NY.GDP.MKTP.CD';
+  const DEBT = 'DT.DOD.DECT.CD.CG';
+  const DATA = `/v2/country/BRA/indicator/${GDP}`;
+  const ROWS = [
+    { page: 1, pages: 1, per_page: 20_000, total: 2 },
+    ['2021', '2020'].map((date) => rawDataPoint('BR', 'BRA', 'Brazil', date, 1)),
+  ];
+  const EMPTY = [{ page: 1, pages: 0, per_page: 20_000, total: 0 }, null];
+  const INDEX = [
+    { page: 1, pages: 1, per_page: 10_000, total: 2 },
+    [rawCountry('BRA', 'Brazil'), rawCountry('KEN', 'Kenya')],
+  ];
+  const NOT_SERVED = [
+    {
+      message: [
+        {
+          id: '175',
+          key: 'Invalid format',
+          value: 'The indicator was not found. It may have been deleted or archived.',
+        },
+      ],
+    },
+  ];
+  const DEBT_CATALOG = [
+    pagingObj(),
+    [rawIndicatorFrom(DEBT, 'External debt stocks', '81', 'International Debt Statistics: DSSI')],
+  ];
+  const sourceListing = (concept: string, variables: Array<[string, string]>) => ({
+    page: 1,
+    pages: 1,
+    total: variables.length,
+    source: [
+      {
+        id: '81',
+        name: 'DSSI',
+        concept: [{ id: concept, variable: variables.map(([id, value]) => ({ id, value })) }],
+      },
+    ],
+  });
+  /** The id-175 route to source 81 with every discovery read answering. */
+  const DSSI_ROUTES = {
+    [`/v2/country/BRA/indicator/${DEBT}`]: NOT_SERVED,
+    [`/v2/indicator/${DEBT}`]: DEBT_CATALOG,
+    '/v2/sources/81/concepts': {
+      page: 1,
+      pages: 1,
+      total: 3,
+      source: [
+        { id: '81', name: 'DSSI', concept: ['Country', 'Series', 'Time'].map((id) => ({ id })) },
+      ],
+    },
+    '/v2/sources/81/country': sourceListing('Country', [['BRA', 'Brazil']]),
+    '/v2/sources/81/time': sourceListing('Time', [
+      ['YR2020', '2020'],
+      ['YR2021', '2021'],
+    ]),
+    '/v2/country': INDEX,
+  };
+
+  type Reply = unknown | ((init: RequestInit | undefined) => Promise<Response>);
+  const HOLD = (init: RequestInit | undefined): Promise<Response> =>
+    new Promise((_resolve, reject) => {
+      const signal = init?.signal;
+      if (signal?.aborted) return reject(signal.reason);
+      signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+    });
+  const answerAfter =
+    (ms: number, body: unknown) =>
+    (init: RequestInit | undefined): Promise<Response> =>
+      new Promise((resolve, reject) => {
+        const timer = setTimeout(() => resolve(Response.json(body)), ms);
+        init?.signal?.addEventListener('abort', () => {
+          clearTimeout(timer);
+          reject(init.signal?.reason);
+        });
+      });
+
+  const fetchMock = vi.fn<typeof fetch>();
+  let service: InstanceType<
+    typeof import('@/services/worldbank/worldbank-service.js')['WorldBankApiService']
+  >;
+
+  /**
+   * Answer by `<path>?per_page=<n>`, then `<path>?date=<window>`, then the path
+   * alone. A function reply decides itself; anything else is served as JSON.
+   */
+  function route(entries: Record<string, Reply>) {
+    const routes = new Map(Object.entries(entries));
+    fetchMock.mockImplementation(async (input, init) => {
+      const { pathname, searchParams } = new URL(String(input));
+      const key = [
+        `${pathname}?per_page=${searchParams.get('per_page')}`,
+        `${pathname}?date=${searchParams.get('date')}`,
+        pathname,
+      ].find((k) => routes.has(k));
+      if (key === undefined) throw new Error(`Unrouted upstream request: ${String(input)}`);
+      const reply = routes.get(key);
+      return typeof reply === 'function' ? reply(init) : Response.json(reply);
+    });
+  }
+
+  /** Paths requested, in order, without the query string. */
+  function requestedPaths(): string[] {
+    return fetchMock.mock.calls.map(([input]) => new URL(String(input)).pathname);
+  }
+
+  /** Track a promise's settlement without letting a rejection go unobserved. */
+  function track<T>(promise: Promise<T>) {
+    const state: { settled: boolean; value?: T; error?: unknown } = { settled: false };
+    promise.then(
+      (value) => Object.assign(state, { settled: true, value }),
+      (error: unknown) => Object.assign(state, { settled: true, error }),
+    );
+    return state;
+  }
+
+  beforeEach(async () => {
+    const actual = await vi.importActual<typeof import('@cyanheads/mcp-ts-core/utils')>(
+      '@cyanheads/mcp-ts-core/utils',
+    );
+    const utils = await import('@cyanheads/mcp-ts-core/utils');
+    vi.mocked(utils.withRetry).mockImplementation(actual.withRetry);
+    vi.mocked(utils.fetchWithTimeout).mockImplementation(actual.fetchWithTimeout);
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    // Jitter off: each backoff is exactly 1 s × 2^attempt.
+    vi.spyOn(Math, 'random').mockReturnValue(0.5);
+    fetchMock.mockReset();
+    vi.stubGlobal('fetch', fetchMock);
+    const { getServerConfig } = await import('@/config/server-config.js');
+    vi.mocked(getServerConfig).mockReturnValue({
+      apiBaseUrl: 'https://api.worldbank.org/v2',
+      defaultPerPage: 50,
+      catalogCacheTtlMs: 60_000,
+    } as never);
+    const { WorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
+    service = new WorldBankApiService(makeConfig() as never, createInMemoryStorage());
+  });
+
+  afterEach(async () => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    const utils = await import('@cyanheads/mcp-ts-core/utils');
+    vi.mocked(utils.withRetry).mockImplementation(singleAttempt as never);
+    vi.mocked(utils.fetchWithTimeout).mockReset();
+  });
+
+  type Service = typeof service;
+  type Ctx = ReturnType<typeof createMockContext>;
+  const listed = { indicatorId: GDP, countries: 'BRA', page: 1, perPage: 50 };
+
+  it.each<[string, (s: Service, ctx: Ctx) => Promise<unknown>, Record<string, Reply>, string]>([
+    [
+      'the data read of listed countries',
+      (s, ctx) => s.getData({ ...listed, dateRange: '2020:2021' }, ctx),
+      { [DATA]: HOLD },
+      DATA,
+    ],
+    [
+      'the data read of every country',
+      (s, ctx) => s.getData({ ...listed, countries: 'all', dateRange: '2020:2021' }, ctx),
+      { [`/v2/country/all/indicator/${GDP}`]: HOLD },
+      `/v2/country/all/indicator/${GDP}`,
+    ],
+    ['one page of the whole series', (s, ctx) => s.getData(listed, ctx), { [DATA]: HOLD }, DATA],
+    [
+      'the re-read of a suspect read',
+      (s, ctx) => s.getData({ ...listed, dateRange: '2020:2021' }, ctx),
+      { [DATA]: EMPTY, [`${DATA}?per_page=19999`]: HOLD },
+      DATA,
+    ],
+    [
+      'the widen read of mrnev',
+      (s, ctx) => s.getData({ ...listed, mrnev: 1 }, ctx),
+      {
+        [DATA]: [pagingObj({ total: 1 }), [rawDataPoint('BR', 'BRA', 'Brazil', '2025', null)]],
+        [`${DATA}?date=1900:2100`]: HOLD,
+      },
+      DATA,
+    ],
+    [
+      'the country index the data rows are classified by',
+      (s, ctx) => s.getData({ ...listed, dateRange: '2020:2021' }, ctx),
+      { [DATA]: ROWS, '/v2/country': HOLD },
+      '/v2/country',
+    ],
+    [
+      'the catalog lookup behind an id-175 rejection',
+      (s, ctx) => s.getData({ ...listed, indicatorId: DEBT, dateRange: '2020:2021' }, ctx),
+      { [`/v2/country/BRA/indicator/${DEBT}`]: NOT_SERVED, [`/v2/indicator/${DEBT}`]: HOLD },
+      `/v2/indicator/${DEBT}`,
+    ],
+    [
+      "the catalog source's concepts listing",
+      (s, ctx) => s.getData({ ...listed, indicatorId: DEBT, dateRange: '2020:2021' }, ctx),
+      { ...DSSI_ROUTES, '/v2/sources/81/concepts': HOLD },
+      '/v2/sources/81/concepts',
+    ],
+    [
+      "the catalog source's time listing",
+      (s, ctx) => s.getData({ ...listed, indicatorId: DEBT, dateRange: '2020:2021' }, ctx),
+      { ...DSSI_ROUTES, '/v2/sources/81/time': HOLD },
+      '/v2/sources/81/time',
+    ],
+    [
+      'the source-scoped data read',
+      (s, ctx) => s.getData({ ...listed, indicatorId: DEBT, dateRange: '2020:2021' }, ctx),
+      { ...DSSI_ROUTES, [`/v2/sources/81/country/BRA/series/${DEBT}`]: HOLD },
+      `/v2/sources/81/country/BRA/series/${DEBT}`,
+    ],
+    [
+      'an explicitly selected source',
+      (s, ctx) => s.getData({ ...listed, sourceId: '2', dateRange: '2020:2021' }, ctx),
+      { '/v2/source/2': HOLD },
+      '/v2/source/2',
+    ],
+    [
+      "an explicitly selected source's country listing",
+      (s, ctx) =>
+        s.listCountries({ sourceId: '50', includeAggregates: false, page: 1, perPage: 50 }, ctx),
+      { '/v2/source/50': HOLD },
+      '/v2/source/50',
+    ],
+    [
+      'a country listing without aggregates',
+      (s, ctx) => s.listCountries({ includeAggregates: false, page: 1, perPage: 50 }, ctx),
+      { '/v2/country': HOLD },
+      '/v2/country',
+    ],
+    [
+      'a country listing with aggregates',
+      (s, ctx) => s.listCountries({ includeAggregates: true, page: 1, perPage: 50 }, ctx),
+      { '/v2/country': HOLD },
+      '/v2/country',
+    ],
+    [
+      'the country index a lookup reads',
+      (s, ctx) => s.lookupCountry('KE', ctx),
+      { '/v2/country': HOLD },
+      '/v2/country',
+    ],
+    [
+      'one country',
+      (s, ctx) => s.getCountry('KEN', ctx),
+      { '/v2/country/KEN': HOLD },
+      '/v2/country/KEN',
+    ],
+    [
+      'one indicator',
+      (s, ctx) => s.getIndicator(GDP, ctx),
+      { [`/v2/indicator/${GDP}`]: HOLD },
+      `/v2/indicator/${GDP}`,
+    ],
+    ['the topic list', (s, ctx) => s.listTopics(ctx), { '/v2/topic': HOLD }, '/v2/topic'],
+    [
+      'the source list',
+      (s, ctx) => s.listSources(1, 50, ctx),
+      { '/v2/source': HOLD },
+      '/v2/source',
+    ],
+    [
+      'the indicator catalog a keyword search loads',
+      (s, ctx) => s.searchIndicators({ query: 'population', page: 1, perPage: 10 }, ctx),
+      { '/v2/indicator': HOLD },
+      '/v2/indicator',
+    ],
+    [
+      'the scope a topic-filtered keyword search reads',
+      (s, ctx) =>
+        s.searchIndicators({ query: 'population', topicId: '8', page: 1, perPage: 10 }, ctx),
+      { '/v2/topic/8/indicator': HOLD },
+      '/v2/topic/8/indicator',
+    ],
+    [
+      'an unfiltered indicator listing page',
+      (s, ctx) => s.searchIndicators({ page: 1, perPage: 10 }, ctx),
+      { '/v2/indicator': HOLD },
+      '/v2/indicator',
+    ],
+  ])('settles at 50 s as upstream_timeout when %s is held', async (_label, call, routes, held) => {
+    route(routes);
+    const outcome = track(call(service, createMockContext()));
+
+    await vi.advanceTimersByTimeAsync(49_999);
+    expect(outcome.settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(outcome.error).toMatchObject({
+      code: JsonRpcErrorCode.Timeout,
+      message: expect.stringContaining('World Bank Indicators API'),
+      data: { reason: 'upstream_timeout', retryable: true, budgetMs: 50_000 },
+    });
+    expect((outcome.error as McpError).data?.recovery).toMatchObject({
+      hint: expect.stringContaining('Repeat the same call unchanged'),
+    });
+    expect(requestedPaths()).toContain(held);
+  });
+
+  it.each([
+    ['a held re-read', { [DATA]: answerAfter(30_000, EMPTY), [`${DATA}?per_page=19999`]: HOLD }],
+    ['a held country index', { [DATA]: answerAfter(30_000, ROWS), '/v2/country': HOLD }],
+  ])(
+    'spends one deadline across chained reads: 30 s on the first, then %s',
+    async (_label, routes) => {
+      route(routes);
+      const outcome = track(
+        service.getData({ ...listed, dateRange: '2020:2021' }, createMockContext()),
+      );
+
+      await vi.advanceTimersByTimeAsync(49_999);
+      expect(outcome.settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+
+      expect(outcome.error).toMatchObject({ data: { reason: 'upstream_timeout' } });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it('serves a first attempt that answers after 40 s, in one request', async () => {
+    route({ [DATA]: answerAfter(40_000, ROWS), '/v2/country': INDEX });
+    const outcome = track(
+      service.getData({ ...listed, dateRange: '2020:2021' }, createMockContext()),
+    );
+
+    await vi.advanceTimersByTimeAsync(40_000);
+
+    expect(outcome.error).toBeUndefined();
+    expect(outcome.value).toMatchObject({ total: 2, data: [{ date: '2021' }, { date: '2020' }] });
+    expect(requestedPaths()).toEqual([DATA, '/v2/country']);
+  });
+
+  it('serves a source-scoped read whose time listing takes 20 s on every request, from one listing request', async () => {
+    const TIME = '/v2/sources/81/time';
+    route({
+      ...DSSI_ROUTES,
+      [TIME]: answerAfter(20_000, DSSI_ROUTES[TIME]),
+      [`/v2/sources/81/country/BRA/series/${DEBT}`]: {
+        page: 1,
+        pages: 1,
+        total: 2,
+        source: {
+          id: '81',
+          name: 'DSSI',
+          data: ['YR2021', 'YR2020'].map((time) => ({
+            variable: [
+              { concept: 'Time', id: time, value: time.slice(2) },
+              { concept: 'Series', id: DEBT, value: 'External debt stocks' },
+              { concept: 'Country', id: 'BRA', value: 'Brazil' },
+            ],
+            value: 1,
+          })),
+        },
+      },
+    });
+    const outcome = track(
+      service.getData(
+        { ...listed, indicatorId: DEBT, dateRange: '2020:2021' },
+        createMockContext(),
+      ),
+    );
+
+    await vi.advanceTimersByTimeAsync(20_000);
+
+    expect(outcome.error).toBeUndefined();
+    expect(outcome.value).toMatchObject({ total: 2, data: [{ date: '2021' }, { date: '2020' }] });
+    expect(requestedPaths().filter((path) => path === TIME)).toHaveLength(1);
+  });
+
+  it.each([
+    ['HTTP 500', () => new Response('error', { status: 500 })],
+    [
+      'the HTML "Request Error" page',
+      () =>
+        new Response('<html><body><h2>Request Error</h2></body></html>', {
+          status: 400,
+          headers: { 'content-type': 'text/html' },
+        }),
+    ],
+  ])('retries %s inside the deadline and serves the retry', async (_label, failure) => {
+    let calls = 0;
+    route({
+      [DATA]: async () => (++calls === 1 ? failure() : Response.json(ROWS)),
+      '/v2/country': INDEX,
+    });
+    const outcome = track(
+      service.getData({ ...listed, dateRange: '2020:2021' }, createMockContext()),
+    );
+
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(outcome.value).toMatchObject({ total: 2 });
+    expect(requestedPaths()).toEqual([DATA, DATA, '/v2/country']);
+  });
+
+  it('lets a shared load its waiting call abandoned at the deadline complete and cache', async () => {
+    const gate = Promise.withResolvers<void>();
+    route({
+      '/v2/country': async () => {
+        await gate.promise;
+        return Response.json(INDEX);
+      },
+    });
+    const first = track(service.lookupCountry('KE', createMockContext()));
+    await vi.advanceTimersByTimeAsync(50_000);
+    expect(first.error).toMatchObject({ data: { reason: 'upstream_timeout' } });
+
+    gate.resolve();
+    await vi.advanceTimersByTimeAsync(0);
+
+    await expect(service.lookupCountry('KE', createMockContext())).resolves.toMatchObject({
+      id: 'KEN',
+    });
+    expect(requestedPaths()).toEqual(['/v2/country']);
+  });
+
+  it('settles a read whose every answer is immediate without a timer left behind', async () => {
+    route({ [DATA]: ROWS, '/v2/country': INDEX });
+    await expect(
+      service.getData({ ...listed, dateRange: '2020:2021' }, createMockContext()),
+    ).resolves.toMatchObject({ total: 2 });
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('surfaces a caller abort during an attempt as cancellation, reaching the in-flight request', async () => {
+    const caller = new AbortController();
+    const reason = new Error('client went away');
+    let inFlight: AbortSignal | undefined;
+    route({
+      [DATA]: (init: RequestInit | undefined) => {
+        inFlight = init?.signal ?? undefined;
+        const pending = HOLD(init);
+        caller.abort(reason);
+        return pending;
+      },
+    });
+    const outcome = track(
+      service.getData(
+        { ...listed, dateRange: '2020:2021' },
+        createMockContext({ signal: caller.signal }),
+      ),
+    );
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(inFlight?.reason).toBe(reason);
+    expect(outcome.error).toMatchObject({ code: JsonRpcErrorCode.RequestCancelled });
+    await vi.advanceTimersByTimeAsync(50_000);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('surfaces a caller abort during a backoff as cancellation', async () => {
+    const caller = new AbortController();
+    const reason = new Error('client went away');
+    route({ [DATA]: async () => new Response('error', { status: 503 }) });
+    const outcome = track(
+      service.getData(
+        { ...listed, dateRange: '2020:2021' },
+        createMockContext({ signal: caller.signal }),
+      ),
+    );
+    await vi.advanceTimersByTimeAsync(100);
+    expect(outcome.settled).toBe(false);
+    caller.abort(reason);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(outcome.error).toBe(reason);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('surfaces a caller abort during a shared-load wait as cancellation, leaving the load running', async () => {
+    const caller = new AbortController();
+    const reason = new Error('client went away');
+    let inFlight: AbortSignal | undefined;
+    route({
+      [DATA]: ROWS,
+      '/v2/country': (init: RequestInit | undefined) => {
+        inFlight = init?.signal ?? undefined;
+        const pending = HOLD(init);
+        caller.abort(reason);
+        return pending;
+      },
+    });
+    const outcome = track(
+      service.getData(
+        { ...listed, dateRange: '2020:2021' },
+        createMockContext({ signal: caller.signal }),
+      ),
+    );
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(outcome.error).toBe(reason);
+    expect(inFlight?.aborted).toBe(false);
   });
 });
 

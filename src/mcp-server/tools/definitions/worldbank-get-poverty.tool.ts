@@ -12,6 +12,11 @@ import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { pagePastEndNotice } from '@/mcp-server/tools/page-past-end-notice.js';
 import { pageSizeReducedNotice } from '@/mcp-server/tools/page-size-reduced-notice.js';
 import { perPageInput, resolvePerPage } from '@/mcp-server/tools/per-page.js';
+import {
+  CALL_DEADLINE_MS,
+  isCallDeadlineExceeded,
+  withCallDeadline,
+} from '@/services/call-deadline.js';
 import { getPipService } from '@/services/pip/pip-service.js';
 import { MAX_ESTIMATES_PER_PAGE } from '@/services/response-budget.js';
 import { COUNTRY_LIST_CONTENT, splitCountryCodes } from '@/services/worldbank/identifiers.js';
@@ -43,7 +48,7 @@ function listedValuesHint(parameters: readonly string[], listed: readonly string
 export const worldbankGetPoverty = tool('worldbank_get_poverty', {
   title: 'Get World Bank Poverty and Inequality Estimates',
   description:
-    'Query poverty and inequality estimates from the World Bank Poverty and Inequality Platform (PIP) for economies and for PIP\'s own aggregates — World, World Bank regions, income groups, lending groups, and fragility groups. Returns the poverty headcount ratio, poverty gap, and poverty severity at any poverty line, plus mean and median welfare and population. Use it for inequality and distribution questions too — survey-based economy rows carry the Gini coefficient, mean log deviation, polarization, and the ten decile income/consumption shares, because PIP returns poverty and inequality in the same row. PIP is a separate dataset from the WDI series worldbank_get_data reads: it measures welfare in PPP dollars per person per day, at a PPP vintage ppp_version selects, and computes its aggregates at any poverty line, where worldbank_get_data carries only the published lines. Every row reports how it was produced. Nullable estimateType separately identifies actual, nowcast, or projection estimates, while distributionType preserves the source distribution classification (micro, group, or imputed); missing upstream classifications remain null. On an economy, estimationType "survey" rows carry the full inequality block; "interpolation", "extrapolation", and "CMD estimation" rows are gap-filled estimates where no survey covers the year, reporting level, and welfare type, and their gini, mld, polarization, and decileShares are null — a documented gap in the source data, not an error. Aggregate rows (isAggregate true) are "actual", "nowcast", or "projection", add popInPoverty, and carry no distributional block.',
+    "Query poverty and inequality estimates from the World Bank Poverty and Inequality Platform (PIP) for economies and PIP's own aggregates (World, regions, income, lending, and fragility groups): poverty headcount, gap, and severity at any poverty line, mean and median welfare, and population, plus the Gini, mean log deviation, polarization, and decile shares on survey rows. PIP is separate from the WDI series worldbank_get_data reads: welfare is in PPP dollars per person per day at the vintage ppp_version selects, and its aggregates are computed at any line, where worldbank_get_data carries only the published lines. estimationType tells survey rows from gap-filled estimates, whose inequality fields are null by design rather than missing in error.",
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   inputAliases: { limit: 'per_page' },
   input: z.object({
@@ -55,11 +60,9 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
             COUNTRY_LIST_CONTENT,
             'Provide at least one country code, or "all" for every economy.',
           )
-          .describe(
-            'A single country code, a list separated by commas, semicolons, or pipes, or "all".',
-          ),
+          .describe('One code, several separated by commas, semicolons, or pipes, or "all".'),
         z
-          .array(z.string().describe('A country code.'))
+          .array(z.string())
           .min(1)
           /**
            * Checked against what the split actually yields, not against raw
@@ -70,12 +73,10 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
             (codes) => splitCountryCodes(codes).length > 0,
             'Provide at least one country code, or "all" for every economy.',
           )
-          .describe(
-            'An array of country codes; an element holding several codes separated by commas, semicolons, or pipes is split too.',
-          ),
+          .describe('Codes; an element holding several separated codes is split too.'),
       ])
       .describe(
-        "Country codes: a single code, an array, or one string separated by commas, semicolons, or pipes. Economies go by ISO3 (IND, USA) or ISO2 (IN, US) code, including those PIP publishes only as model estimates (AFG); \"all\" returns every economy. PIP's aggregates are served too: WLD; the World Bank regions AFE, AFW, EAS, ECS, LCN, MEA, NAC, SAS, SSF; the income groups HIC, LIC, LMIC (or LMC), UMIC (or UMC); the fragility groups FCVY (fragile) and FCVN (not fragile); and the lending groups IDX (IDA only), IDB or BLND (IDA blend), IBD or IBRD (IBRD only), and REST. Income groups follow the fiscal-year classification PIP's data release was built with — FY2026 (July 2025) for release 20260922 — applied to every year, so membership can differ from the current one worldbank_get_country reports. IDA (IDA total) is rejected because PIP computes no IDA total: ask for IDX and IDB together. FCS is rejected: use PIP's FCVY for its fragile group, whose membership is not asserted to match WDI's FCS. Other aggregate codes (SSA, EAP, MIC, LMY) are rejected, and welfare_type and reporting_level cannot be combined with an aggregate.",
+        "Economies by ISO3 (IND) or ISO2 (IN) code, model-estimate-only ones (AFG) included, or \"all\" for every economy. PIP's aggregates: WLD; regions AFE, AFW, EAS, ECS, LCN, MEA, NAC, SAS, SSF; income groups HIC, LIC, LMIC (or LMC), UMIC (or UMC); fragility groups FCVY (fragile) and FCVN (not fragile); lending groups IDX (IDA only), IDB or BLND (IDA blend), IBD or IBRD (IBRD only), REST. Income groups use the classification of PIP's data release for every year, so membership can differ from worldbank_get_country's. IDA is rejected (PIP computes no IDA total: ask for IDX and IDB), as are FCS (use FCVY, not asserted to match it), SSA, EAP, MIC, and LMY. welfare_type and reporting_level cannot combine with an aggregate.",
       ),
     year: z
       .string()
@@ -89,7 +90,7 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
       )
       .optional()
       .describe(
-        'Reporting year to return. A four-digit year (2022), "all" for the full history, or "MRV" for the most recent year. Omitted behaves as "all". MRV follows fill_gaps: with fill_gaps true each economy resolves to PIP\'s latest estimate year, and with fill_gaps false to its latest survey year; an aggregate resolves to its newest reporting year. PIP coverage starts in 1963 and ends at the last year of the data release in use; a year outside that span fails with the span named.',
+        'A four-digit reporting year, "all" (the default) for the full history, or "MRV" for the latest: per economy, PIP\'s latest estimate year with fill_gaps true or its latest survey year with fill_gaps false; an aggregate\'s newest year. Coverage runs from 1963 to the last year of PIP\'s data release.',
       ),
     poverty_line: z
       .number()
@@ -97,29 +98,25 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
       .max(2700)
       .optional()
       .describe(
-        'Poverty line in PPP dollars per person per day, at the applied PPP vintage — any threshold, not only the published ones. Omitted uses the international poverty line for that vintage, so the applied value is echoed back on every row as povertyLine rather than assumed here. The poverty line does not affect the inequality fields, which describe the whole distribution.',
+        "Poverty line in PPP dollars per person per day at the applied vintage, any threshold; omitted, the international poverty line for that vintage. PIP rounds it to two decimals (6.953 is computed at 6.95): each row's povertyLine is the line applied, appliedFilters.povertyLine the value sent. The inequality fields do not depend on it.",
       ),
     welfare_type: z
       .union([
         z.literal(''),
-        z
-          .enum(['income', 'consumption'])
-          .describe('Restrict to surveys measuring income, or to those measuring consumption.'),
+        z.enum(['income', 'consumption']).describe('Income or consumption surveys.'),
       ])
       .optional()
       .describe(
-        "Restrict results to one welfare measure. Surveys measure either income or consumption and the two are not directly comparable, so a cross-country comparison is safer pinned to one. Omitted returns whichever measure each economy publishes, with a row for each measure in a year surveyed both ways; PIP's gap-filled estimates use one measure per year.",
+        "One welfare measure. Income and consumption are not directly comparable, so pin one for a cross-country comparison. Omitted, each economy's published measure, with a row per measure in a year surveyed both ways; gap-filled estimates use one measure per year.",
       ),
     reporting_level: z
       .union([
         z.literal(''),
-        z
-          .enum(['national', 'urban', 'rural'])
-          .describe('Restrict to the national, urban, or rural estimate.'),
+        z.enum(['national', 'urban', 'rural']).describe('National, urban, or rural estimates.'),
       ])
       .optional()
       .describe(
-        'Restrict results to one reporting level. Most economies publish a national figure only. China alone publishes national, urban, and rural figures for the same year. Several others publish urban or rural figures in some years and national figures in others, and with fill_gaps true a year surveyed only in urban or rural areas also returns PIP\'s national estimate where PIP publishes one. Argentina publishes urban figures only, so "national" leaves it out. Every row states its own reportingLevel.',
+        'One reporting level. Most economies publish national figures only; China publishes all three for the same year; some publish urban or rural figures in some years, where fill_gaps true adds PIP\'s national estimate if it has one. Argentina is urban only, so "national" leaves it out.',
       ),
     ppp_version: z
       .union([
@@ -127,19 +124,19 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
         z
           .string()
           .regex(/^\d{4}$/, 'ppp_version must be a four-digit PPP vintage year, e.g. "2017".')
-          .describe('A PPP vintage year.'),
+          .describe('A four-digit PPP vintage year.'),
       ])
       .optional()
       .describe(
-        'PPP vintage to express every dollar figure in — the poverty line, mean, and median — as a four-digit year ("2021", "2017"). It must be one of the vintages PIP\'s current data release is published at; any other value fails with the available vintages named. Omitted uses the newest vintage of that release. The vintage and release applied are echoed as appliedFilters.pppVersion and appliedFilters.releaseVersion.',
+        'PPP vintage for every dollar figure ("2021", "2017"), one PIP\'s current data release is published at; omitted, the newest.',
       ),
     fill_gaps: z
       .boolean()
       .default(true)
       .describe(
-        'When true (the default), PIP\'s own estimate fills in whatever the surveys do not cover instead of leaving it out: a year with no survey, so a single-year query still answers and a full-history query returns a row per year rather than only the survey years, and a reporting level or welfare type a surveyed year lacks, such as a national estimate beside an urban-only survey. Those estimated rows carry no inequality data. Set false to return survey-derived rows only, accepting an empty result for years no survey covers and for economies PIP publishes only as model estimates. It also decides what "MRV" resolves to, and has no effect on aggregate rows.',
+        "True: PIP's estimates fill the years, reporting levels, and welfare types no survey covers, so an unsurveyed year still returns a row; those rows carry no inequality data. False: survey rows only, empty for unsurveyed years and for model-estimate-only economies. No effect on aggregates.",
       ),
-    page: z.number().int().min(1).default(1).describe('Pagination page number (1-based).'),
+    page: z.number().int().min(1).default(1).describe('Page number, 1-based.'),
     per_page: perPageInput(MAX_ESTIMATES_PER_PAGE),
   }),
   output: z.object({
@@ -150,156 +147,106 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
             countryCode: z
               .string()
               .describe(
-                "ISO3 code of the economy, or the aggregate code (SSF, LIC, WLD) on an aggregate row — IDX for PIP's IDA-only group. Accepted back as countries.",
+                'Economy ISO3 code, or the aggregate code (IDX for IDA only); accepted back as countries.',
               ),
-            countryName: z
-              .string()
-              .describe('Economy or aggregate name — "IDA only" for IDX, as WDI names it.'),
-            regionCode: z
-              .string()
-              .nullable()
-              .describe(
-                'PIP region code of the economy (e.g. SAS, NAC, SSF); null on an aggregate row.',
-              ),
-            regionName: z
-              .string()
-              .nullable()
-              .describe('PIP region name of the economy; null on an aggregate row.'),
-            reportingYear: z.number().describe('Calendar year the estimate reports on.'),
-            reportingLevel: z
-              .string()
-              .nullable()
-              .describe(
-                'Coverage of this estimate: national, urban, or rural. Null on an aggregate row.',
-              ),
-            welfareType: z
-              .string()
-              .nullable()
-              .describe(
-                'Whether the underlying survey measures income or consumption. The two are not directly comparable across economies. Null on an aggregate row, which spans both.',
-              ),
+            countryName: z.string().describe('Economy or aggregate name.'),
+            regionCode: z.string().nullable().describe('PIP region code, such as SAS.'),
+            regionName: z.string().nullable().describe('PIP region name.'),
+            reportingYear: z.number().describe('Year the estimate reports on.'),
+            reportingLevel: z.string().nullable().describe('Coverage: national, urban, or rural.'),
+            welfareType: z.string().nullable().describe('Welfare measure: income or consumption.'),
             povertyLine: z
               .number()
-              .describe(
-                'Poverty line the poverty measures were computed at, in PPP dollars per person per day, as applied upstream.',
-              ),
+              .describe('Poverty line applied, in PPP dollars per person per day.'),
             headcount: z
               .number()
               .nullable()
-              .describe(
-                'Share of the population below the poverty line, as a fraction (0.0814 = 8.14%).',
-              ),
+              .describe('Share of the population below the line, as a fraction (0.0814 = 8.14%).'),
             povertyGap: z
               .number()
               .nullable()
               .describe(
-                'Mean shortfall below the poverty line across the whole population, as a fraction of the line — depth of poverty, not just its incidence.',
+                'Mean shortfall below the line across the population, as a fraction of the line.',
               ),
             povertySeverity: z
               .number()
               .nullable()
-              .describe(
-                'Squared poverty gap, weighting the poorest most heavily — inequality among those below the line.',
-              ),
-            watts: z.number().nullable().describe('Watts index, a distribution-sensitive measure.'),
+              .describe('Squared poverty gap, weighting the poorest most.'),
+            watts: z.number().nullable().describe('Watts poverty index.'),
             mean: z.number().nullable().describe('Mean daily welfare per person in PPP dollars.'),
             median: z
               .number()
               .nullable()
-              .describe(
-                'Median daily welfare per person in PPP dollars. Null on aggregate rows, which PIP publishes without one.',
-              ),
-            gini: z
-              .number()
-              .nullable()
-              .describe(
-                'Gini coefficient of the welfare distribution, 0 (perfect equality) to 1. Null on gap-filled rows — see estimationType.',
-              ),
-            mld: z
-              .number()
-              .nullable()
-              .describe('Mean log deviation, an inequality measure. Null on gap-filled rows.'),
-            polarization: z
-              .number()
-              .nullable()
-              .describe('Wolfson polarization index. Null on gap-filled rows.'),
+              .describe('Median daily welfare per person in PPP dollars.'),
+            gini: z.number().nullable().describe('Gini coefficient, 0 (equality) to 1.'),
+            mld: z.number().nullable().describe('Mean log deviation.'),
+            polarization: z.number().nullable().describe('Wolfson polarization index.'),
             decileShares: z
               .array(z.number())
               .length(10)
               .nullable()
               .describe(
-                'Share of total income or consumption held by each decile, poorest first, summing to 1. Null on gap-filled rows.',
+                "Each decile's share of income or consumption, poorest first, summing to 1.",
               ),
-            population: z
-              .number()
-              .nullable()
-              .describe(
-                'Population the estimate covers — multiply by headcount for the number of people below the line.',
-              ),
+            population: z.number().nullable().describe('Population the estimate covers.'),
             popInPoverty: z
               .number()
               .nullable()
               .describe(
-                'Number of people below the poverty line, as PIP publishes it on aggregate rows. Null on economy rows, where population × headcount gives it.',
+                'People below the line, published on aggregate rows; null on economy rows, where population × headcount gives it.',
               ),
             surveyYear: z
               .number()
               .nullable()
-              .describe(
-                'Year of the survey behind the estimate, fractional when the survey spans a fiscal year (2022.58). Null on gap-filled rows, which trace to no single survey.',
-              ),
+              .describe('Survey year, fractional when the survey spans a fiscal year (2022.58).'),
             surveyAcronym: z
               .string()
-              .describe(
-                'Short name of the underlying survey (empty on gap-filled rows and where PIP publishes none).',
-              ),
+              .describe('Survey short name; empty on gap-filled rows and where none is published.'),
             surveyComparability: z
               .number()
               .nullable()
               .describe(
-                "PIP's series comparability code within the economy: 0 is its oldest comparable series and the code steps up each time comparability breaks, so two survey rows of one economy compare over time only when they share it. Null on gap-filled rows.",
+                'Comparability code within the economy, 0 for its oldest series and stepping up at each break; two survey rows compare over time only when they share it.',
               ),
             comparableSpell: z
               .string()
               .nullable()
-              .describe(
-                'The span of years the comparable series behind this row covers, as PIP labels it ("2022", "2011 - 2022"). Null on gap-filled rows.',
-              ),
+              .describe('Years the comparable series covers, as PIP labels it ("2011 - 2022").'),
             estimationType: z
               .string()
               .describe(
-                'How the row was produced. On an economy: "survey" carries the full inequality block; "interpolation", "extrapolation", and "CMD estimation" are gap-filled and carry none, the last being what PIP publishes for economies it has no survey for at all. On an aggregate: "actual", "nowcast", or "projection".',
+                'How the row was produced. Economy rows: "survey", or gap-filled "interpolation", "extrapolation", or "CMD estimation" (no survey at all), whose gini, mld, polarization, decileShares, surveyYear, surveyComparability, and comparableSpell are null. Aggregate rows: "actual", "nowcast", or "projection".',
               ),
             estimateType: z
               .string()
               .nullable()
               .describe(
-                'PIP estimate classification: actual, nowcast, or projection. Null when PIP publishes none; independent of estimationType.',
+                'Estimate classification: actual, nowcast, or projection; null when none is published. Independent of estimationType.',
               ),
             distributionType: z
               .string()
               .nullable()
               .describe(
-                'PIP distribution classification, such as micro, group, or imputed. Null when PIP publishes none.',
+                'Distribution classification: micro, group, or imputed; null when none is published.',
               ),
             isInterpolated: z
               .boolean()
               .nullable()
               .describe(
-                'True on the interpolated and extrapolated rows. Read estimationType instead of relying on this alone — a "CMD estimation" row is also gap-filled but reports false here. Null on aggregate rows.',
+                'True on interpolated and extrapolated rows but false on a gap-filled "CMD estimation" row, so read estimationType.',
               ),
             isAggregate: z
               .boolean()
               .describe(
-                'True on a PIP aggregate — World, a region, an income group, a lending group, or a fragility group — whose median, distributional block, survey fields, welfareType, and reportingLevel are null.',
+                'True on a PIP aggregate row, whose regionCode, regionName, reportingLevel, welfareType, median, gini, mld, polarization, decileShares, surveyYear, surveyComparability, comparableSpell, and isInterpolated are null and surveyAcronym is empty.',
               ),
           })
           .describe(
-            'One economy × year × reporting-level × welfare-type estimate, or one aggregate × year.',
+            'An economy × year × reporting level × welfare type estimate, or an aggregate × year.',
           ),
       )
       .describe(
-        'Poverty and inequality estimates for this page — economies and aggregates in one list, ordered by code, year, reporting level, then welfare type.',
+        'Estimates on this page, ordered by code, year, reporting level, then welfare type.',
       ),
   }),
 
@@ -309,67 +256,35 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
         countries: z
           .string()
           .describe(
-            "Codes as queried, comma-joined across economies and aggregates: uppercased and deduplicated, two-character codes resolved to their three-character form (NG → NGA), and WDI group spellings read as PIP's (LMC → LMIC, IDB → BLND, IBD → IBRD). PIP's IDA-only group stays IDX, since IDA means IDA total. Every code here can be sent back as countries and asks for the same economy or group.",
+            "Codes as queried, comma-joined: uppercased, deduplicated, ISO2 resolved to three characters (NG → NGA), and WDI group spellings read as PIP's (LMC → LMIC, IDB → BLND, IBD → IBRD). Each can be sent back as countries.",
           ),
-        year: z
-          .string()
-          .optional()
-          .describe('Year filter applied, omitted when none was requested.'),
-        povertyLine: z
-          .number()
-          .optional()
-          .describe(
-            'Poverty line requested, omitted when the upstream default was used — in which case the applied value is on every row as povertyLine.',
-          ),
-        welfareType: z
-          .string()
-          .optional()
-          .describe('Welfare-type filter applied, omitted when none.'),
-        reportingLevel: z
-          .string()
-          .optional()
-          .describe('Reporting-level filter applied, omitted when none.'),
-        pppVersion: z
-          .string()
-          .describe(
-            'PPP vintage every dollar figure in these estimates is expressed in, whether requested or resolved as the newest vintage of the release.',
-          ),
-        releaseVersion: z
-          .string()
-          .describe(
-            'PIP data release the estimates come from, as its YYYYMMDD stamp — the newest release PIP lists. Survey and gap-filled rows share it.',
-          ),
-        fillGaps: z
-          .boolean()
-          .describe(
-            'Whether gap-filling was permitted for this query, including the server default of true.',
-          ),
-        page: z.number().describe('Page number requested.'),
-        perPage: z
-          .number()
-          .describe(
-            'Results per page actually served — the requested size or server default, reduced to the page cap when larger. totalPages is counted at this size.',
-          ),
+        year: z.string().optional().describe('Year applied.'),
+        povertyLine: z.number().optional().describe('Poverty line as sent.'),
+        welfareType: z.string().optional().describe('Welfare type applied.'),
+        reportingLevel: z.string().optional().describe('Reporting level applied.'),
+        pppVersion: z.string().describe('PPP vintage of every dollar figure.'),
+        releaseVersion: z.string().describe('PIP data release (YYYYMMDD), the newest PIP lists.'),
+        fillGaps: z.boolean().describe('Whether gap-filling was on.'),
+        page: z.number().describe('Page requested.'),
+        perPage: z.number().describe('Page size served, after any reduction to the page maximum.'),
         requestedPerPage: z
           .number()
           .optional()
           .describe(
-            'Page size asked for, requested or server default, present only when it exceeded the page cap and perPage was reduced.',
+            'Page size asked for, or the server default; present only when perPage was reduced.',
           ),
       })
-      .describe(
-        'The effective parameters sent to PIP — confirms country code normalization and which filters were in force for these estimates.',
-      ),
-    totalCount: z.number().describe('Total estimates before pagination.'),
+      .describe('The query as sent to PIP; a filter not applied is omitted.'),
+    totalCount: z.number().describe('Matching estimates before pagination.'),
     currentPage: z
       .number()
-      .describe('Page number requested — past totalPages when the request ran off the end.'),
-    totalPages: z.number().describe('Total number of pages.'),
+      .describe('Page number; past totalPages when the request ran off the end.'),
+    totalPages: z.number().describe('Total pages at perPage.'),
     notice: z
       .string()
       .optional()
       .describe(
-        'Context for an empty result set, for a page past the end of the results, for a page size reduced to the page cap, for a result carrying gap-filled or aggregate rows with no inequality data, for survey rows returned without the gap-filled estimates PIP failed to serve, and for economies fill_gaps false left out.',
+        'Explains an empty result, a page past the end, a reduced page size, gap-filled or aggregate rows, gap-filled estimates PIP failed to return, or economies fill_gaps false left out.',
       ),
   },
 
@@ -406,7 +321,7 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
       reason: 'country_not_found',
       severity: 'notice',
       code: JsonRpcErrorCode.NotFound,
-      when: 'No economy or aggregate PIP publishes goes by one or more of the codes, including a two-character code the World Bank country listing does not carry.',
+      when: 'A code names no economy or aggregate PIP publishes.',
       recovery:
         'Look an economy up with worldbank_list_countries by its ISO3 or ISO2 code. For an aggregate use a code the countries parameter lists: WLD, a region such as SSF, an income group such as LIC, or a lending group such as IDX.',
     },
@@ -414,7 +329,7 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
       reason: 'ambiguous_aggregate',
       severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
-      when: "IDA or its ISO2 code XG names WDI's IDA total, which PIP does not compute.",
+      when: "IDA or XG asks for WDI's IDA total, which PIP does not compute.",
       recovery:
         'Ask for IDX (IDA only) and IDB (IDA blend) instead, together if both parts are wanted.',
     },
@@ -422,7 +337,7 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
       reason: 'unserved_aggregate',
       severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
-      when: "An aggregate code this tool does not serve: WDI's FCS, a PovcalNet grouping from PIP's regions table (SSA, EAP), or a WDI income aggregate PIP computes none for (MIC, LMY).",
+      when: 'An aggregate code this tool does not serve, such as FCS, SSA, or MIC.',
       recovery:
         'Use one of the accepted aggregate codes the message lists — SSF rather than SSA for Sub-Saharan Africa — or query the individual economies instead.',
     },
@@ -430,7 +345,7 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
       reason: 'aggregate_filter_conflict',
       severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'welfare_type or reporting_level was set alongside an aggregate code.',
+      when: 'welfare_type or reporting_level is set with an aggregate code.',
       recovery:
         'Drop welfare_type and reporting_level, or query the aggregates and the economies in separate calls.',
     },
@@ -438,7 +353,7 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
       reason: 'invalid_parameter',
       severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'PIP rejected the value supplied for a query parameter other than country.',
+      when: 'PIP rejected a parameter value.',
       recovery:
         'Correct the rejected parameter to the form its description gives and retry, or drop the parameter.',
     },
@@ -446,20 +361,35 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
       reason: 'ppp_version_unavailable',
       severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
-      when: "ppp_version names a PPP vintage PIP's current data release is not published at.",
+      when: "ppp_version is not a vintage PIP's current release is published at.",
       recovery:
         'Retry with one of the PPP vintages named in the message, or omit ppp_version to use the newest one.',
     },
     {
       reason: 'upstream_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'PIP answered with a server error, or the World Bank Indicators API country listing that resolves an ISO2 code could not be loaded.',
+      when: 'PIP returned a server error, or the country listing that resolves ISO2 codes did not load.',
       recovery:
         'Wait a few seconds and retry the same request; if it keeps failing, narrow it to fewer codes or a single year.',
+    },
+    {
+      reason: 'upstream_timeout',
+      code: JsonRpcErrorCode.Timeout,
+      retryable: true,
+      thrownBy: 'service',
+      when: "The call's 50-second budget ran out before PIP or the ISO2 country listing answered, or a PIP request ran past its 90-second bound.",
+      recovery:
+        'Repeat the same call: this server keeps the request running after the deadline and answers the repeat from its result. When PIP itself did not finish the request within 90 seconds, a repeat starts over, so narrow it to fewer economies or years.',
     },
   ],
 
   async handler(input, ctx) {
+    /**
+     * One deadline for the whole call, started before anything waits: the ISO2
+     * lookup through the Indicators API and every PIP request spend the same
+     * budget, never one each.
+     */
+    const call = withCallDeadline(ctx);
     const codes = splitCountryCodes(input.countries);
     const year = input.year?.trim() ? input.year.trim() : undefined;
     const welfareType = input.welfare_type || undefined;
@@ -493,15 +423,31 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
      * aggregate's ISO2 code (ZG → SSF) shares with its own code, so it routes
      * the same way. The index is read only when a two-character code is present.
      * An index that fails to load is reported as the upstream failure it is,
-     * naming the listing; a cancellation of this call is the caller's and
+     * naming the listing, and one still loading when the call deadline passes as
+     * the timeout it is; a cancellation of this call is the caller's and
      * propagates untouched.
      */
     const lookups = await Promise.all(
       codes.map((code) =>
-        code.length === 2 ? getWorldBankApiService().lookupCountry(code, ctx) : undefined,
+        code.length === 2 ? getWorldBankApiService().lookupCountry(code, call) : undefined,
       ),
     ).catch((err: unknown) => {
       if (ctx.signal.aborted) throw err;
+      if (isCallDeadlineExceeded(err)) {
+        const hint = (err.data?.recovery as { hint?: string } | undefined)?.hint;
+        throw ctx.fail(
+          'upstream_timeout',
+          `The World Bank Indicators API country listing, which resolves an ISO2 code to the three-character code PIP takes, did not load within the call's ${CALL_DEADLINE_MS / 1000} s deadline.`,
+          {
+            ...err.data,
+            recovery: {
+              hint: `${hint ? `${hint} ` : ''}Passing each economy by its ISO3 code needs no country-listing lookup.`,
+            },
+            countries: codes,
+          },
+          { cause: err },
+        );
+      }
       throw ctx.fail(
         'upstream_unavailable',
         'The World Bank Indicators API country listing, which resolves an ISO2 code to the three-character code PIP takes, could not be loaded.',
@@ -555,7 +501,7 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
           page: input.page,
           perPage: pageSize.served,
         },
-        ctx,
+        call,
       );
     } catch (err) {
       if (err instanceof McpError) {
@@ -606,6 +552,12 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
         }
         if (reason === 'upstream_unavailable') {
           throw ctx.fail('upstream_unavailable', err.message, {
+            ...err.data,
+            countries: codes,
+          });
+        }
+        if (reason === 'upstream_timeout') {
+          throw ctx.fail('upstream_timeout', err.message, {
             ...err.data,
             countries: codes,
           });
@@ -662,7 +614,7 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
       }
       if (result.gapFillUnavailable) {
         notices.push(
-          'PIP did not return its gap-filled estimates for the surveyed economies, so their rows come from surveys alone. An estimate the surveys do not cover, such as a national figure for a year surveyed only in urban areas, may be missing; retry the same request to include it.',
+          'PIP did not return its gap-filled estimates for the surveyed economies, so their rows come from surveys alone. An estimate the surveys do not cover, such as a national figure for a year surveyed only in urban areas, may be missing; repeat the same request in about a minute to include it.',
         );
       }
       if (result.rows.some((row) => row.isAggregate)) {

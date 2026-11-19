@@ -295,8 +295,12 @@ describe('worldbankListCountries', () => {
     expect(worldbankListCountries.input.safeParse({ per_page: 300 }).success).toBe(true);
     const perPage = (worldbankListCountries.input.shape.per_page as { description?: string })
       .description;
-    expect(perPage).toMatch(/above 300 are served at that maximum/);
-    expect(perPage).toMatch(/requested and served sizes echoed/);
+    // The cap, that a larger size is served at it rather than rejected, and the notice.
+    expect(perPage).toMatch(/above 300 are served at that maximum, with a notice/);
+    // The requested and served sizes are echoed in appliedFilters, described there.
+    const echo = worldbankListCountries.enrichment?.appliedFilters.shape;
+    expect(echo?.perPage.description).toMatch(/Page size served/);
+    expect(echo?.requestedPerPage.description).toMatch(/present only when perPage was reduced/);
   });
 
   it('accepts include_aggregates=true', async () => {

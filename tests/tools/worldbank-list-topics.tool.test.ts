@@ -32,7 +32,7 @@ describe('worldbankListTopics', () => {
     const { worldbankListTopics } = await import(
       '@/mcp-server/tools/definitions/worldbank-list-topics.tool.js'
     );
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: worldbankListTopics.errors });
     const input = worldbankListTopics.input.parse({});
     const result = await worldbankListTopics.handler(input, ctx);
     expect(result.topics).toHaveLength(2);
@@ -63,7 +63,7 @@ describe('worldbankListTopics', () => {
     const { worldbankListTopics } = await import(
       '@/mcp-server/tools/definitions/worldbank-list-topics.tool.js'
     );
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: worldbankListTopics.errors });
     const input = worldbankListTopics.input.parse({});
     const result = await worldbankListTopics.handler(input, ctx);
     expect(result.topics).toHaveLength(0);

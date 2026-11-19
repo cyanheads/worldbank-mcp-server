@@ -1037,8 +1037,12 @@ describe('worldbankGetData', () => {
       '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
     );
     const source = worldbankGetData.handler.toString();
-    for (const { reason } of worldbankGetData.errors ?? []) {
-      expect(source).toContain(reason);
+    for (const entry of worldbankGetData.errors ?? []) {
+      // A service-thrown reason passes through the handler untouched; its wire
+      // path is proven in service-errors-on-the-wire.test.ts.
+      if (!('thrownBy' in entry && entry.thrownBy === 'service')) {
+        expect(source).toContain(entry.reason);
+      }
     }
   });
 
@@ -1091,7 +1095,7 @@ describe('worldbankGetData', () => {
     ).not.toThrow();
   });
 
-  it('describes maximum normalization at 1000', async () => {
+  it('describes maximum normalization at 4000', async () => {
     const { worldbankGetData } = await import(
       '@/mcp-server/tools/definitions/worldbank-get-data.tool.js'
     );
@@ -1099,14 +1103,14 @@ describe('worldbankGetData', () => {
       worldbankGetData.input.safeParse({
         indicator_id: 'SP.POP.TOTL',
         countries: 'all',
-        per_page: 1000,
+        per_page: 4000,
       }).success,
     ).toBe(true);
     const perPage = (worldbankGetData.input.shape.per_page as { description?: string }).description;
-    expect(perPage).toMatch(/above 1000 are served at that maximum/);
+    expect(perPage).toMatch(/above 4000 are served at that maximum/);
     expect(perPage).not.toMatch(/higher values/i);
-    expect(worldbankGetData.description).toMatch(/1000 per page/);
-    expect(worldbankGetData.description).not.toMatch(/per_page up to 1000/);
+    expect(worldbankGetData.description).toMatch(/4000 per page/);
+    expect(worldbankGetData.description).not.toMatch(/per_page up to 4000/);
   });
 
   it('accepts above-maximum requests for handler normalization', async () => {

@@ -2,14 +2,21 @@
  * @fileoverview ProjectsService against the framework's real fetch, status
  * mapping, and retry loop, with only the global `fetch` stubbed. Covers how each
  * upstream status is classified — a query the API cannot parse apart from an
- * upstream failure — and how many attempts each one gets.
+ * upstream failure — how many attempts each one gets, and the call deadline
+ * every request runs under.
  * @module tests/services/projects/projects-service-http.test
  */
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createInMemoryStorage, createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  CALL_DEADLINE_MS,
+  isCallDeadlineExceeded,
+  withCallDeadline,
+} from '@/services/call-deadline.js';
 import { ProjectsService } from '@/services/projects/projects-service.js';
+import { answerAfter, held } from '../../helpers/held-fetch.js';
 
 vi.mock('@/config/server-config.js', () => ({
   getServerConfig: vi.fn().mockReturnValue({
@@ -43,6 +50,7 @@ const baseOpts = {
   regions: [] as string[],
   financialTypes: [] as string[],
   includeAbstract: false,
+  includeThemes: false,
   page: 1,
   perPage: 10,
 };
@@ -113,7 +121,11 @@ describe('ProjectsService over the real fetch and retry path', () => {
       const error = await rejection({ ...baseOpts, query: 'water' });
 
       expect(error.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
-      expect(error.data).toMatchObject({ reason: 'upstream_unavailable', status });
+      expect(error.data).toMatchObject({
+        reason: 'upstream_unavailable',
+        status,
+        operation: 'World Bank Projects API request',
+      });
       expect(error.data).not.toHaveProperty('retryable');
       // The framework's default budget: one attempt plus three retries.
       expect(fetchMock).toHaveBeenCalledTimes(4);
@@ -143,4 +155,149 @@ describe('ProjectsService over the real fetch and retry path', () => {
       expect(fetchMock).toHaveBeenCalledTimes(1);
     },
   );
+});
+
+// ─── Call deadline ────────────────────────────────────────────────────────────
+
+/** Track a promise's settlement without letting a rejection go unobserved. */
+function track<T>(promise: Promise<T>) {
+  const state: { settled: boolean; value?: T; error?: unknown } = { settled: false };
+  promise.then(
+    (value) => Object.assign(state, { settled: true, value }),
+    (error: unknown) => Object.assign(state, { settled: true, error }),
+  );
+  return state;
+}
+
+const emptyPage = () =>
+  Response.json({ rows: 0, os: '0', page: '1', total: '0', projects: {}, facets: {} });
+
+/**
+ * The deadline mechanism itself is tabled in tests/services/call-deadline.test.ts;
+ * these prove the Projects service runs every request it makes under it.
+ */
+describe('ProjectsService under the call deadline', () => {
+  const service = () => new ProjectsService({} as never, createInMemoryStorage());
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    fetchMock.mockReset();
+    fetchMock.mockRejectedValue(new Error('unmocked fetch'));
+    vi.stubGlobal('fetch', fetchMock);
+    // Jitter off: each backoff is exactly baseDelayMs × 2^attempt.
+    vi.spyOn(Math, 'random').mockReturnValue(0.5);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('holds a stalled request open to the 50 s deadline and expires there as upstream_timeout', async () => {
+    let inFlight: AbortSignal | undefined;
+    fetchMock.mockImplementation((_url, init) => {
+      inFlight = init?.signal ?? undefined;
+      return held(init);
+    });
+    const outcome = track(
+      service().searchProjects({ ...baseOpts, query: 'water' }, createMockContext()),
+    );
+
+    await vi.advanceTimersByTimeAsync(CALL_DEADLINE_MS - 1);
+    expect(outcome.settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(outcome.error).toMatchObject({
+      code: JsonRpcErrorCode.Timeout,
+      message: expect.stringContaining('World Bank Projects API'),
+      data: {
+        reason: 'upstream_timeout',
+        retryable: true,
+        budgetMs: 50_000,
+        recovery: { hint: expect.stringContaining('narrow the request') },
+      },
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(inFlight?.aborted).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('retries a 5xx inside the deadline, giving the retry only what is left', async () => {
+    fetchMock
+      .mockImplementationOnce((_url, init) =>
+        answerAfter(30_000, () => new Response('busy', { status: 503 }), init),
+      )
+      .mockImplementationOnce((_url, init) => held(init));
+    const outcome = track(
+      service().searchProjects({ ...baseOpts, query: 'water' }, createMockContext()),
+    );
+
+    // 30 s for the 503 and a 1 s backoff leave the retry 19 s, not a fresh budget.
+    await vi.advanceTimersByTimeAsync(CALL_DEADLINE_MS - 1);
+    expect(outcome.settled).toBe(false);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(outcome.error).toMatchObject({ data: { reason: 'upstream_timeout' } });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('spends the same deadline on the zero-hit country probe and keeps the empty result when the probe runs out of it', async () => {
+    fetchMock
+      .mockImplementationOnce((_url, init) => answerAfter(45_000, emptyPage, init))
+      .mockImplementationOnce((_url, init) => held(init));
+    const outcome = track(
+      service().searchProjects(
+        { ...baseOpts, countryCodes: ['BR'], statuses: ['Pipeline'] },
+        createMockContext(),
+      ),
+    );
+
+    await vi.advanceTimersByTimeAsync(CALL_DEADLINE_MS - 1);
+    expect(outcome.settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(outcome.value).toMatchObject({ projects: [], total: 0, countryOnlyTotal: null });
+    expect(new URL(String(fetchMock.mock.calls[1]?.[0])).searchParams.get('rows')).toBe('0');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('surfaces a caller abort during the request as cancellation, reaching the in-flight fetch', async () => {
+    const caller = new AbortController();
+    const reason = new Error('client went away');
+    let inFlight: AbortSignal | undefined;
+    fetchMock.mockImplementation((_url, init) => {
+      inFlight = init?.signal ?? undefined;
+      const pending = held(init);
+      caller.abort(reason);
+      return pending;
+    });
+    const outcome = track(
+      service().searchProjects(
+        { ...baseOpts, query: 'water' },
+        createMockContext({ signal: caller.signal }),
+      ),
+    );
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(inFlight?.reason).toBe(reason);
+    expect(outcome.error).toMatchObject({ code: JsonRpcErrorCode.RequestCancelled });
+    expect(isCallDeadlineExceeded(outcome.error)).toBe(false);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('sends nothing when the call reaches the Projects API with 1 ms or less left', async () => {
+    const call = withCallDeadline(createMockContext());
+    vi.advanceTimersByTime(CALL_DEADLINE_MS - 1);
+
+    await expect(
+      service().searchProjects({ ...baseOpts, query: 'water' }, call),
+    ).rejects.toMatchObject({
+      code: JsonRpcErrorCode.Timeout,
+      data: { reason: 'upstream_timeout' },
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
 });

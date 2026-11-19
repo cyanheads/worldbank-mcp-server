@@ -64,6 +64,15 @@ export const worldbankCountryResource = resource('worldbank://country/{countryCo
       recovery:
         'Pass a single country code, or use worldbank_list_countries to list several countries.',
     },
+    {
+      reason: 'upstream_timeout',
+      code: JsonRpcErrorCode.Timeout,
+      retryable: true,
+      thrownBy: 'service',
+      when: "The World Bank Indicators API did not answer within the read's 50-second budget, which spans every attempt and retry.",
+      recovery:
+        'The request is valid. Repeat the same call unchanged after about a minute: the World Bank Indicators API finishes a request after this server stops waiting and caches the answer, so the repeat is usually served from that cache. A changed call starts a new computation.',
+    },
   ],
 
   async handler(params, ctx) {

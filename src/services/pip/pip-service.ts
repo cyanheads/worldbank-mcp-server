@@ -24,10 +24,16 @@ import {
   validationError,
 } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
-import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
+import { defaultIsTransient, fetchWithTimeout } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
+import {
+  callDeadlineRemainingMs,
+  isCallDeadlineExceeded,
+  retryWithinCallDeadline,
+  withCallDeadline,
+} from '@/services/call-deadline.js';
 import { MAX_ESTIMATES_PER_PAGE } from '@/services/response-budget.js';
-import { sharedLoadContext, untilAborted } from '@/services/shared-load.js';
+import { awaitSharedLoad, sharedLoadContext } from '@/services/shared-load.js';
 import type {
   PipValidationBody,
   PovertyRow,
@@ -38,34 +44,60 @@ import type {
   RawPipVersion,
 } from './types.js';
 
-/** Minimal request-context shape that satisfies fetchWithTimeout and withRetry. */
+/** Minimal request-context shape that satisfies fetchWithTimeout. */
 type ReqCtx = Context & Record<string, unknown>;
 
 /**
- * Timeout for a single `/pip` request. PIP computes a query the first time it
- * sees it and serves the repeat from cache, so latency is bimodal: a warm query
- * answers in under a second, while a cold one routinely runs 15–60s and has
- * been measured near 90s. The 60s ceiling matches what the Indicators service
- * allows its own bulk fetches; a tighter one fails on queries that do complete.
+ * Timeout for one attempt of a PIP request. PIP computes a query the first time
+ * it sees it and serves the repeat from cache, so latency is bimodal: a warm
+ * query answers in under a second, while a cold one routinely runs 15–60 s, has
+ * measured 69.7 s for the full-history all-economy gap-filled query and 73 s for
+ * one economy-year, and has been seen near 90 s. No caller waits on an attempt —
+ * every request runs as a shared load that outlives the call deadline — so the
+ * attempt is sized to that cold tail rather than to a client.
  */
-const REQUEST_TIMEOUT_MS = 60_000;
+const REQUEST_TIMEOUT_MS = 90_000;
 
 /**
- * Bound on a reference load shared by concurrent queries, which runs under no
- * caller's signal: both attempts `fetchJson` makes, with room for the backoff
- * between them.
+ * Bound on a shared load, which runs under no caller's signal: both attempts
+ * `fetchJson` can make, with room for the backoff between them.
  */
-const REFERENCE_LOAD_TIMEOUT_MS = 2 * REQUEST_TIMEOUT_MS + 5_000;
+const SHARED_LOAD_TIMEOUT_MS = 2 * REQUEST_TIMEOUT_MS + 5_000;
+
+/**
+ * How long a completed `/pip` or `/pip-grp` response is held, so the same call
+ * repeated after its deadline ran out is answered from the request it left
+ * running. PIP itself keeps nothing for a query whose client went away, so
+ * without the hold that repeat would start the computation over.
+ */
+const HELD_RESPONSE_TTL_MS = 5 * 60_000;
+
+/**
+ * Most completed `/pip` and `/pip-grp` responses held at once. One call makes at
+ * most seven: two passes, the all-economy pass of the model-estimate path, and
+ * one request per aggregate grouping. A held response costs what its parsed rows
+ * cost — 6.9 MB of heap for the largest PIP serves, the full-history all-economy
+ * gap-filled pass, 1.8 MB for its survey twin, a few KB for a single economy —
+ * so eight bound the hold near 55 MB at worst.
+ */
+const MAX_HELD_RESPONSES = 8;
 
 /**
  * How long a single year waits on the gap-filled pass once the survey pass has
  * answered every requested economy. Those survey rows already hold every
- * economy, and only a grain no survey covers can still be missing, so a cold
- * gap-filled query is abandoned for the survey rows and the degrade notice
- * rather than held through its 60s attempt and retry, which outlasts a client
- * that gives a call 60s.
+ * economy, and only a grain no survey covers can still be missing, so the call
+ * stops waiting on a cold gap-filled query and answers from the survey rows with
+ * the degrade notice. The request runs on and is held, so the same call repeated
+ * once it lands includes it.
  */
 const GAP_FILL_GRACE_MS = 10_000;
+
+/**
+ * Time the grace leaves on the call deadline at the latest: a survey row that
+ * lands late still has this long to reach the caller, rather than the deadline
+ * failing a call the survey rows could answer.
+ */
+const GAP_FILL_DEADLINE_RESERVE_MS = 1_000;
 
 /**
  * Bytes of a non-2xx body captured into the error, raised from the framework's
@@ -500,12 +532,55 @@ function isSingleYear(year: string | undefined): boolean {
 }
 
 /**
- * The settled gap-filled pass, or a `Timeout` rejection when {@link GAP_FILL_GRACE_MS}
- * passes first, with `abandon` aborted so the request stops.
+ * Whether a shared load failed by running out of its own bound — an attempt's
+ * {@link REQUEST_TIMEOUT_MS}, or {@link SHARED_LOAD_TIMEOUT_MS} firing on the
+ * load's signal mid-attempt or mid-backoff.
+ */
+function ranOutOfOwnBound(error: unknown): boolean {
+  if (error instanceof DOMException) return error.name === 'TimeoutError';
+  const source = error instanceof McpError ? error.data?.errorSource : undefined;
+  return source === 'FetchTimeout' || source === 'FetchSignalTimeout';
+}
+
+/**
+ * A shared PIP request that ran out of its own bound, as a caller waiting on it
+ * sees it: a caller that joined the request late, as the repeat of a call that
+ * ran out of its deadline does, can outlive it. PIP keeps nothing for a query it
+ * did not finish, so a repeat starts over.
+ */
+function requestRanOut(cause: unknown): McpError {
+  return timeout(
+    `PIP did not finish the request within the ${REQUEST_TIMEOUT_MS / 1000} s this server gives it.`,
+    {
+      reason: 'upstream_timeout',
+      retryable: true,
+      recovery: {
+        hint: 'PIP keeps nothing for a request it did not finish, so the same call starts it over: narrow it to fewer economies or years, or repeat it later.',
+      },
+    },
+    { cause },
+  );
+}
+
+/**
+ * How long the gap-filled pass gets once the survey rows are in: the grace, cut
+ * to end {@link GAP_FILL_DEADLINE_RESERVE_MS} before the call deadline.
+ */
+function gapFillGraceMs(ctx: Context): number {
+  const leftMs = callDeadlineRemainingMs(ctx);
+  return leftMs === undefined
+    ? GAP_FILL_GRACE_MS
+    : Math.max(0, Math.min(GAP_FILL_GRACE_MS, leftMs - GAP_FILL_DEADLINE_RESERVE_MS));
+}
+
+/**
+ * The settled gap-filled pass, or a `Timeout` rejection when `graceMs` passes
+ * first, with `abandon` aborted so the caller stops waiting on the request.
  */
 async function withinGapFillGrace(
   pass: Promise<PromiseSettledResult<PovertyRow[]>>,
   abandon: AbortController,
+  graceMs: number,
 ): Promise<PromiseSettledResult<PovertyRow[]>> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const expired = new Promise<PromiseRejectedResult>((resolve) => {
@@ -514,10 +589,10 @@ async function withinGapFillGrace(
       resolve({
         status: 'rejected',
         reason: timeout(
-          `PIP gap-filled estimates did not arrive within ${GAP_FILL_GRACE_MS / 1000}s of the survey rows.`,
+          `PIP gap-filled estimates did not arrive within ${graceMs} ms of the survey rows.`,
         ),
       });
-    }, GAP_FILL_GRACE_MS);
+    }, graceMs);
   });
   try {
     return await Promise.race([pass, expired]);
@@ -548,6 +623,67 @@ function compareRows(a: PovertyRow, b: PovertyRow): number {
     (a.reportingLevel ?? '').localeCompare(b.reportingLevel ?? '') ||
     (a.welfareType ?? '').localeCompare(b.welfareType ?? '')
   );
+}
+
+// ─── Shared loads ────────────────────────────────────────────────────────────
+
+/** A load in flight, or one that completed and is held until `heldUntil`. */
+type SharedEntry = { load: Promise<unknown>; heldUntil?: number };
+
+/**
+ * Loads shared by key. Every caller that asks for a key while its load is in
+ * flight waits on that one load, and a load that completes is held for `holdMs`
+ * so a repeat is answered from it; a failed load is dropped at once, so the next
+ * caller asks again. At most `maxHeld` completed loads are held: completing one
+ * more drops the expired ones, then the one that completed earliest. Loads in
+ * flight are not counted — each runs under a bound of its own.
+ */
+class SharedLoads {
+  private readonly entries = new Map<string, SharedEntry>();
+  private readonly holdMs: number;
+  private readonly maxHeld: number;
+
+  constructor(policy: { holdMs: number; maxHeld: number }) {
+    this.holdMs = policy.holdMs;
+    this.maxHeld = policy.maxHeld;
+  }
+
+  /** The load for `key`: the one in flight, the one held, or one `begin` starts now. */
+  get(key: string, begin: () => Promise<unknown>): Promise<unknown> {
+    const existing = this.entries.get(key);
+    if (existing && (existing.heldUntil === undefined || Date.now() < existing.heldUntil)) {
+      return existing.load;
+    }
+    const entry: SharedEntry = { load: begin() };
+    this.entries.set(key, entry);
+    entry.load.then(
+      () => this.hold(key, entry),
+      () => {
+        if (this.entries.get(key) === entry) this.entries.delete(key);
+      },
+    );
+    return entry.load;
+  }
+
+  private hold(key: string, entry: SharedEntry): void {
+    if (this.entries.get(key) !== entry) return;
+    // Re-inserted, so the map's order among held entries is completion order.
+    this.entries.delete(key);
+    if (this.holdMs <= 0) return;
+    const now = Date.now();
+    entry.heldUntil = now + this.holdMs;
+    this.entries.set(key, entry);
+
+    let held = 0;
+    for (const other of this.entries.values()) if (other.heldUntil !== undefined) held++;
+    for (const [otherKey, other] of this.entries) {
+      if (other.heldUntil === undefined) continue;
+      if (other.heldUntil <= now || held > this.maxHeld) {
+        this.entries.delete(otherKey);
+        held--;
+      }
+    }
+  }
 }
 
 // ─── Service ─────────────────────────────────────────────────────────────────
@@ -590,23 +726,29 @@ type ResolvedVersion = { pppVersion: string; releaseVersion: string; version: st
 
 export class PipService {
   private readonly baseUrl: string;
-  private readonly referenceCacheTtlMs: number;
 
   /**
-   * Reference listings — `/versions` and the two `/aux` tables — keyed by what
-   * was fetched and cached as promises, so concurrent queries share one
-   * request. Held on the instance, like the Indicators service's reference
-   * caches, so tests and multiple instances stay isolated.
+   * Reference listings — `/versions` and the two `/aux` tables — shared by
+   * concurrent queries and held for the catalog TTL (0 holds nothing past the
+   * load). A handful of keys — one economy list per release vintage asked
+   * for — so no count bound. Held on the instance, like the Indicators
+   * service's reference caches, so tests and multiple instances stay isolated.
    */
-  private readonly referenceCache = new Map<
-    string,
-    { expiresAt: number; listing: Promise<unknown[]> }
-  >();
+  private readonly references: SharedLoads;
+
+  /** `/pip` and `/pip-grp` responses, keyed by URL. */
+  private readonly responses = new SharedLoads({
+    holdMs: HELD_RESPONSE_TTL_MS,
+    maxHeld: MAX_HELD_RESPONSES,
+  });
 
   constructor(_config: AppConfig, _storage: StorageService) {
     const serverConfig = getServerConfig();
     this.baseUrl = serverConfig.pipBaseUrl.replace(/\/$/, '');
-    this.referenceCacheTtlMs = serverConfig.catalogCacheTtlMs;
+    this.references = new SharedLoads({
+      holdMs: serverConfig.catalogCacheTtlMs,
+      maxHeld: Number.POSITIVE_INFINITY,
+    });
   }
 
   private buildUrl(path: string, params: Record<string, string | number | undefined>): string {
@@ -617,26 +759,23 @@ export class PipService {
     return `${this.baseUrl}${path}?${qs.toString()}`;
   }
 
-  /** Fetch and parse one PIP response, with non-2xx statuses translated by `classify`. */
-  private fetchJson(
-    url: string,
-    ctx: Context,
-    classify: (error: McpError) => McpError,
-  ): Promise<unknown> {
-    return withRetry(
-      async () => {
-        let text: string;
-        try {
-          const response = await fetchWithTimeout(url, REQUEST_TIMEOUT_MS, ctx as ReqCtx, {
-            signal: ctx.signal,
-            expectedStatuses: [404],
-            errorBodyLimit: ERROR_BODY_LIMIT,
-          });
-          text = await response.text();
-        } catch (error) {
-          if (error instanceof McpError) throw classify(error);
-          throw error;
-        }
+  /**
+   * Fetch and parse one PIP response under a shared load's context, which
+   * carries no call deadline, so each attempt gets {@link REQUEST_TIMEOUT_MS}. A
+   * non-2xx status arrives as the framework's status-mapped error; callers
+   * classify it ({@link classifyPipError}) once their wait ends.
+   */
+  private fetchJson(url: string, ctx: Context): Promise<unknown> {
+    return retryWithinCallDeadline(
+      ctx,
+      'pip',
+      async ({ signal, timeoutMs }) => {
+        const response = await fetchWithTimeout(url, timeoutMs, ctx as ReqCtx, {
+          signal,
+          expectedStatuses: [404],
+          errorBodyLimit: ERROR_BODY_LIMIT,
+        });
+        const text = await response.text();
 
         // Same Cloudflare front as the Indicators API, same HTML-on-gateway-error mode.
         if (/^\s*<(!DOCTYPE\s+html|html[\s>])/i.test(text)) {
@@ -656,27 +795,63 @@ export class PipService {
         }
       },
       {
-        operation: 'PipService.fetchJson',
-        context: ctx as ReqCtx,
+        attemptTimeoutMs: REQUEST_TIMEOUT_MS,
         baseDelayMs: 1000,
         /**
-         * One retry, not the framework default of three. It earns its place on
-         * a timeout: the attempt that timed out leaves the query warm in PIP's
-         * cache, and the retry usually answers at once. PIP has answered some
-         * query shapes with a 500 on every attempt, and further attempts would
-         * only add delay to those.
+         * One retry, not the framework default of three, and none after an
+         * attempt that ran out its own timeout. PIP keeps nothing for a query
+         * whose client went away — an abandoned query asked again minutes later
+         * computes from scratch — so a retry after a timeout would only start
+         * the same cold computation over. A 5xx or a network error returns early
+         * and gets its one retry; PIP has answered some query shapes with a 500
+         * on every attempt, and further attempts would only add delay to those.
          */
         maxRetries: 1,
-        signal: ctx.signal,
+        isTransient: (error) =>
+          defaultIsTransient(error) &&
+          !(error instanceof McpError && error.data?.errorSource === 'FetchTimeout'),
       },
     );
   }
 
   /**
-   * Fetch one `/pip` or `/pip-grp` response, mapping PIP's status codes to
-   * domain errors. An error names `reported` — the codes sent, unless the
-   * request stands in for others, as `all` does when read for the economies
-   * PIP publishes only as model estimates.
+   * A PIP response that must be a JSON array, loaded once per `key` through
+   * `loads` and awaited by the caller until it settles, the caller cancels, or
+   * the call deadline passes. The load runs under a signal of its own
+   * ({@link sharedLoadContext}), never the starting caller's, so one caller
+   * cancelling or running out of time fails that caller alone: the load carries
+   * on for every other caller waiting on it, and completes for `loads` to hold.
+   * A load that runs out of its own bound reaches its callers as
+   * {@link requestRanOut}.
+   */
+  private async loadArray(
+    loads: SharedLoads,
+    key: string,
+    url: string,
+    notArray: string,
+    ctx: Context,
+  ): Promise<unknown[]> {
+    const load = loads.get(key, async () => {
+      ctx.log.debug('Fetching from PIP', { url });
+      const parsed = await this.fetchJson(url, sharedLoadContext(ctx, SHARED_LOAD_TIMEOUT_MS));
+      if (!Array.isArray(parsed)) throw serializationError(notArray, { url });
+      return parsed;
+    });
+    try {
+      return await awaitSharedLoad(load as Promise<unknown[]>, ctx, 'pip');
+    } catch (error) {
+      throw !ctx.signal.aborted && ranOutOfOwnBound(error) ? requestRanOut(error) : error;
+    }
+  }
+
+  /**
+   * Fetch one `/pip` or `/pip-grp` response, keyed by its URL, so identical
+   * requests in flight together make one, and a repeat inside
+   * {@link HELD_RESPONSE_TTL_MS} makes none. PIP's status codes map to domain
+   * errors per caller, naming `reported` — the codes sent, unless the request
+   * stands in for others, as `all` does when read for the economies PIP
+   * publishes only as model estimates — so callers sharing that request each
+   * see their own codes.
    */
   private async fetchRows<T>(
     path: '/pip' | '/pip-grp',
@@ -686,16 +861,17 @@ export class PipService {
     reported: readonly string[] = codes,
   ): Promise<T[]> {
     const url = this.buildUrl(path, { country: codes.join(','), ...params });
-    ctx.log.debug('Fetching PIP estimates', { url });
-
-    const parsed = await this.fetchJson(url, ctx, (error) => classifyPipError(error, reported));
-    if (!Array.isArray(parsed)) {
-      throw serializationError(
+    try {
+      return (await this.loadArray(
+        this.responses,
+        url,
+        url,
         'PIP returned a response that is not the expected array of estimate rows.',
-        { url },
-      );
+        ctx,
+      )) as T[];
+    } catch (error) {
+      throw error instanceof McpError ? classifyPipError(error, reported) : error;
     }
-    return parsed as T[];
   }
 
   /** Fetch one `/pip` pass for `codes`, survey-only or gap-filled; an error names `reported`. */
@@ -717,37 +893,18 @@ export class PipService {
   }
 
   /**
-   * Load a reference listing, from cache while it is fresh. A TTL of 0 disables
-   * retention; a failed load is never served from cache to the next query.
-   *
-   * The load is shared by every query waiting on it, so it runs under a signal
-   * of its own ({@link sharedLoadContext}) rather than the first caller's, and
-   * each caller waits on it only until its own signal aborts. One caller
-   * cancelling fails that caller alone, and a load every caller abandoned still
-   * completes and caches for the next query.
+   * Load a reference listing, held while it is fresh. A TTL of 0 holds nothing
+   * past the load; a failed load is never served to the next query, and a load
+   * every caller abandoned still completes and is held for the next one.
    */
-  private loadReference<T>(key: string, url: string, ctx: Context): Promise<T[]> {
-    const cached = this.referenceCache.get(key);
-    if (cached && cached.expiresAt > Date.now()) {
-      return untilAborted(cached.listing as Promise<T[]>, ctx.signal);
-    }
-
-    ctx.log.debug('Fetching PIP reference listing', { url });
-    const shared = sharedLoadContext(ctx, REFERENCE_LOAD_TIMEOUT_MS);
-    const listing = this.fetchJson(url, shared, (error) => error).then((parsed) => {
-      if (!Array.isArray(parsed)) {
-        throw serializationError('PIP returned a reference listing that is not an array.', {
-          url,
-        });
-      }
-      return parsed as T[];
-    });
-
-    this.referenceCache.set(key, { listing, expiresAt: Date.now() + this.referenceCacheTtlMs });
-    listing.catch(() => {
-      if (this.referenceCache.get(key)?.listing === listing) this.referenceCache.delete(key);
-    });
-    return untilAborted(listing, ctx.signal);
+  private async loadReference<T>(key: string, url: string, ctx: Context): Promise<T[]> {
+    return (await this.loadArray(
+      this.references,
+      key,
+      url,
+      'PIP returned a reference listing that is not an array.',
+      ctx,
+    )) as T[];
   }
 
   /** The `/versions` listing: every data release × PPP vintage. */
@@ -765,6 +922,8 @@ export class PipService {
    * the query: every code then goes to `/pip`, as it did before aggregates were
    * routed, so an economy still answers and an aggregate meets `/pip`'s own
    * 500. The failure is logged and not cached, so the next query asks again.
+   * The caller cancelling or the call deadline passing while the table loads is
+   * the call's end, not the table's failure, and is thrown as it is.
    */
   private async loadRegions(ctx: Context): Promise<Map<string, string>> {
     const url = this.buildUrl('/aux', { table: 'regions', format: 'json' });
@@ -772,7 +931,7 @@ export class PipService {
     try {
       regions = await this.loadReference<RawPipRegion>('regions', url, ctx);
     } catch (error) {
-      if (ctx.signal.aborted) throw error;
+      if (ctx.signal.aborted || isCallDeadlineExceeded(error)) throw error;
       ctx.log.warning('PIP regions table unavailable; routing every code to /pip', {
         error: error instanceof Error ? error.message : String(error),
       });
@@ -873,16 +1032,17 @@ export class PipService {
    * publishes one — so no economy comes back at two different years.
    *
    * The gap-filled pass takes nothing from the survey pass, so the two run at
-   * once, and the gap-filled request is abandoned as soon as the survey request
-   * fails. When the gap-filled pass fails on its own — any upstream error,
-   * including one still out {@link GAP_FILL_GRACE_MS} after the survey rows
-   * arrive — a single year whose every requested economy answered the survey
-   * pass is still answered from the survey rows and flagged
-   * `gapFillUnavailable`: those rows hold every economy, only a grain no survey
-   * covers can be missing, and the survey request already accepted the same
-   * parameters, so the failure is PIP's rather than the caller's. Every other
-   * shape relies on the gap-filled pass for whole economies or years, so its
-   * failure fails the call, as does the caller's cancellation.
+   * once, and the call stops waiting on the gap-filled request as soon as the
+   * survey request fails; the request itself runs on as a shared load. When the
+   * gap-filled pass fails on its own — any upstream error, including one still
+   * out {@link GAP_FILL_GRACE_MS} after the survey rows arrive, or within
+   * {@link GAP_FILL_DEADLINE_RESERVE_MS} of the call deadline — a single year
+   * whose every requested economy answered the survey pass is still answered
+   * from the survey rows and flagged `gapFillUnavailable`: those rows hold every
+   * economy, only a grain no survey covers can be missing, and the survey request
+   * already accepted the same parameters, so the failure is PIP's rather than the
+   * caller's. Every other shape relies on the gap-filled pass for whole economies
+   * or years, so its failure fails the call, as does the caller's cancellation.
    */
   private async surveyFirst(
     codes: readonly string[],
@@ -915,7 +1075,7 @@ export class PipService {
     const surveyCoversEveryEconomy =
       isSingleYear(filters.year) && codes.every((code) => answered.has(code));
     const filledResult = surveyCoversEveryEconomy
-      ? await withinGapFillGrace(filledPass, abandon)
+      ? await withinGapFillGrace(filledPass, abandon, gapFillGraceMs(ctx))
       : await filledPass;
 
     if (filledResult.status === 'rejected') {
@@ -1038,6 +1198,11 @@ export class PipService {
    * Every request carries the same fully-qualified `version`, resolved once up
    * front, so survey rows, the estimates filled around them, and the aggregates
    * always come from one release at one PPP vintage.
+   *
+   * Every wait the call makes spends one call deadline ({@link withCallDeadline}),
+   * the one `ctx` already carries when the tool started it. Its expiry is the
+   * typed `upstream_timeout`; the requests themselves run on and are held, so the
+   * same call repeated is answered from them.
    */
   async getPoverty(
     opts: {
@@ -1075,6 +1240,7 @@ export class PipService {
     pppVersion: string;
     releaseVersion: string;
   }> {
+    ctx = withCallDeadline(ctx);
     const { countries, year, povertyLine, welfareType, reportingLevel, fillGaps, page, perPage } =
       opts;
 

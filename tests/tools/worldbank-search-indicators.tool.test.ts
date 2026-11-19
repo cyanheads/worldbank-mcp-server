@@ -88,7 +88,7 @@ describe('worldbankSearchIndicators', () => {
   it('sets enrichment notice on empty results', async () => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
     vi.mocked(getWorldBankApiService).mockReturnValue({
-      searchIndicators: vi.fn().mockResolvedValue({ indicators: [], total: 0, page: 1, pages: 0 }),
+      searchIndicators: vi.fn().mockResolvedValue({ indicators: [], total: 0, page: 1, pages: 1 }),
     } as never);
 
     const { worldbankSearchIndicators } = await import(
@@ -168,6 +168,7 @@ describe('worldbankSearchIndicators', () => {
       'missing_filter',
       'invalid_filter',
       'empty_query',
+      'upstream_timeout',
     ]);
   });
 
@@ -639,7 +640,7 @@ describe('worldbankSearchIndicators', () => {
   it('sets non-query empty-results notice when only topic filter used', async () => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
     vi.mocked(getWorldBankApiService).mockReturnValue({
-      searchIndicators: vi.fn().mockResolvedValue({ indicators: [], total: 0, page: 1, pages: 0 }),
+      searchIndicators: vi.fn().mockResolvedValue({ indicators: [], total: 0, page: 1, pages: 1 }),
     } as never);
 
     const { worldbankSearchIndicators } = await import(
@@ -738,7 +739,7 @@ describe('worldbankSearchIndicators', () => {
     expect(text).not.toContain('x'.repeat(151));
   });
 
-  it('describes sourceNote as an excerpt and points at worldbank_get_indicator for the whole note', async () => {
+  it('describes sourceNote as an excerpt, once, on the field, and points at worldbank_get_indicator for the whole note', async () => {
     const { worldbankSearchIndicators } = await import(
       '@/mcp-server/tools/definitions/worldbank-search-indicators.tool.js'
     );
@@ -749,7 +750,7 @@ describe('worldbankSearchIndicators', () => {
     ).element.shape;
     expect(item.sourceNote?.description).toMatch(/150 characters/);
     expect(item.sourceNote?.description).toMatch(/worldbank_get_indicator/);
-    expect(worldbankSearchIndicators.description).toMatch(/150 characters/);
+    expect(worldbankSearchIndicators.description).not.toMatch(/150 characters/);
   });
 
   // ─── Format edge cases ────────────────────────────────────────────────────

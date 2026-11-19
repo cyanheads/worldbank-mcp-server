@@ -17,12 +17,24 @@ import ngaCapture from './fixtures/nga.json' with { type: 'json' };
 
 // ─── fetchWithTimeout mock ────────────────────────────────────────────────────
 // Hoisted so the mock is in place before the service module resolves the dep.
-// The framework's transient classification stays real.
+// The framework's transient classification stays real. `withRetry` makes one
+// attempt, handed the signal and remaining budget the real one would hand it.
 vi.mock('@cyanheads/mcp-ts-core/utils', async (importOriginal) => ({
   defaultIsTransient: (await importOriginal<typeof import('@cyanheads/mcp-ts-core/utils')>())
     .defaultIsTransient,
   fetchWithTimeout: vi.fn(),
-  withRetry: vi.fn().mockImplementation((fn: () => unknown) => fn()),
+  withRetry: vi
+    .fn()
+    .mockImplementation(
+      (
+        fn: (attempt: { signal: AbortSignal; remainingMs: number }) => unknown,
+        opts?: { signal?: AbortSignal; deadlineMs?: number },
+      ) =>
+        fn({
+          signal: opts?.signal ?? new AbortController().signal,
+          remainingMs: opts?.deadlineMs ?? Number.POSITIVE_INFINITY,
+        }),
+    ),
 }));
 
 vi.mock('@/config/server-config.js', () => ({
@@ -668,7 +680,8 @@ describe('PipService', () => {
 
   describe('once the survey pass has answered every economy of a single year', () => {
     beforeEach(() => {
-      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      // Date too: the call deadline is an instant, read against the clock.
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
     });
     afterEach(() => {
       vi.useRealTimers();
@@ -697,7 +710,7 @@ describe('PipService', () => {
       return { held, request, settled: () => settled };
     }
 
-    it('answers from the survey rows 10 s later when the gap-filled pass is still out, abandoning it', async () => {
+    it('answers from the survey rows 10 s later when the gap-filled pass is still out, leaving that request running for a repeat', async () => {
       const { held, request, settled } = await surveyAnswered('1990');
 
       await vi.advanceTimersByTimeAsync(9_999);
@@ -711,7 +724,17 @@ describe('PipService', () => {
         gapFilled: false,
         gapFillUnavailable: true,
       });
-      expect(held[1]?.signal.aborted).toBe(true);
+      expect(held[1]?.signal.aborted).toBe(false);
+
+      // The request lands after the call returned; the same call repeated includes it.
+      held[1]?.answer([gapFilledRow('BOL', 1990, { estimation_type: 'extrapolation' })]);
+      await drainMicrotasks();
+      const repeat = await service.getPoverty(
+        { ...baseOpts, countries: ['BOL'], year: '1990' },
+        createMockContext(),
+      );
+      expect(repeat).toMatchObject({ total: 2, gapFilled: true, gapFillUnavailable: false });
+      expect(held).toHaveLength(2);
     });
 
     it('merges a gap-filled answer that lands inside those 10 s', async () => {
@@ -725,12 +748,14 @@ describe('PipService', () => {
         gapFilled: true,
         gapFillUnavailable: false,
       });
+      // The grace that never ran out is cleared, as are the call's deadline waits.
+      expect(vi.getTimerCount()).toBe(0);
     });
 
-    it('keeps waiting on a shape that needs the gap-filled rows', async () => {
+    it('keeps waiting, up to the call deadline, on a shape that needs the gap-filled rows', async () => {
       const { held, request, settled } = await surveyAnswered('all');
 
-      await vi.advanceTimersByTimeAsync(120_000);
+      await vi.advanceTimersByTimeAsync(49_999);
       expect(settled()).toBe(false);
       held[1]?.answer([gapFilledRow('BOL', 1991, { estimation_type: 'interpolation' })]);
 
@@ -739,6 +764,60 @@ describe('PipService', () => {
         gapFilled: true,
         gapFillUnavailable: false,
       });
+    });
+
+    it('fails a shape that needs the gap-filled rows at the call deadline, never on the survey rows alone', async () => {
+      const { held, request, settled } = await surveyAnswered('all');
+
+      await vi.advanceTimersByTimeAsync(49_999);
+      expect(settled()).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+
+      await expect(request).rejects.toMatchObject({
+        code: JsonRpcErrorCode.Timeout,
+        data: { reason: 'upstream_timeout', budgetMs: 50_000, retryable: true },
+      });
+      expect(held[1]?.signal.aborted).toBe(false);
+    });
+
+    /** A ctx whose call deadline has `leftMs` to run, as a tool handler that spent the rest would pass. */
+    async function ctxWithDeadlineLeft(leftMs: number) {
+      const { withCallDeadline, CALL_DEADLINE_MS } = await import('@/services/call-deadline.js');
+      const ctx = withCallDeadline(createMockContext());
+      vi.setSystemTime(Date.now() + CALL_DEADLINE_MS - leftMs);
+      return ctx;
+    }
+
+    it('ends the grace a second before the call deadline when the survey rows land late', async () => {
+      const { held, started } = await holdPipRequests();
+      const ctx = await ctxWithDeadlineLeft(5_000);
+      let settled = false;
+      const request = service.getPoverty({ ...baseOpts, countries: ['BOL'], year: '1990' }, ctx);
+      void request.finally(() => {
+        settled = true;
+      });
+      await started;
+      await drainMicrotasks();
+      held[0]?.answer([surveyRow('BOL', 1990, { reporting_level: 'urban' })]);
+      await drainMicrotasks();
+
+      // 4 s of grace, not 10: the survey rows reach the caller before the deadline.
+      await vi.advanceTimersByTimeAsync(3_999);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(request).resolves.toMatchObject({ total: 1, gapFillUnavailable: true });
+    });
+
+    it('answers at once from the survey rows when they land inside the last second', async () => {
+      const { held, started } = await holdPipRequests();
+      const ctx = await ctxWithDeadlineLeft(800);
+      const request = service.getPoverty({ ...baseOpts, countries: ['BOL'], year: '1990' }, ctx);
+      await started;
+      await drainMicrotasks();
+      held[0]?.answer([surveyRow('BOL', 1990, { reporting_level: 'urban' })]);
+
+      await vi.advanceTimersByTimeAsync(0);
+      await expect(request).resolves.toMatchObject({ total: 1, gapFillUnavailable: true });
     });
   });
 
@@ -817,35 +896,41 @@ describe('PipService', () => {
     await drainMicrotasks();
     held[0]?.answer([surveyRow('BOL', 1990, { reporting_level: 'urban' })]);
     await drainMicrotasks();
-    cancelled.abort();
+    cancelled.abort(new Error('caller went away'));
 
     const outcome = await request.then(
       (value) => ({ settled: 'resolved', value }),
       (error: unknown) => ({ settled: 'rejected', error }),
     );
-    expect(outcome).toMatchObject({
-      settled: 'rejected',
-      error: { code: JsonRpcErrorCode.RequestCancelled, message: 'PIP estimates was aborted.' },
-    });
-    expect(outcome).not.toHaveProperty('value');
+    expect(outcome).toEqual({ settled: 'rejected', error: cancelled.signal.reason });
+    // Only the caller's wait ends: the shared request runs on.
+    expect(held[1]?.signal.aborted).toBe(false);
   });
 
-  it('fails with the survey error and abandons the gap-filled request still in flight', async () => {
-    const { held, started } = await holdPipRequests();
-    const ctx = createMockContext();
-    const request = service.getPoverty({ ...baseOpts, countries: ['BOL'], year: '1990' }, ctx);
-    await started;
-    await drainMicrotasks();
-    const [survey, filled] = held;
+  it('fails with the survey error and stops waiting on the gap-filled request, which runs on', async () => {
+    // The call's wait on each pass arms a call-deadline timer; a wait still pending keeps one.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    try {
+      const { held, started } = await holdPipRequests();
+      const ctx = createMockContext();
+      const request = service.getPoverty({ ...baseOpts, countries: ['BOL'], year: '1990' }, ctx);
+      await started;
+      await drainMicrotasks();
+      const [survey, filled] = held;
 
-    const { serviceUnavailable } = await import('@cyanheads/mcp-ts-core/errors');
-    survey?.fail(serviceUnavailable('Fetch failed with status 502.', { status: 502 }));
+      const { serviceUnavailable } = await import('@cyanheads/mcp-ts-core/errors');
+      survey?.fail(serviceUnavailable('Fetch failed with status 502.', { status: 502 }));
 
-    await expect(request).rejects.toMatchObject({
-      data: { reason: 'upstream_unavailable', status: 502 },
-    });
-    expect(filled?.signal.aborted).toBe(true);
-    expect(ctx.signal.aborted).toBe(false);
+      await expect(request).rejects.toMatchObject({
+        data: { reason: 'upstream_unavailable', status: 502 },
+      });
+      await drainMicrotasks();
+      expect(vi.getTimerCount()).toBe(0);
+      expect(filled?.signal.aborted).toBe(false);
+      expect(ctx.signal.aborted).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   // ─── Gap-filled rows ──────────────────────────────────────────────────────
@@ -1412,6 +1497,312 @@ describe('PipService', () => {
     expect(pipCalls()).toHaveLength(0);
     expect(groupCalls()).toHaveLength(0);
   });
+
+  /**
+   * A caller that joined the regions-table load late can see the load run out of
+   * its own bound while its call deadline is still running: the table failed to
+   * load, so the query degrades rather than ending.
+   */
+  it('degrades when the regions-table load runs out of its own bound before the call deadline', async () => {
+    const { timeout } = await import('@cyanheads/mcp-ts-core/errors');
+    const serve = fetchWithTimeoutMock.getMockImplementation() as (...args: unknown[]) => unknown;
+    fetchWithTimeoutMock.mockImplementation(async (url: string, ...rest: unknown[]) => {
+      if (url.includes('/aux?table=regions')) {
+        throw timeout('Fetch timed out.', { errorSource: 'FetchTimeout' });
+      }
+      return serve(url, ...rest);
+    });
+    mockRows([surveyRow('USA', 2022)]);
+    mockRows([gapFilledRow('USA', 2022)]);
+
+    await expect(service.getPoverty(baseOpts, createMockContext())).resolves.toMatchObject({
+      total: 1,
+    });
+    expect(pipCalls()).toHaveLength(2);
+  });
+
+  // ─── Shared, held PIP requests ────────────────────────────────────────────
+
+  /** The `country` each `/pip` request asked for, in order. */
+  const pipCountries = () => pipCalls().map((url) => new URL(url).searchParams.get('country'));
+
+  it('makes one request per pass for two identical calls in flight', async () => {
+    const { held, started } = await holdPipRequests();
+    const opts = { ...baseOpts, countries: ['BOL'], year: '1990' };
+    const first = service.getPoverty(opts, createMockContext());
+    const second = service.getPoverty(opts, createMockContext());
+    await started;
+    await drainMicrotasks();
+
+    expect(held.map(({ url }) => new URL(url).searchParams.get('fill_gaps'))).toEqual([
+      'false',
+      'true',
+    ]);
+    held[0]?.answer([surveyRow('BOL', 1990, { reporting_level: 'urban' })]);
+    held[1]?.answer([gapFilledRow('BOL', 1990, { estimation_type: 'extrapolation' })]);
+    const [a, b] = await Promise.all([first, second]);
+    expect(a).toMatchObject({ total: 2, gapFilled: true });
+    expect(b).toEqual(a);
+  });
+
+  it('answers a repeat of a completed call from its held passes, with no new request', async () => {
+    mockRows([surveyRow('USA', 2022)]);
+    mockRows([gapFilledRow('USA', 2021)]);
+    const first = await service.getPoverty({ ...baseOpts, year: 'all' }, createMockContext());
+    const repeat = await service.getPoverty({ ...baseOpts, year: 'all' }, createMockContext());
+
+    expect(pipCalls()).toHaveLength(2);
+    expect(first).toMatchObject({ total: 2, gapFilled: true });
+    expect(repeat).toEqual(first);
+  });
+
+  it('never holds a failed pass, so a repeat asks again', async () => {
+    await mockHttpError(503, '{"error":["Service Unavailable"]}');
+    mockRows([surveyRow('USA', 2022)]);
+    const opts = { ...baseOpts, fillGaps: false };
+
+    await expect(service.getPoverty(opts, createMockContext())).rejects.toMatchObject({
+      data: { reason: 'upstream_unavailable', status: 503 },
+    });
+    await expect(service.getPoverty(opts, createMockContext())).resolves.toMatchObject({
+      total: 1,
+    });
+    expect(pipCalls()).toHaveLength(2);
+  });
+
+  it('holds a completed pass for five minutes, then asks again', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      mockRows([surveyRow('USA', 2022)]);
+      mockRows([surveyRow('USA', 2022, { headcount: 0.02 })]);
+      const opts = { ...baseOpts, fillGaps: false };
+      const start = Date.now();
+
+      await service.getPoverty(opts, createMockContext());
+      vi.setSystemTime(start + 299_999);
+      await service.getPoverty(opts, createMockContext());
+      expect(pipCalls()).toHaveLength(1);
+
+      vi.setSystemTime(start + 300_000);
+      const fresh = await service.getPoverty(opts, createMockContext());
+      expect(pipCalls()).toHaveLength(2);
+      expect(fresh.rows[0]?.headcount).toBe(0.02);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('holds at most eight completed passes, dropping the one completed earliest', async () => {
+    const years = [2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009];
+    for (const year of years) mockRows([surveyRow('USA', year)]);
+    const yearOpts = (year: number) => ({ ...baseOpts, year: String(year), fillGaps: false });
+    for (const year of years) await service.getPoverty(yearOpts(year), createMockContext());
+    expect(pipCalls()).toHaveLength(9);
+
+    await service.getPoverty(yearOpts(2002), createMockContext());
+    await service.getPoverty(yearOpts(2009), createMockContext());
+    expect(pipCalls()).toHaveLength(9);
+
+    mockRows([surveyRow('USA', 2001)]);
+    await service.getPoverty(yearOpts(2001), createMockContext());
+    expect(pipCalls()).toHaveLength(10);
+    expect(new URL(pipCalls()[9] ?? '').searchParams.get('year')).toBe('2001');
+  });
+
+  it('counts a held pass from when it completed, not from when it started', async () => {
+    const serve = fetchWithTimeoutMock.getMockImplementation() as (
+      ...args: unknown[]
+    ) => Promise<unknown>;
+    const first = Promise.withResolvers<unknown>();
+    const firstEntered = Promise.withResolvers<void>();
+    fetchWithTimeoutMock.mockImplementation(async (url: string, ...rest: unknown[]) => {
+      if (!url.includes('/pip?') || new URL(url).searchParams.get('year') !== '2000') {
+        return serve(url, ...rest);
+      }
+      firstEntered.resolve();
+      return first.promise;
+    });
+    const yearOpts = (year: number) => ({ ...baseOpts, year: String(year), fillGaps: false });
+
+    // 2000 starts first and stays out while 2001–2008 complete.
+    const started = service.getPoverty(yearOpts(2000), createMockContext());
+    await firstEntered.promise;
+    const others = [2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008];
+    for (const year of others) mockRows([surveyRow('USA', year)]);
+    for (const year of others) await service.getPoverty(yearOpts(year), createMockContext());
+
+    first.resolve({ text: async () => JSON.stringify([surveyRow('USA', 2000)]) });
+    await started;
+    mockRows([surveyRow('USA', 2009)]);
+    await service.getPoverty(yearOpts(2009), createMockContext());
+    expect(pipCalls()).toHaveLength(10);
+
+    // 2000 completed ninth of ten, so it is still held; 2001 completed first and was dropped.
+    await service.getPoverty(yearOpts(2000), createMockContext());
+    expect(pipCalls()).toHaveLength(10);
+    mockRows([surveyRow('USA', 2001)]);
+    await service.getPoverty(yearOpts(2001), createMockContext());
+    expect(pipCalls()).toHaveLength(11);
+    expect(new URL(pipCalls()[10] ?? '').searchParams.get('year')).toBe('2001');
+  });
+
+  /**
+   * The load's bound is an `AbortSignal.timeout`, which runs on the real clock out
+   * of fake timers' reach, so it is read where the load sets it: room for both
+   * 90 s attempts and the backoff between them.
+   */
+  it('bounds a shared /pip request at its two 90 s attempts plus 5 s', async () => {
+    const bound = vi.spyOn(AbortSignal, 'timeout');
+    try {
+      mockRows([surveyRow('USA', 2022)]);
+      await service.getPoverty({ ...baseOpts, fillGaps: false }, createMockContext());
+
+      const [, attemptMs, , options] =
+        fetchWithTimeoutMock.mock.calls.find(([url]) => String(url).includes('/pip?')) ?? [];
+      expect(attemptMs).toBe(90_000);
+      const load = bound.mock.results.findIndex(({ value }) => value === options?.signal);
+      expect(bound.mock.calls[load]).toEqual([185_000]);
+    } finally {
+      bound.mockRestore();
+    }
+  });
+
+  it('keys a pass by its whole request: B alone is asked after A and A+B were answered', async () => {
+    mockRows([surveyRow('USA', 2022)]);
+    mockRows([surveyRow('USA', 2022), surveyRow('IND', 2022)]);
+    mockRows([surveyRow('IND', 2022)]);
+    mockRows([surveyRow('IND', 2022, { poverty_line: 2.16 })]);
+    const opts = { ...baseOpts, fillGaps: false };
+    const run = (countries: string[], povertyLine?: number) =>
+      service.getPoverty(
+        { ...opts, countries, ...(povertyLine !== undefined && { povertyLine }) },
+        createMockContext(),
+      );
+
+    await run(['USA']);
+    await run(['USA', 'IND']);
+    const alone = await run(['IND']);
+    const otherLine = await run(['IND'], 2.16);
+    expect(pipCountries()).toEqual(['USA', 'USA,IND', 'IND', 'IND']);
+    expect(alone.rows.map((row) => row.countryCode)).toEqual(['IND']);
+    expect(otherLine.rows[0]?.povertyLine).toBe(2.16);
+
+    // Each answers its repeat from its own entry.
+    expect((await run(['USA', 'IND'])).total).toBe(2);
+    expect((await run(['USA'])).total).toBe(1);
+    expect((await run(['IND'])).rows[0]?.povertyLine).toBe(3);
+    expect(pipCalls()).toHaveLength(4);
+  });
+
+  /**
+   * Serve `/pip` by URL: a code-by-code request for a model-estimate-only
+   * economy is rejected as `/pip` rejects it, and the all-economy gap-filled
+   * request is held until the test answers or fails it.
+   */
+  async function serveModelPass() {
+    const { McpError } = await import('@cyanheads/mcp-ts-core/errors');
+    const allEconomies = Promise.withResolvers<unknown>();
+    const entered = Promise.withResolvers<void>();
+    const serve = fetchWithTimeoutMock.getMockImplementation() as (
+      ...args: unknown[]
+    ) => Promise<unknown>;
+    fetchWithTimeoutMock.mockImplementation(async (url: string, ...rest: unknown[]) => {
+      if (!url.includes('/pip?')) return serve(url, ...rest);
+      if (new URL(url).searchParams.get('country') === 'all') {
+        entered.resolve();
+        return allEconomies.promise;
+      }
+      throw new McpError(JsonRpcErrorCode.NotFound, 'Fetch failed with status 404.', {
+        status: 404,
+        body: validationBody('country', ['USA', 'IND']),
+      });
+    });
+    return { allEconomies, entered: entered.promise };
+  }
+
+  it('answers two model-estimate economies from one shared all-economy request, each narrowed to its own', async () => {
+    const { allEconomies, entered } = await serveModelPass();
+    const afg = service.getPoverty({ ...baseOpts, countries: ['AFG'] }, createMockContext());
+    const abw = service.getPoverty({ ...baseOpts, countries: ['ABW'] }, createMockContext());
+    await entered;
+    await drainMicrotasks();
+    allEconomies.resolve({
+      text: async () =>
+        JSON.stringify([
+          gapFilledRow('AFG', 2022, { estimation_type: 'CMD estimation' }),
+          gapFilledRow('ABW', 2022, { estimation_type: 'CMD estimation' }),
+          gapFilledRow('USA', 2022),
+        ]),
+    });
+
+    expect((await afg).rows.map((row) => row.countryCode)).toEqual(['AFG']);
+    expect((await abw).rows.map((row) => row.countryCode)).toEqual(['ABW']);
+    expect(pipCountries().filter((country) => country === 'all')).toHaveLength(1);
+  });
+
+  it("names each caller's own codes when the shared all-economy request fails", async () => {
+    const { allEconomies, entered } = await serveModelPass();
+    const afg = service.getPoverty({ ...baseOpts, countries: ['AFG'] }, createMockContext());
+    const abw = service.getPoverty({ ...baseOpts, countries: ['ABW'] }, createMockContext());
+    await entered;
+    await drainMicrotasks();
+    const { McpError } = await import('@cyanheads/mcp-ts-core/errors');
+    allEconomies.reject(
+      new McpError(JsonRpcErrorCode.ServiceUnavailable, 'Fetch failed with status 500.', {
+        status: 500,
+        body: '{"error":["Internal Server Error"]}',
+      }),
+    );
+
+    await expect(afg).rejects.toMatchObject({
+      message: expect.stringContaining('"AFG"'),
+      data: { reason: 'upstream_unavailable', countryCodes: 'AFG', status: 500 },
+    });
+    await expect(abw).rejects.toMatchObject({
+      message: expect.stringContaining('"ABW"'),
+      data: { reason: 'upstream_unavailable', countryCodes: 'ABW', status: 500 },
+    });
+    expect(pipCountries().filter((country) => country === 'all')).toHaveLength(1);
+  });
+
+  /**
+   * A client or transport that gives up on its own `AbortSignal.timeout()` aborts
+   * with a `TimeoutError`, the same name a shared load's own bound produces; it is
+   * still the caller's cancellation, not PIP running out of time.
+   */
+  it.each([
+    ['an Error', () => new Error('caller went away')],
+    ['a TimeoutError', () => new DOMException('client timeout', 'TimeoutError')],
+  ])(
+    'fails only the caller that cancels a shared pass (with %s), which carries on for the other caller',
+    async (_reason, reason) => {
+      const { held } = await holdPipRequests();
+      const serveHeld = fetchWithTimeoutMock.getMockImplementation() as (
+        ...args: unknown[]
+      ) => Promise<unknown>;
+      const cancelled = new AbortController();
+      // Cancel from inside the fetch, once both passes are in flight.
+      fetchWithTimeoutMock.mockImplementation((...args: unknown[]) => {
+        const pending = serveHeld(...args);
+        if (held.length === 2) cancelled.abort(reason());
+        return pending;
+      });
+      const opts = { ...baseOpts, countries: ['BOL'], year: '1990' };
+      const leaving = service.getPoverty(opts, createMockContext({ signal: cancelled.signal }));
+      const staying = service.getPoverty(opts, createMockContext());
+
+      const left = await leaving.then(
+        () => 'resolved',
+        (error: unknown) => error,
+      );
+      expect(left).toBe(cancelled.signal.reason);
+      expect(held.map(({ signal }) => signal.aborted)).toEqual([false, false]);
+      held[0]?.answer([surveyRow('BOL', 1990, { reporting_level: 'urban' })]);
+      held[1]?.answer([gapFilledRow('BOL', 1990, { estimation_type: 'extrapolation' })]);
+      await expect(staying).resolves.toMatchObject({ total: 2, gapFilled: true });
+      expect(held).toHaveLength(2);
+    },
+  );
 
   // ─── Model-estimate-only economies ────────────────────────────────────────
 

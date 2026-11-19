@@ -349,6 +349,7 @@ describe('worldbankGetCountry', () => {
     expect(worldbankGetCountry.errors?.map((e) => e.reason)).toEqual([
       'country_not_found',
       'multiple_countries',
+      'upstream_timeout',
     ]);
   });
 

@@ -35,7 +35,7 @@ const cases: Array<[AnyToolDefinition, string[], string[]]> = [
       'country_not_found',
       'indicator_and_country_not_found',
     ],
-    ['upstream_inconsistent'],
+    ['upstream_inconsistent', 'upstream_timeout'],
   ],
   [
     worldbankGetPoverty,
@@ -47,10 +47,10 @@ const cases: Array<[AnyToolDefinition, string[], string[]]> = [
       'invalid_parameter',
       'ppp_version_unavailable',
     ],
-    ['upstream_unavailable'],
+    ['upstream_unavailable', 'upstream_timeout'],
   ],
-  [worldbankGetCountry, ['country_not_found', 'multiple_countries'], []],
-  [worldbankGetIndicator, ['indicator_not_found', 'multiple_indicators'], []],
+  [worldbankGetCountry, ['country_not_found', 'multiple_countries'], ['upstream_timeout']],
+  [worldbankGetIndicator, ['indicator_not_found', 'multiple_indicators'], ['upstream_timeout']],
   [
     worldbankSearchProjects,
     [
@@ -59,18 +59,23 @@ const cases: Array<[AnyToolDefinition, string[], string[]]> = [
       'reversed_date_range',
       'invalid_query',
       'invalid_sector_name',
+      'invalid_theme_name',
       'page_out_of_range',
     ],
-    ['upstream_unavailable'],
+    ['upstream_unavailable', 'upstream_timeout'],
   ],
-  [worldbankSearchIndicators, ['missing_filter', 'invalid_filter', 'empty_query'], []],
+  [
+    worldbankSearchIndicators,
+    ['missing_filter', 'invalid_filter', 'empty_query'],
+    ['upstream_timeout'],
+  ],
   [
     worldbankListCountries,
     ['invalid_filter', 'source_not_found', 'source_not_queryable', 'unsupported_source_filter'],
-    [],
+    ['upstream_timeout'],
   ],
-  [worldbankListSources, [], []],
-  [worldbankListTopics, [], []],
+  [worldbankListSources, [], ['upstream_timeout']],
+  [worldbankListTopics, [], ['upstream_timeout']],
 ];
 
 describe('tool error severity', () => {

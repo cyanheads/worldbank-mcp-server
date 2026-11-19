@@ -20,24 +20,28 @@ import {
   validationError,
 } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
-import { defaultIsTransient, fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
+import { defaultIsTransient, fetchWithTimeout } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
+import {
+  CALL_DEADLINE_MS,
+  retryWithinCallDeadline,
+  withCallDeadline,
+} from '@/services/call-deadline.js';
 import { plainProse } from '@/services/plain-prose.js';
 import { MAX_PROJECTS_PER_PAGE } from '@/services/response-budget.js';
-import { normalizeSectorNames } from './normalize-sector-names.js';
+import { normalizeSectorNames, normalizeThemeNames } from './normalize-sector-names.js';
 import { toWdiIso2 } from './portfolio-country-codes.js';
-import type { ProjectSector, ProjectSummary, RawProject, RawProjectsEnvelope } from './types.js';
+import type {
+  ProjectSector,
+  ProjectSummary,
+  ProjectTheme,
+  RawProject,
+  RawProjectsEnvelope,
+  RawTheme,
+} from './types.js';
 
-/** Minimal request-context shape that satisfies fetchWithTimeout and withRetry. */
+/** Minimal request-context shape that satisfies fetchWithTimeout. */
 type ReqCtx = Context & Record<string, unknown>;
-
-/**
- * Timeout for a single `/projects` request. Measured latency is well inside a
- * second even for a full 1,000-row page, so this matches the ordinary-request
- * budget the Indicators service uses rather than the 60s PIP needs for its cold
- * query computation.
- */
-const REQUEST_TIMEOUT_MS = 15_000;
 
 /**
  * Largest `os` the endpoint accepts. Past it the request fails with an HTTP 400
@@ -62,6 +66,11 @@ const MULTI_VALUE_SEPARATOR = '^';
  * `proj_id` and `project_abstract` come back whatever is asked for, while `pdo`
  * comes back only when listed. `major_sectors` carries each major sector's
  * sub-sectors nested inside it.
+ *
+ * `theme_list` is added only when themes are requested: on the 1,000 newest
+ * active operations it adds 1.9 MB to the response (2026-11-19). An explicit `fl`
+ * returns it but never `theme_exact`, the field the theme filter matches, which
+ * only `fl=*` returns.
  */
 const PROJECT_FIELDS = [
   'id',
@@ -146,7 +155,7 @@ function toCalendarDate(value: string | null | undefined): string | null {
   return match ? (match[1] as string) : value;
 }
 
-/** Monetary amounts and sector shares arrive as strings; an absent value is absent, not zero. */
+/** Amounts and sector and theme shares arrive as strings; an absent value is absent, not zero. */
 function toAmount(value: string | null | undefined): number | null {
   if (value === null || value === undefined || value.trim() === '') return null;
   const amount = Number(value);
@@ -189,13 +198,50 @@ function projectSectors(raw: RawProject): ProjectSector[] {
   return sectors;
 }
 
+/**
+ * The three-level `theme_list` flattened depth-first in upstream order, each
+ * entry naming its parent so a name listed at two levels stays two entries.
+ * Names and parents are trimmed — 23 current names are stored with a leading
+ * space, which the `theme` filter sends back — and keep any `FY17 - ` prefix.
+ * Shares follow the sector rule: a project whose shares are all zero or absent
+ * publishes no split, so every entry reports null rather than zero.
+ */
+function projectThemes(raw: RawProject): ProjectTheme[] {
+  const entry = (theme: RawTheme, parent: string | null): ProjectTheme => ({
+    name: (theme.name ?? '').trim(),
+    code: theme.code ?? '',
+    parent,
+    percent: toAmount(theme.percent),
+  });
+  const themes = (raw.theme_list ?? []).flatMap((level1) => {
+    const first = entry(level1, null);
+    return [
+      first,
+      ...(level1.theme2 ?? []).flatMap((level2) => {
+        const second = entry(level2, first.name);
+        return [second, ...(level2.theme3 ?? []).map((level3) => entry(level3, second.name))];
+      }),
+    ];
+  });
+  if (themes.every((theme) => !theme.percent)) {
+    for (const theme of themes) theme.percent = null;
+  }
+  return themes;
+}
+
 /** Upstream prose as trimmed plain text; null when the project publishes none. */
 function plainText(value: string | null | undefined): string | null {
   const text = plainProse(value ?? '').trim();
   return text === '' ? null : text;
 }
 
-function normalizeProject(raw: RawProject, includeAbstract: boolean): ProjectSummary {
+function normalizeProject(
+  raw: RawProject,
+  {
+    includeAbstract,
+    includeThemes,
+  }: Pick<ProjectSearchOptions, 'includeAbstract' | 'includeThemes'>,
+): ProjectSummary {
   const id = raw.id ?? '';
   return {
     id,
@@ -215,6 +261,7 @@ function normalizeProject(raw: RawProject, includeAbstract: boolean): ProjectSum
     financialTypes: [...new Set(raw.projectfinancialtype ?? [])],
     majorSectors: majorSectorNames(raw),
     sectors: projectSectors(raw),
+    themes: includeThemes ? projectThemes(raw) : null,
     abstract: includeAbstract ? plainText(raw.project_abstract) : null,
     url: `${PROJECT_PAGE_BASE}/${id}`,
   };
@@ -232,6 +279,16 @@ type ProjectsFilters = {
   sector_exact?: string;
   status_exact?: string;
   strdate?: string;
+  theme_exact?: string;
+};
+
+/** One `/projects` request: what it filters on, which fields it returns, and which slice. */
+type ProjectsRequest = {
+  /** The comma-joined `fl` field list. */
+  fields: string;
+  filters: ProjectsFilters;
+  offset: number;
+  rows: number;
 };
 
 export type ProjectSearchOptions = {
@@ -241,6 +298,8 @@ export type ProjectSearchOptions = {
   /** Financing windows (`IBRD`, `IDA`, `Grants`, `Other`), combined as OR. */
   financialTypes: string[];
   includeAbstract: boolean;
+  /** Read each project's `theme_list` into `themes`; null on every row otherwise. */
+  includeThemes: boolean;
   page: number;
   perPage: number;
   query?: string;
@@ -248,6 +307,8 @@ export type ProjectSearchOptions = {
   /** Sector names, combined as OR across the bare, trailing-space, and FY17 spellings. */
   sectors?: string[];
   statuses: string[];
+  /** Theme names, combined as OR across the bare, leading-space, and FY17 spellings. */
+  themes?: string[];
 };
 
 export type ProjectSearchResult = {
@@ -282,10 +343,10 @@ export class ProjectsService {
    * own order is descending project ID, which leaves the newest approvals pages
    * deep. The sort lives here, not in the filters, so no filter can drop it.
    */
-  private buildUrl(filters: ProjectsFilters, rows: number, offset: number): string {
+  private buildUrl({ fields, filters, offset, rows }: ProjectsRequest): string {
     const qs = new URLSearchParams({
       format: 'json',
-      fl: PROJECT_FIELDS,
+      fl: fields,
       rows: String(rows),
       os: String(offset),
       srt: 'boardapprovaldate',
@@ -297,26 +358,30 @@ export class ProjectsService {
     return `${this.baseUrl}/projects?${qs.toString()}`;
   }
 
-  /** Fetch one `/projects` response and normalize its envelope into rows plus a count. */
+  /**
+   * Fetch one `/projects` response and normalize its envelope into rows plus a
+   * count, under the call deadline `ctx` carries: one attempt can hold until the
+   * deadline, an early failure is retried in what it leaves, and expiry is the
+   * typed `upstream_timeout`. The body is read inside the attempt, so the
+   * attempt's timeout bounds it too.
+   */
   private fetchPage(
-    filters: ProjectsFilters,
-    rows: number,
-    offset: number,
+    request: ProjectsRequest,
     ctx: Context,
   ): Promise<{ raw: RawProject[]; total: number }> {
-    const url = this.buildUrl(filters, rows, offset);
+    const url = this.buildUrl(request);
     ctx.log.debug('Searching World Bank projects', { url });
 
-    return withRetry(
-      async () => {
+    return retryWithinCallDeadline(
+      ctx,
+      'projects',
+      async ({ signal, timeoutMs }) => {
         let text: string;
         try {
-          const response = await fetchWithTimeout(url, REQUEST_TIMEOUT_MS, ctx as ReqCtx, {
-            signal: ctx.signal,
-          });
+          const response = await fetchWithTimeout(url, timeoutMs, ctx as ReqCtx, { signal });
           text = await response.text();
         } catch (error) {
-          if (error instanceof McpError) throw classifyProjectsError(error, filters.qterm);
+          if (error instanceof McpError) throw classifyProjectsError(error, request.filters.qterm);
           throw error;
         }
 
@@ -369,12 +434,8 @@ export class ProjectsService {
           total,
         };
       },
-      {
-        operation: 'ProjectsService.fetchPage',
-        context: ctx as ReqCtx,
-        baseDelayMs: 1000,
-        signal: ctx.signal,
-      },
+      // attemptTimeoutMs applies only without a call deadline, which searchProjects always starts.
+      { attemptTimeoutMs: CALL_DEADLINE_MS, baseDelayMs: 1000 },
     );
   }
 
@@ -392,10 +453,15 @@ export class ProjectsService {
    * all" from "the codes are fine, the combination is what is empty". The probe
    * asks the codes as one OR-set, so a positive count settles the set rather
    * than each code, and a probe that fails leaves the empty result untouched.
+   *
+   * The search and the probe spend one call deadline — the caller's when it
+   * started one, so a tool that resolved country codes first shares its budget.
    */
   async searchProjects(opts: ProjectSearchOptions, ctx: Context): Promise<ProjectSearchResult> {
-    const { countryCodes, includeAbstract, page, perPage } = opts;
+    ctx = withCallDeadline(ctx);
+    const { countryCodes, includeThemes, page, perPage } = opts;
     const sectors = normalizeSectorNames(opts.sectors ?? []);
+    const themes = normalizeThemeNames(opts.themes ?? []);
 
     // The endpoint silently returns at most 1,000 rows, abstracts included.
     const rows = Math.min(perPage, MAX_PROJECTS_PER_PAGE);
@@ -432,6 +498,20 @@ export class ProjectsService {
           ...new Set(sectors.flatMap((name) => [name, `${name} `, `FY17 - ${name}`])),
         ].join(MULTI_VALUE_SEPARATOR),
       }),
+      /**
+       * `theme_exact` matches a name at any of the three theme levels, case and
+       * whitespace exactly. 23 current names are stored only with a leading
+       * space, and the FY17 taxonomy prefixes its names, so a name is sent bare,
+       * with the leading space, and FY17-prefixed; no FY17 name carries the
+       * space, so the three spellings cover every stored form. Case is sent as
+       * given: the two taxonomies share some names only up to case (`Climate
+       * Change`, `FY17 - Climate change`), and no rule maps one onto the other.
+       */
+      ...(themes.length > 0 && {
+        theme_exact: [
+          ...new Set(themes.flatMap((name) => [name, ` ${name}`, `FY17 - ${name}`])),
+        ].join(MULTI_VALUE_SEPARATOR),
+      }),
       ...(opts.financialTypes.length > 0 && {
         projectfinancialtype_exact: opts.financialTypes.join(MULTI_VALUE_SEPARATOR),
       }),
@@ -439,19 +519,37 @@ export class ProjectsService {
       ...(opts.approvedTo !== undefined && { enddate: opts.approvedTo }),
     };
 
-    const { raw, total } = await this.fetchPage(filters, rows, offset, ctx);
+    const { raw, total } = await this.fetchPage(
+      {
+        fields: includeThemes ? `${PROJECT_FIELDS},theme_list` : PROJECT_FIELDS,
+        filters,
+        offset,
+        rows,
+      },
+      ctx,
+    );
 
     let countryOnlyTotal: number | null = null;
     if (total === 0 && countryFilter !== undefined) {
       try {
-        const probe = await this.fetchPage({ countrycode_exact: countryFilter }, 0, 0, ctx);
+        const probe = await this.fetchPage(
+          {
+            fields: PROJECT_FIELDS,
+            filters: { countrycode_exact: countryFilter },
+            offset: 0,
+            rows: 0,
+          },
+          ctx,
+        );
         countryOnlyTotal = probe.total;
       } catch (error) {
         /**
          * The search itself succeeded — an empty result is a valid answer, and a
-         * failed diagnostic must not turn it into an error. Leaving the count
-         * null drops the caller back to the generic empty-result notice. A
-         * cancellation still propagates, so it isn't answered as a success.
+         * failed diagnostic must not turn it into an error — a probe the call
+         * deadline cut off included, since the answer in hand still arrives by
+         * the deadline. Leaving the count null drops the caller back to the
+         * generic empty-result notice. A cancellation still propagates, so it
+         * isn't answered as a success.
          */
         if (ctx.signal.aborted) throw error;
         ctx.log.debug('Country-filter probe failed; reporting the empty result without it', {
@@ -461,7 +559,7 @@ export class ProjectsService {
     }
 
     return {
-      projects: raw.map((project) => normalizeProject(project, includeAbstract)),
+      projects: raw.map((project) => normalizeProject(project, opts)),
       total,
       page,
       pages: Math.max(1, Math.ceil(total / rows)),

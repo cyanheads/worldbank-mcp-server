@@ -1,8 +1,9 @@
 /**
  * @fileoverview Tests for ProjectsService — normalization of the ID-keyed
  * response object into rows, offset pagination and the row ceiling upstream
- * silently enforces, caret-joined multi-value filters, the zero-hit country
- * probe, and classification of upstream failures without leaking their bodies.
+ * silently enforces, caret-joined multi-value filters, the theme filter and
+ * the flattened theme hierarchy, the zero-hit country probe, and
+ * classification of upstream failures without leaking their bodies.
  * @module tests/services/projects/projects-service.test
  */
 
@@ -10,15 +11,28 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createInMemoryStorage, createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import socialUnionCapture from './fixtures/social-union.json' with { type: 'json' };
+import themeListsCapture from './fixtures/theme-lists.json' with { type: 'json' };
 
 // ─── fetchWithTimeout mock ────────────────────────────────────────────────────
 // Hoisted so the mock is in place before the service module resolves the dep.
-// The real status classification and retry loop are covered against a stubbed
-// global fetch in projects-service-http.test.ts.
+// The real status classification, retry loop, and call deadline are covered
+// against a stubbed global fetch in projects-service-http.test.ts. One attempt,
+// handed the attempt handle the real withRetry passes.
 vi.mock('@cyanheads/mcp-ts-core/utils', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@cyanheads/mcp-ts-core/utils')>()),
   fetchWithTimeout: vi.fn(),
-  withRetry: vi.fn().mockImplementation((fn: () => unknown) => fn()),
+  withRetry: vi
+    .fn()
+    .mockImplementation(
+      (
+        fn: (handle: { signal: AbortSignal; remainingMs: number }) => unknown,
+        opts?: { signal?: AbortSignal; deadlineMs?: number },
+      ) =>
+        fn({
+          signal: opts?.signal ?? new AbortController().signal,
+          remainingMs: opts?.deadlineMs ?? Number.POSITIVE_INFINITY,
+        }),
+    ),
 }));
 
 const CONFIG = {
@@ -137,6 +151,7 @@ describe('ProjectsService', () => {
     regions: [] as string[],
     financialTypes: [] as string[],
     includeAbstract: false,
+    includeThemes: false,
     page: 1,
     perPage: 50,
   };
@@ -168,6 +183,31 @@ describe('ProjectsService', () => {
     await service.searchProjects(baseOpts, createMockContext());
     expect(requestedUrl().pathname).toBe('/api/v3/projects');
     expect(requestedUrl().searchParams.has('sector_exact')).toBe(false);
+  });
+
+  it('sends a search without themes exactly as before: no theme filter and no theme_list', async () => {
+    mockBody(envelope([rawProject('P100')]));
+    await service.searchProjects(baseOpts, createMockContext());
+    const params = requestedUrl().searchParams;
+    expect(params.has('theme_exact')).toBe(false);
+    expect(params.get('fl')?.split(',')).toEqual([
+      'id',
+      'project_name',
+      'pdo',
+      'status',
+      'countryname',
+      'countrycode',
+      'regionname',
+      'boardapprovaldate',
+      'closingdate',
+      'curr_total_commitment',
+      'curr_ibrd_commitment',
+      'curr_ida_commitment',
+      'grantamt',
+      'projectfinancialtype',
+      'major_sectors',
+      'project_abstract',
+    ]);
   });
 
   it.each([
@@ -287,6 +327,8 @@ describe('ProjectsService', () => {
         { name: 'Public Administration - Health', code: 'HHF', majorSector: 'Health', percent: 20 },
         { name: 'Primary Education', code: 'EEP', majorSector: 'Education', percent: 20 },
       ],
+      // Not requested, so not read: themes are opt-in like the abstract.
+      themes: null,
       abstract: 'Rehabilitation of the dam and the associated irrigation perimeter.',
       url: 'https://projects.worldbank.org/en/projects-operations/project-detail/P100',
     });
@@ -308,6 +350,7 @@ describe('ProjectsService', () => {
       'financialTypes',
       'majorSectors',
       'sectors',
+      'themes',
       'abstract',
       'url',
     ]);
@@ -698,6 +741,272 @@ describe('ProjectsService', () => {
       'Other - Industry, Trade, and Services ',
       'FY17 - Other - Industry, Trade, and Services',
     ]);
+  });
+
+  // ─── Themes ───────────────────────────────────────────────────────────────
+
+  /** One flattened theme entry, as the service reports it. */
+  const theme = (name: string, code: string, parent: string | null, percent: number | null) => ({
+    name,
+    code,
+    parent,
+    percent,
+  });
+
+  /** A `theme_list` entry at any level, as upstream nests it. */
+  type CapturedTheme = { name: string; theme2?: CapturedTheme[]; theme3?: CapturedTheme[] };
+
+  /**
+   * `theme_list` values of nine active operations as the endpoint returned them
+   * on 2026-11-19, assembled into one envelope: both taxonomies, a level-2 name
+   * stored with a leading space (P508964), a name listed at two levels
+   * (P506846), a level-1 entry with no share (P181576), shares above 100
+   * (P170706), a published zero inside a split (P160427), an all-zero project
+   * (P164909), one with no shares at all (P505889), and an `Adaptation` match
+   * that publishes no `theme_list` (P515194).
+   */
+  const capturedRows = Object.values(themeListsCapture.projects) as Array<{
+    theme_list?: CapturedTheme[];
+  }>;
+
+  /** Every name a captured `theme_list` stores, depth-first, spelled as stored. */
+  const storedNames = (entries: CapturedTheme[]): string[] =>
+    entries.flatMap((entry) => [entry.name, ...storedNames(entry.theme2 ?? entry.theme3 ?? [])]);
+
+  /** Replay the captured envelope under an `Adaptation` search with themes requested. */
+  async function capturedThemes() {
+    mockBody(JSON.stringify(themeListsCapture));
+    const result = await service.searchProjects(
+      { ...baseOpts, themes: ['Adaptation'], includeThemes: true },
+      createMockContext(),
+    );
+    return new Map(result.projects.map((project) => [project.id, project.themes]));
+  }
+
+  it.each([
+    [['Adaptation'], 'Adaptation^ Adaptation^FY17 - Adaptation'],
+    [['FY17 - Adaptation'], 'Adaptation^ Adaptation^FY17 - Adaptation'],
+    [
+      [' Productivity, Firm Dynamics, and Jobs '],
+      'Productivity, Firm Dynamics, and Jobs^ Productivity, Firm Dynamics, and Jobs^FY17 - Productivity, Firm Dynamics, and Jobs',
+    ],
+    [
+      ['Climate Change', 'FY17 - Adaptation', 'Adaptation'],
+      'Climate Change^ Climate Change^FY17 - Climate Change^Adaptation^ Adaptation^FY17 - Adaptation',
+    ],
+    // Case is sent as given: FY17 - Climate change differs from Climate Change by case alone.
+    [['Climate change'], 'Climate change^ Climate change^FY17 - Climate change'],
+  ])(
+    'sends theme %j as one theme_exact OR-set, ANDed with the other filters',
+    async (themes, expected) => {
+      mockBody(envelope([rawProject('P100')], 862));
+      await service.searchProjects(
+        { ...baseOpts, themes, statuses: ['Active'], sectors: ['Health'], countryCodes: ['KE'] },
+        createMockContext(),
+      );
+      const params = requestedUrl().searchParams;
+      expect(params.get('theme_exact')).toBe(expected);
+      expect(params.get('status_exact')).toBe('Active');
+      expect(params.get('sector_exact')).toBe('Health^Health ^FY17 - Health');
+      expect(params.get('countrycode_exact')).toBe('KE');
+    },
+  );
+
+  it.each(['', '   ', 'FY17 - ', 'FY17 -', 'Adaptation^Mitigation'])(
+    'rejects theme name %j as invalid_theme_name before fetching',
+    async (name) => {
+      await expect(
+        service.searchProjects({ ...baseOpts, themes: ['Adaptation', name] }, createMockContext()),
+      ).rejects.toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        message: expect.stringMatching(/^Theme names must be nonblank/),
+        data: { reason: 'invalid_theme_name', retryable: false },
+      });
+      expect(fetchWithTimeoutMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it('lets an unknown theme name return an upstream no-match in one request', async () => {
+    mockBody(envelope([]));
+    const result = await service.searchProjects(
+      { ...baseOpts, themes: ['Invented Theme'] },
+      createMockContext(),
+    );
+    expect(requestedUrl().searchParams.get('theme_exact')).toBe(
+      'Invented Theme^ Invented Theme^FY17 - Invented Theme',
+    );
+    expect(result).toMatchObject({ projects: [], total: 0, pages: 1 });
+    expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the theme filter on a page past the end', async () => {
+    mockBody(envelope([], 3));
+    const result = await service.searchProjects(
+      { ...baseOpts, themes: ['Gender'], perPage: 2, page: 3 },
+      createMockContext(),
+    );
+    expect(requestedUrl().searchParams.get('theme_exact')).toBe('Gender^ Gender^FY17 - Gender');
+    expect(requestedUrl().searchParams.get('os')).toBe('4');
+    expect(result).toMatchObject({ projects: [], total: 3, pages: 2, page: 3 });
+  });
+
+  it('reads themes only when asked, and requests theme_list only then', async () => {
+    mockBody(JSON.stringify(themeListsCapture));
+    const withheld = await service.searchProjects(
+      { ...baseOpts, themes: ['Adaptation'] },
+      createMockContext(),
+    );
+    expect(requestedUrl(0).searchParams.get('fl')?.split(',')).not.toContain('theme_list');
+    // Every captured row carries a theme_list but P515194, and none reports it unasked.
+    expect(withheld.projects.map((project) => project.themes)).toEqual(Array(9).fill(null));
+
+    mockBody(JSON.stringify(themeListsCapture));
+    const included = await service.searchProjects(
+      { ...baseOpts, includeThemes: true },
+      createMockContext(),
+    );
+    expect(requestedUrl(1).searchParams.get('fl')?.split(',')).toEqual(
+      expect.arrayContaining(['major_sectors', 'pdo', 'theme_list']),
+    );
+    expect(requestedUrl(1).searchParams.has('theme_exact')).toBe(false);
+    expect(included.projects.map((project) => project.themes?.length)).toEqual([
+      13, 4, 7, 8, 17, 7, 5, 5, 0,
+    ]);
+  });
+
+  it('flattens the current taxonomy depth-first, trimming a leading space from names and parents', async () => {
+    const themes = await capturedThemes();
+    const innovation = 'Innovation, Technology, and Green Competitiveness';
+    expect(themes.get('P508964')).toEqual([
+      theme('Private Sector Development', '120000', null, 100),
+      theme(innovation, '120300', 'Private Sector Development', 100),
+      theme('Innovation and Technology Policy', '120304', innovation, 100),
+      theme('Technology Adoption by Firms', '120301', innovation, 100),
+    ]);
+
+    // Shares overlap rather than split: two level-1 themes at 100 each.
+    const environment = 'Environment, Infrastructure, and Natural Resource Management';
+    const energy = 'Energy and Mineral Resources';
+    expect(themes.get('P511160')).toEqual([
+      theme(environment, '240000', null, 100),
+      theme('Climate Change', '240100', environment, 100),
+      theme('Adaptation', '240102', 'Climate Change', 50),
+      theme('Mitigation', '240101', 'Climate Change', 50),
+      theme(energy, '241800', environment, 100),
+      theme('Enabling Renewable Energy', '241801', energy, 100),
+      theme('Energy Access-Electricity', '241807', energy, 100),
+      theme('Energy Efficient Demand', '241805', energy, 100),
+      theme('Energy Efficient Supply', '241804', energy, 100),
+      theme('Energy and Mining Policies & Reform', '241806', energy, 100),
+      theme('Finance', '130000', null, 100),
+      theme('Finance for the Real Economy', '130300', 'Finance', 100),
+      theme('Infrastructure Finance', '130302', 'Finance for the Real Economy', 100),
+    ]);
+  });
+
+  it('keeps FY17 names prefixed, and tells a name listed at two levels apart by parent', async () => {
+    const themes = await capturedThemes();
+    const environment = 'FY17 - Environment and Natural Resource Management';
+    expect(themes.get('P181576')).toEqual([
+      // The level-1 entries publish no share; their children do.
+      theme(environment, '80', null, null),
+      theme('FY17 - Climate change', '81', environment, 100),
+      theme('FY17 - Adaptation', '812', 'FY17 - Climate change', 50),
+      theme('FY17 - Mitigation', '811', 'FY17 - Climate change', 50),
+      theme('FY17 - Environmental policies and institutions', '84', environment, 100),
+      theme('FY17 - Human Development and Gender', '60', null, null),
+      theme('FY17 - Education', '65', 'FY17 - Human Development and Gender', 9),
+      theme('FY17 - Education Governance, School-Based Management', '656', 'FY17 - Education', 9),
+    ]);
+    expect(themes.get('P506846')?.filter((entry) => entry.name === 'Poverty and Equity')).toEqual([
+      theme('Poverty and Equity', '200000', null, 100),
+      theme('Poverty and Equity', '200100', 'Poverty and Equity', 100),
+    ]);
+  });
+
+  it('keeps shares as published — above 100, or 0 inside a split — and nulls a project with no split', async () => {
+    const themes = await capturedThemes();
+    expect(
+      themes
+        .get('P170706')
+        ?.filter((entry) => entry.parent === null)
+        .map((entry) => entry.percent),
+    ).toEqual([100, 300, 100, 200]);
+    expect(themes.get('P160427')?.map((entry) => entry.percent)).toEqual([
+      100, 20, 20, 0, 100, 99, 99,
+    ]);
+    // Every share zero, and no share at all: neither publishes a split.
+    for (const id of ['P164909', 'P505889']) {
+      expect(themes.get(id)).toHaveLength(5);
+      expect(themes.get(id)?.every((entry) => entry.percent === null)).toBe(true);
+    }
+    // Matched by the Adaptation filter, yet it publishes no theme_list.
+    expect(themes.get('P515194')).toEqual([]);
+  });
+
+  it('tolerates a theme with no children and an empty or null theme_list', async () => {
+    mockBody(
+      envelope([
+        rawProject('P100', {
+          theme_list: [
+            { name: 'Gender', code: '400000', percent: '30', theme2: null },
+            {
+              name: 'Finance',
+              code: '130000',
+              percent: '70',
+              theme2: [
+                { name: 'Finance for the Real Economy', code: '130300', percent: '70', theme3: [] },
+              ],
+            },
+          ],
+        }),
+        rawProject('P200', { theme_list: [] }),
+        rawProject('P300', { theme_list: null }),
+      ]),
+    );
+    const result = await service.searchProjects(
+      { ...baseOpts, includeThemes: true },
+      createMockContext(),
+    );
+    expect(result.projects.map((project) => project.themes)).toEqual([
+      [
+        theme('Gender', '400000', null, 30),
+        theme('Finance', '130000', null, 70),
+        theme('Finance for the Real Economy', '130300', 'Finance', 70),
+      ],
+      [],
+      [],
+    ]);
+  });
+
+  /**
+   * Every theme name a row reports, passed back to `theme`, has to reach
+   * upstream in the spelling the index stores — the leading space included,
+   * since `theme_exact` matches whitespace exactly and the trimmed name
+   * matches nothing.
+   */
+  it('sends back every stored spelling of the theme names a captured page reports', async () => {
+    mockBody(JSON.stringify(themeListsCapture));
+    const page = await service.searchProjects(
+      { ...baseOpts, includeThemes: true },
+      createMockContext(),
+    );
+    const stored = capturedRows.flatMap((row) => storedNames(row.theme_list ?? []));
+    const reported = page.projects.flatMap((project) =>
+      (project.themes ?? []).map((entry) => entry.name),
+    );
+    expect(stored).toContain(' Innovation, Technology, and Green Competitiveness');
+    expect(reported).toContain('Innovation, Technology, and Green Competitiveness');
+    expect(reported).toHaveLength(stored.length);
+
+    for (const [index, name] of reported.entries()) {
+      mockBody(envelope([]));
+      await service.searchProjects({ ...baseOpts, themes: [name] }, createMockContext());
+      const sent = requestedUrl(fetchWithTimeoutMock.mock.calls.length - 1)
+        .searchParams.get('theme_exact')
+        ?.split('^');
+      expect(sent, `theme_exact for ${JSON.stringify(name)}`).toContain(stored[index]);
+    }
   });
 
   // ─── Query construction ───────────────────────────────────────────────────

@@ -94,7 +94,7 @@ describe('catalog Markdown literals', () => {
   it('keeps raw query and notices on structuredContent while escaping custom trailers', async () => {
     const { getWorldBankApiService } = await import('@/services/worldbank/worldbank-service.js');
     vi.mocked(getWorldBankApiService).mockReturnValue({
-      searchIndicators: vi.fn().mockResolvedValue({ indicators: [], total: 0, page: 1, pages: 0 }),
+      searchIndicators: vi.fn().mockResolvedValue({ indicators: [], total: 0, page: 1, pages: 1 }),
     } as never);
     const result = await runToolContract(worldbankSearchIndicators, { query: hostile });
     expect(result.isError).toBeFalsy();

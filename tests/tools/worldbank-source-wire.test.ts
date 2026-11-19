@@ -305,8 +305,8 @@ describe('World Bank source and exhaustive pagination wire contracts', () => {
     });
   });
 
-  it('surfaces exhausted source request timeouts instead of empty data', async () => {
-    vi.useFakeTimers();
+  it('surfaces a source request held to the call deadline as upstream_timeout instead of empty data', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
     network.mockImplementation(
       (_url, init) =>
         new Promise((_resolve, reject) => {
@@ -315,16 +315,29 @@ describe('World Bank source and exhaustive pagination wire contracts', () => {
           });
         }),
     );
+    let settled = false;
     const pending = runToolContract(worldbankGetData, {
       source_id: '50',
       indicator_id: 'SP.POP.TOTL',
       countries: 'US',
+    }).finally(() => {
+      settled = true;
     });
-    await vi.runAllTimersAsync();
+    await vi.advanceTimersByTimeAsync(49_999);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(settled).toBe(true);
     const result = await pending;
     expect(result.isError).toBe(true);
-    expect(result.structuredContent).toMatchObject({ error: { code: JsonRpcErrorCode.Timeout } });
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        code: JsonRpcErrorCode.Timeout,
+        data: { reason: 'upstream_timeout', retryable: true, budgetMs: 50_000 },
+      },
+    });
+    expect(JSON.stringify(result.content)).toContain('reason upstream_timeout');
     expect(JSON.stringify(result)).not.toContain('source_not_found');
-    expect(network).toHaveBeenCalledTimes(4);
+    expect(network).toHaveBeenCalledTimes(1);
   });
 });

@@ -1,0 +1,536 @@
+{
+  "rows": 9,
+  "os": "0",
+  "page": "1",
+  "total": "9",
+  "projects": {
+    "P511160": {
+      "id": "P511160",
+      "proj_id": "P511160",
+      "status": "Active",
+      "boardapprovaldate": "2026-11-26T00:00:00Z",
+      "theme_list": [
+        {
+          "name": "Environment, Infrastructure, and Natural Resource Management",
+          "code": "240000",
+          "seqno": "1",
+          "percent": "100",
+          "theme2": [
+            {
+              "name": "Climate Change",
+              "code": "240100",
+              "seqno": "2",
+              "percent": "100",
+              "theme3": [
+                {
+                  "name": "Adaptation",
+                  "code": "240102",
+                  "seqno": "3",
+                  "percent": "50"
+                },
+                {
+                  "name": "Mitigation",
+                  "code": "240101",
+                  "seqno": "3",
+                  "percent": "50"
+                }
+              ]
+            },
+            {
+              "name": "Energy and Mineral Resources",
+              "code": "241800",
+              "seqno": "2",
+              "percent": "100",
+              "theme3": [
+                {
+                  "name": "Enabling Renewable Energy",
+                  "code": "241801",
+                  "seqno": "3",
+                  "percent": "100"
+                },
+                {
+                  "name": "Energy Access-Electricity",
+                  "code": "241807",
+                  "seqno": "3",
+                  "percent": "100"
+                },
+                {
+                  "name": "Energy Efficient Demand",
+                  "code": "241805",
+                  "seqno": "3",
+                  "percent": "100"
+                },
+                {
+                  "name": "Energy Efficient Supply",
+                  "code": "241804",
+                  "seqno": "3",
+                  "percent": "100"
+                },
+                {
+                  "name": "Energy and Mining Policies & Reform",
+                  "code": "241806",
+                  "seqno": "3",
+                  "percent": "100"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "Finance",
+          "code": "130000",
+          "seqno": "1",
+          "percent": "100",
+          "theme2": [
+            {
+              "name": "Finance for the Real Economy",
+              "code": "130300",
+              "seqno": "2",
+              "percent": "100",
+              "theme3": [
+                {
+                  "name": "Infrastructure Finance",
+                  "code": "130302",
+                  "seqno": "3",
+                  "percent": "100"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "P508964": {
+      "id": "P508964",
+      "proj_id": "P508964",
+      "status": "Active",
+      "boardapprovaldate": "2026-01-11T00:00:00Z",
+      "theme_list": [
+        {
+          "name": "Private Sector Development",
+          "code": "120000",
+          "seqno": "1",
+          "percent": "100",
+          "theme2": [
+            {
+              "name": " Innovation, Technology, and Green Competitiveness",
+              "code": "120300",
+              "seqno": "2",
+              "percent": "100",
+              "theme3": [
+                {
+                  "name": "Innovation and Technology Policy",
+                  "code": "120304",
+                  "seqno": "3",
+                  "percent": "100"
+                },
+                {
+                  "name": "Technology Adoption by Firms",
+                  "code": "120301",
+                  "seqno": "3",
+                  "percent": "100"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "P506846": {
+      "id": "P506846",
+      "proj_id": "P506846",
+      "status": "Active",
+      "boardapprovaldate": "2024-11-19T00:00:00Z",
+      "theme_list": [
+        {
+          "name": "Environment, Infrastructure, and Natural Resource Management",
+          "code": "240000",
+          "seqno": "1",
+          "percent": "100",
+          "theme2": [
+            {
+              "name": "Climate Change",
+              "code": "240100",
+              "seqno": "2",
+              "percent": "100",
+              "theme3": [
+                {
+                  "name": "Mitigation",
+                  "code": "240101",
+                  "seqno": "3",
+                  "percent": "100"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "Poverty and Equity",
+          "code": "200000",
+          "seqno": "1",
+          "percent": "100",
+          "theme2": [
+            {
+              "name": "Poverty and Equity",
+              "code": "200100",
+              "seqno": "2",
+              "percent": "100"
+            }
+          ]
+        },
+        {
+          "name": "Urban Development and Land Administration / Management",
+          "code": "210000",
+          "seqno": "1",
+          "percent": "100",
+          "theme2": [
+            {
+              "name": "Public Transport",
+              "code": "210300",
+              "seqno": "2",
+              "percent": "100"
+            }
+          ]
+        }
+      ]
+    },
+    "P181576": {
+      "id": "P181576",
+      "proj_id": "P181576",
+      "status": "Active",
+      "boardapprovaldate": "2024-05-21T00:00:00Z",
+      "theme_list": [
+        {
+          "name": "FY17 - Environment and Natural Resource Management",
+          "code": "80",
+          "seqno": "1",
+          "theme2": [
+            {
+              "name": "FY17 - Climate change",
+              "code": "81",
+              "seqno": "2",
+              "percent": "100",
+              "theme3": [
+                {
+                  "name": "FY17 - Adaptation",
+                  "code": "812",
+                  "seqno": "3",
+                  "percent": "50"
+                },
+                {
+                  "name": "FY17 - Mitigation",
+                  "code": "811",
+                  "seqno": "3",
+                  "percent": "50"
+                }
+              ]
+            },
+            {
+              "name": "FY17 - Environmental policies and institutions",
+              "code": "84",
+              "seqno": "2",
+              "percent": "100"
+            }
+          ]
+        },
+        {
+          "name": "FY17 - Human Development and Gender",
+          "code": "60",
+          "seqno": "1",
+          "theme2": [
+            {
+              "name": "FY17 - Education",
+              "code": "65",
+              "seqno": "2",
+              "percent": "9",
+              "theme3": [
+                {
+                  "name": "FY17 - Education Governance, School-Based Management",
+                  "code": "656",
+                  "seqno": "3",
+                  "percent": "9"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "P170706": {
+      "id": "P170706",
+      "proj_id": "P170706",
+      "status": "Active",
+      "boardapprovaldate": "2021-11-23T00:00:00Z",
+      "theme_list": [
+        {
+          "name": "FY17 - Human Development and Gender",
+          "code": "60",
+          "seqno": "11",
+          "percent": "100",
+          "theme2": [
+            {
+              "name": "FY17 - Disease Control",
+              "code": "62",
+              "seqno": "12",
+              "percent": "100",
+              "theme3": [
+                {
+                  "name": "FY17 - Pandemic Response",
+                  "code": "626",
+                  "seqno": "13",
+                  "percent": "100"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "FY17 - Private Sector Development",
+          "code": "20",
+          "seqno": "1",
+          "percent": "300",
+          "theme2": [
+            {
+              "name": "FY17 - Enterprise Development",
+              "code": "24",
+              "seqno": "4",
+              "percent": "100",
+              "theme3": [
+                {
+                  "name": "FY17 - Entrepreneurship",
+                  "code": "241",
+                  "seqno": "5",
+                  "percent": "100"
+                }
+              ]
+            },
+            {
+              "name": "FY17 - ICT",
+              "code": "26",
+              "seqno": "6",
+              "percent": "100",
+              "theme3": [
+                {
+                  "name": "FY17 - ICT Solutions",
+                  "code": "261",
+                  "seqno": "7",
+                  "percent": "100"
+                }
+              ]
+            },
+            {
+              "name": "FY17 - Jobs",
+              "code": "22",
+              "seqno": "2",
+              "percent": "100",
+              "theme3": [
+                {
+                  "name": "FY17 - Job Creation",
+                  "code": "221",
+                  "seqno": "3",
+                  "percent": "100"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "FY17 - Social Development and Protection",
+          "code": "50",
+          "seqno": "8",
+          "percent": "100",
+          "theme2": [
+            {
+              "name": "FY17 - Social Inclusion",
+              "code": "51",
+              "seqno": "9",
+              "percent": "100",
+              "theme3": [
+                {
+                  "name": "FY17 - Other Excluded Groups",
+                  "code": "512",
+                  "seqno": "10",
+                  "percent": "100"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "FY17 - Urban and Rural Development",
+          "code": "70",
+          "seqno": "14",
+          "percent": "200",
+          "theme2": [
+            {
+              "name": "FY17 - Cultural Heritage",
+              "code": "73",
+              "seqno": "17",
+              "percent": "100"
+            },
+            {
+              "name": "FY17 - Rural Development",
+              "code": "72",
+              "seqno": "15",
+              "percent": "100",
+              "theme3": [
+                {
+                  "name": "FY17 - Rural Markets",
+                  "code": "721",
+                  "seqno": "16",
+                  "percent": "100"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "P160427": {
+      "id": "P160427",
+      "proj_id": "P160427",
+      "status": "Active",
+      "boardapprovaldate": "2019-06-20T00:00:00Z",
+      "theme_list": [
+        {
+          "name": "FY17 - Environment and Natural Resource Management",
+          "code": "80",
+          "seqno": "1",
+          "percent": "100",
+          "theme2": [
+            {
+              "name": "FY17 - Climate change",
+              "code": "81",
+              "seqno": "2",
+              "percent": "20",
+              "theme3": [
+                {
+                  "name": "FY17 - Adaptation",
+                  "code": "812",
+                  "seqno": "4",
+                  "percent": "20"
+                },
+                {
+                  "name": "FY17 - Mitigation",
+                  "code": "811",
+                  "seqno": "3",
+                  "percent": "0"
+                }
+              ]
+            },
+            {
+              "name": "FY17 - Energy",
+              "code": "86",
+              "seqno": "5",
+              "percent": "100",
+              "theme3": [
+                {
+                  "name": "FY17 - Energy Efficiency",
+                  "code": "861",
+                  "seqno": "6",
+                  "percent": "99"
+                },
+                {
+                  "name": "FY17 - Energy Policies & Reform",
+                  "code": "862",
+                  "seqno": "7",
+                  "percent": "99"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "P164909": {
+      "id": "P164909",
+      "proj_id": "P164909",
+      "status": "Active",
+      "boardapprovaldate": "2019-06-27T00:00:00Z",
+      "theme_list": [
+        {
+          "name": "FY17 - Environment and Natural Resource Management",
+          "code": "80",
+          "seqno": "1",
+          "percent": "0",
+          "theme2": [
+            {
+              "name": "FY17 - Climate change",
+              "code": "81",
+              "seqno": "2",
+              "percent": "0",
+              "theme3": [
+                {
+                  "name": "FY17 - Mitigation",
+                  "code": "811",
+                  "seqno": "3",
+                  "percent": "0"
+                }
+              ]
+            },
+            {
+              "name": "FY17 - Energy",
+              "code": "86",
+              "seqno": "4",
+              "percent": "0",
+              "theme3": [
+                {
+                  "name": "FY17 - Energy Efficiency",
+                  "code": "861",
+                  "seqno": "5",
+                  "percent": "0"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "P505889": {
+      "id": "P505889",
+      "proj_id": "P505889",
+      "status": "Active",
+      "boardapprovaldate": "2025-03-25T00:00:00Z",
+      "theme_list": [
+        {
+          "name": "FY17 - Public Sector Management",
+          "code": "40",
+          "seqno": "0",
+          "theme2": [
+            {
+              "name": "FY17 - Public Administration",
+              "code": "43",
+              "seqno": "0",
+              "theme3": [
+                {
+                  "name": "FY17 - Transparency, Accountability and Good Governance",
+                  "code": "432",
+                  "seqno": "1"
+                }
+              ]
+            },
+            {
+              "name": "FY17 - Public Finance Management",
+              "code": "41",
+              "seqno": "0",
+              "theme3": [
+                {
+                  "name": "FY17 - Public Expenditure Management",
+                  "code": "411",
+                  "seqno": "2"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "P515194": {
+      "id": "P515194",
+      "proj_id": "P515194",
+      "status": "Active",
+      "boardapprovaldate": "2026-11-13T00:00:00Z"
+    }
+  },
+  "facets": {}
+}

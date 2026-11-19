@@ -298,6 +298,7 @@ describe('worldbankGetIndicator', () => {
     expect(worldbankGetIndicator.errors?.map((e) => e.reason)).toEqual([
       'indicator_not_found',
       'multiple_indicators',
+      'upstream_timeout',
     ]);
   });
 

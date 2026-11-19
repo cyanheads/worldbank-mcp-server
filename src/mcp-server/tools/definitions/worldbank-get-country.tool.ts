@@ -16,39 +16,41 @@ import { getWorldBankApiService } from '@/services/worldbank/worldbank-service.j
 export const worldbankGetCountry = tool('worldbank_get_country', {
   title: 'Get World Bank Country',
   description:
-    'Fetch metadata for one country or aggregate entity: ISO codes, region, income level, lending type, capital, and coordinates. Accepts an ISO2 code (US, DE), an ISO3 code (USA, DEU), or a World Bank aggregate code (EAS, HIC, WLD); "all" and lists of codes are rejected. Use worldbank_list_countries to browse valid codes.',
+    'Fetch metadata for one country or aggregate: ISO codes, region, income level, lending type, capital, and coordinates. Browse codes with worldbank_list_countries.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({
     country_code: z
       .string()
       .regex(COUNTRY_CODE, COUNTRY_CODE_MESSAGE)
       .describe(
-        'One country code. Accepts ISO2 (US), ISO3 (USA), or aggregate code (EAS, HIC, WLD) — not "all" or a list of codes. Use worldbank_list_countries to browse valid codes.',
+        'One ISO2 (US), ISO3 (USA), or World Bank aggregate (EAS, HIC, WLD) code; not "all" or a list.',
       ),
   }),
   output: z.object({
     id: z.string().describe('Country or aggregate ID.'),
-    iso2: z.string().describe('ISO2 country code.'),
+    iso2: z.string().describe('ISO2 code.'),
     name: z.string().describe('Country or aggregate name.'),
     region: z
       .object({
         id: z.string().describe('Region code.'),
         name: z.string().describe('Region name.'),
       })
-      .describe('World Bank region this country belongs to.'),
+      .describe('World Bank region.'),
     incomeLevel: z
       .object({
         id: z.string().describe('Income level code.'),
         name: z.string().describe('Income level name.'),
       })
       .describe('World Bank income classification.'),
-    lendingType: z.string().describe('World Bank lending type classification.'),
-    capitalCity: z.string().describe('Capital city name (empty for aggregates).'),
-    longitude: z.string().describe('Capital longitude (empty for aggregates).'),
-    latitude: z.string().describe('Capital latitude (empty for aggregates).'),
+    lendingType: z.string().describe('World Bank lending type.'),
+    capitalCity: z.string().describe('Capital city.'),
+    longitude: z.string().describe('Capital longitude.'),
+    latitude: z.string().describe('Capital latitude.'),
     isAggregate: z
       .boolean()
-      .describe('True when this entry is a regional or income-group aggregate.'),
+      .describe(
+        'True for a regional or income-group aggregate, whose capitalCity, longitude, and latitude are empty.',
+      ),
   }),
 
   errors: [
@@ -56,16 +58,25 @@ export const worldbankGetCountry = tool('worldbank_get_country', {
       reason: 'country_not_found',
       severity: 'notice',
       code: JsonRpcErrorCode.NotFound,
-      when: 'The country code does not exist in the World Bank API.',
+      when: 'No country or aggregate has this code.',
       recovery: 'Use worldbank_list_countries to browse valid ISO2, ISO3, and aggregate codes.',
     },
     {
       reason: 'multiple_countries',
       severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'The code is "all", or another selector the World Bank resolves to more than one country.',
+      when: 'The code selects more than one country, as "all" does.',
       recovery:
         'Pass a single country code, or use worldbank_list_countries to list several countries.',
+    },
+    {
+      reason: 'upstream_timeout',
+      code: JsonRpcErrorCode.Timeout,
+      retryable: true,
+      thrownBy: 'service',
+      when: "The World Bank Indicators API did not answer within the call's 50-second budget.",
+      recovery:
+        'The request is valid. Repeat the same call unchanged after about a minute: the World Bank Indicators API finishes a request after this server stops waiting and caches the answer, so the repeat is usually served from that cache. A changed call starts a new computation.',
     },
   ],
 

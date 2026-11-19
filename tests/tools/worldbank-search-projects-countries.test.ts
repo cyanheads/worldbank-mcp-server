@@ -4,7 +4,9 @@
  * Bank country index, the four economies the portfolio files under legacy codes
  * resolve from either identifier, WDI aggregates and unknown codes are rejected
  * before the Projects API is asked, and a search in two-character codes never
- * touches the Indicators API.
+ * touches the Indicators API. A wire row's sectors and themes reach both
+ * surfaces, and a name a row reports, taken back as a filter, reaches upstream
+ * in the spelling the index stores.
  * @module tests/tools/worldbank-search-projects-countries.test
  */
 
@@ -307,6 +309,78 @@ describe('worldbank_search_projects country resolution', () => {
     expect(requests().projects[1]?.get('sector_exact')?.split('^')).toContain(
       'Public Administration - Water, Sanitation, and Solid Waste Management ',
     );
+  });
+
+  it('reports a wire row’s themes on both surfaces and takes a reported name back', async () => {
+    // P508964's theme_list as upstream stored it (2026-11-19): a level-2 name with a leading space.
+    const tagged = {
+      ...project('P508964', 'KE'),
+      theme_list: [
+        {
+          name: 'Private Sector Development',
+          code: '120000',
+          seqno: '1',
+          percent: '100',
+          theme2: [
+            {
+              name: ' Innovation, Technology, and Green Competitiveness',
+              code: '120300',
+              seqno: '2',
+              percent: '100',
+              theme3: [
+                {
+                  name: 'Technology Adoption by Firms',
+                  code: '120301',
+                  seqno: '3',
+                  percent: '100',
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    // Matched by the filter, as P515194 is by Adaptation, yet it publishes no theme_list.
+    const untagged = project('P515194', 'KE');
+    serve([tagged, untagged]);
+    const first = await runToolContract(worldbankSearchProjects, {
+      countries: 'KE',
+      theme: ['Technology Adoption by Firms'],
+      include_themes: true,
+    });
+
+    expect(first.isError).toBeFalsy();
+    const sent = requests().projects[0];
+    expect(sent?.get('fl')?.split(',')).toContain('theme_list');
+    expect(sent?.get('theme_exact')).toBe(
+      'Technology Adoption by Firms^ Technology Adoption by Firms^FY17 - Technology Adoption by Firms',
+    );
+    const innovation = 'Innovation, Technology, and Green Competitiveness';
+    const themes = [
+      { name: 'Private Sector Development', code: '120000', parent: null, percent: 100 },
+      { name: innovation, code: '120300', parent: 'Private Sector Development', percent: 100 },
+      { name: 'Technology Adoption by Firms', code: '120301', parent: innovation, percent: 100 },
+    ];
+    expect(first.structuredContent).toMatchObject({
+      projects: [{ themes }, { id: 'P515194', themes: [] }],
+      appliedFilters: { theme: ['Technology Adoption by Firms'], includeThemes: true },
+    });
+    const text = first.content.map((block) => ('text' in block ? block.text : '')).join('\n');
+    expect(text).toContain(
+      `- **themes:** Private Sector Development (120000 · parent null · 100%); ${innovation} (120300 · parent Private Sector Development · 100%); Technology Adoption by Firms (120301 · parent ${innovation} · 100%)\n`,
+    );
+    expect(text).toContain('(P515194)');
+    expect(text).toContain('- **themes:** none\n');
+
+    const second = await runToolContract(worldbankSearchProjects, { theme: [innovation] });
+    expect(second.isError).toBeFalsy();
+    expect(requests().projects[1]?.get('theme_exact')?.split('^')).toContain(` ${innovation}`);
+    // Not asked for, so neither requested nor reported.
+    expect(requests().projects[1]?.get('fl')?.split(',')).not.toContain('theme_list');
+    expect(second.structuredContent).toMatchObject({
+      projects: [{ themes: null }, { themes: null }],
+      appliedFilters: { includeThemes: false },
+    });
   });
 
   it('no longer tells the caller to convert ISO3 to ISO2 when a code matches nothing', async () => {

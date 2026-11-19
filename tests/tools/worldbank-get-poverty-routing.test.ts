@@ -431,7 +431,8 @@ describe('worldbank_get_poverty routing', () => {
     serve((params) => (params.get('country') === 'NGA' ? [surveyRow('NGA', 2018)] : undefined));
     await call({ countries: 'NGA', year: '2018' });
     const before = requested().length;
-    await call({ countries: 'NGA', year: '2018' });
+    // Another year, so the passes themselves are not answered from the held responses.
+    await call({ countries: 'NGA', year: '2019' });
 
     // The survey request and the gap-filled one beside it, and nothing else.
     const second = requested().slice(before);
@@ -520,7 +521,9 @@ describe('worldbank_get_poverty routing', () => {
         pipRequests().filter((url) => url.searchParams.get('fill_gaps') === 'true'),
       ).toHaveLength(attempts);
       expect(structured.notice).toMatch(UNAVAILABLE_NOTICE);
-      expect(structured.notice).toMatch(/may be missing; retry the same request to include it\.$/);
+      expect(structured.notice).toMatch(
+        /may be missing; repeat the same request in about a minute to include it\.$/,
+      );
       expect(structured.notice).not.toMatch(/Some rows are gap-filled/);
       expect(text).toMatch(UNAVAILABLE_NOTICE);
       expect(text).toContain('Economy KEN (KEN) — 2020, national');
@@ -618,6 +621,315 @@ describe('worldbank_get_poverty routing', () => {
     expect(structured.estimates.map((row) => row.gini)).toEqual([0.23, 0.4405]);
     expect(pipRequests()).toHaveLength(1);
     expect(structured.notice ?? '').not.toMatch(/gap-filled/);
+  });
+
+  // ─── The call deadline ────────────────────────────────────────────────────
+
+  /**
+   * Every request `match` picks waits `ms` of fake time — or forever, when `ms`
+   * is undefined — before it is served as before, rejecting with its signal's
+   * reason if that aborts first, as `fetch` does. The returned list records
+   * each picked request and, once it fired, when its signal aborted.
+   */
+  function hold(match: (url: URL) => boolean, ms?: number) {
+    const serveRest = fetchMock.getMockImplementation() as typeof fetch;
+    const held: Array<{ url: URL; abortedAt?: number }> = [];
+    fetchMock.mockImplementation((input, init) => {
+      const url = new URL(String(input instanceof Request ? input.url : input));
+      if (!match(url)) return serveRest(input, init);
+      const entry: { url: URL; abortedAt?: number } = { url };
+      held.push(entry);
+      return new Promise<Response>((resolve, reject) => {
+        const signal = init?.signal;
+        signal?.addEventListener(
+          'abort',
+          () => {
+            entry.abortedAt = Date.now();
+            reject(signal.reason);
+          },
+          { once: true },
+        );
+        if (ms !== undefined) setTimeout(() => resolve(serveRest(input, init)), ms);
+      });
+    });
+    return held;
+  }
+
+  const isPip = (url: URL, fillGaps?: 'true' | 'false') =>
+    url.pathname === '/pip/v1/pip' &&
+    (fillGaps === undefined || url.searchParams.get('fill_gaps') === fillGaps);
+
+  /** BOL 2016 and KEN 2020 surveyed, IND 2020 estimated, AFG 2020 from the all-economy response. */
+  const deadlineFixture = (params: URLSearchParams) => {
+    const country = params.get('country');
+    const survey = params.get('fill_gaps') === 'false';
+    if (country === 'BOL') return [surveyedYear(params, 'BOL', 2016)];
+    if (country === 'KEN') return [surveyedYear(params, 'KEN', 2020)];
+    if (country === 'KEN,IND') {
+      return survey
+        ? [surveyRow('KEN', 2020)]
+        : [estimateRow('KEN', 2020), estimateRow('IND', 2020)];
+    }
+    if (country === 'all') {
+      return [estimateRow('AFG', 2020, { estimation_type: 'CMD estimation' })];
+    }
+    return;
+  };
+  const deadlineGroups = (params: URLSearchParams) =>
+    params.get('country') === 'SSF' ? [groupRow('SSF', 'Sub-Saharan Africa', 2022)] : undefined;
+
+  /**
+   * Step fake time forward until `pending` settles, and report when it settled.
+   * Fake time only moves when the test moves it, so the instant is the one the
+   * deadline timer fired at, not a measurement.
+   */
+  async function stepUntilSettled<T>(pending: () => Promise<T>) {
+    const start = Date.now();
+    let settledAt: number | undefined;
+    const run = pending().finally(() => {
+      settledAt = Date.now();
+    });
+    while (settledAt === undefined) await vi.advanceTimersByTimeAsync(250);
+    return { value: await run, elapsedMs: (settledAt as number) - start };
+  }
+
+  /** Run `body` with `setTimeout` and the clock faked, restoring real time after. */
+  async function underFakeTime<T>(body: () => Promise<T>): Promise<T> {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    try {
+      return await body();
+    } finally {
+      vi.useRealTimers();
+    }
+  }
+
+  /** {@link stepUntilSettled} in a fake-time session of its own. */
+  const settledAfter = <T>(pending: () => Promise<T>) =>
+    underFakeTime(() => stepUntilSettled(pending));
+
+  const PIP_EXPIRY =
+    "The World Bank Poverty and Inequality Platform (PIP) API did not complete the request within the call's 50 s deadline.";
+
+  it.each([
+    [
+      'the versions listing',
+      { countries: 'BOL', year: '2016' },
+      (url: URL) => url.pathname === '/pip/v1/versions',
+    ],
+    [
+      'the regions table',
+      { countries: 'BOL', year: '2016' },
+      (url: URL) => url.pathname === '/pip/v1/aux' && url.searchParams.get('table') === 'regions',
+    ],
+    ['the survey pass', { countries: 'BOL', year: '2016' }, (url: URL) => isPip(url, 'false')],
+    [
+      'the survey pass with fill_gaps off',
+      { countries: 'BOL', year: '2016', fill_gaps: false },
+      (url: URL) => isPip(url, 'false'),
+    ],
+    [
+      'the gap-filled pass of a shape that needs it',
+      { countries: ['KEN', 'IND'], year: '2020' },
+      (url: URL) => isPip(url, 'true'),
+    ],
+    [
+      'an aggregate',
+      { countries: 'SSF', year: '2022' },
+      (url: URL) => url.pathname === '/pip/v1/pip-grp',
+    ],
+    [
+      "the model-estimate path's economy list",
+      { countries: 'AFG', year: '2020' },
+      (url: URL) =>
+        url.pathname === '/pip/v1/aux' && url.searchParams.get('table') === 'country_list',
+    ],
+    [
+      "the model-estimate path's all-economy pass",
+      { countries: 'AFG', year: '2020' },
+      (url: URL) => isPip(url) && url.searchParams.get('country') === 'all',
+    ],
+  ])(
+    'settles a call whose wait on %s never ends as upstream_timeout at the 50 s budget',
+    async (_wait, input, stalled) => {
+      serve(deadlineFixture, deadlineGroups);
+      const held = hold(stalled);
+      const { value, elapsedMs } = await settledAfter(() => failure(input));
+
+      // Every stall outlasts the budget on its own (each attempt 90 s), so only the budget ends the call.
+      expect(held.length).toBeGreaterThan(0);
+      expect(held.every((request) => request.abortedAt === undefined)).toBe(true);
+      expect(elapsedMs).toBe(50_000);
+      expect(value.error).toMatchObject({
+        code: JsonRpcErrorCode.Timeout,
+        message: PIP_EXPIRY,
+        data: {
+          reason: 'upstream_timeout',
+          retryable: true,
+          budgetMs: 50_000,
+          recovery: { hint: expect.stringMatching(/^The request is valid\. Repeat the same call/) },
+        },
+      });
+      expect(value.text).toContain(PIP_EXPIRY);
+      expect(value.text).toContain('Recovery: The request is valid. Repeat the same call');
+    },
+  );
+
+  it('settles a call whose ISO2 country-listing lookup never ends as upstream_timeout at the 50 s budget', async () => {
+    serve(deadlineFixture);
+    const held = hold((url) => url.pathname === '/v2/country');
+    const { value, elapsedMs } = await settledAfter(() =>
+      failure({ countries: 'KE', year: '2020' }),
+    );
+
+    expect(held.length).toBeGreaterThan(0);
+    expect(elapsedMs).toBe(50_000);
+    expect(pipRequests()).toHaveLength(0);
+    expect(value.error).toMatchObject({
+      code: JsonRpcErrorCode.Timeout,
+      message:
+        "The World Bank Indicators API country listing, which resolves an ISO2 code to the three-character code PIP takes, did not load within the call's 50 s deadline.",
+      data: {
+        reason: 'upstream_timeout',
+        retryable: true,
+        budgetMs: 50_000,
+        countries: ['KE'],
+        recovery: {
+          hint: expect.stringMatching(
+            /Passing each economy by its ISO3 code needs no country-listing lookup\.$/,
+          ),
+        },
+      },
+    });
+  });
+
+  it('spends one budget across the ISO2 lookup and the PIP requests after it', async () => {
+    serve(deadlineFixture);
+    hold((url) => url.pathname === '/v2/country', 30_000);
+    hold((url) => isPip(url, 'false'));
+    const { value, elapsedMs } = await settledAfter(() =>
+      failure({ countries: 'KE', year: '2020' }),
+    );
+
+    expect(requestsTo('/v2/country')).toHaveLength(1);
+    expect(pipRequests().map((url) => url.searchParams.get('country'))).toEqual(['KEN', 'KEN']);
+    expect(elapsedMs).toBe(50_000);
+    expect(value.error).toMatchObject({
+      message: PIP_EXPIRY,
+      data: { reason: 'upstream_timeout', countries: ['KE'] },
+    });
+  });
+
+  it('answers the same call repeated after its timeout from the request that ran on, with no new request', async () => {
+    serve(deadlineFixture);
+    // PIP takes 55 s over the gap-filled pass: past the budget, inside its own 90 s,
+    // and inside the 60 s these fixtures hold the reference listings for.
+    hold((url) => isPip(url, 'true'), 55_000);
+    const input = { countries: ['KEN', 'IND'], year: '2020' };
+
+    await underFakeTime(async () => {
+      const timedOut = await stepUntilSettled(() => failure(input));
+      expect(timedOut.elapsedMs).toBe(50_000);
+      expect(timedOut.value.error.data.reason).toBe('upstream_timeout');
+      const before = requested().length;
+
+      await vi.advanceTimersByTimeAsync(6_000);
+      const repeat = await stepUntilSettled(() => call(input));
+      expect(summary(repeat.value.structured)).toEqual([
+        ['IND', 2020, 'extrapolation'],
+        ['KEN', 2020, 'survey'],
+      ]);
+      expect(repeat.elapsedMs).toBe(0);
+      expect(requested().slice(before)).toEqual([]);
+    });
+    expect(pipRequests()).toHaveLength(2);
+  });
+
+  it("runs a timed-out call's request to its own 90 s cut, without retrying the cut attempt, and holds no failure", async () => {
+    serve(deadlineFixture);
+    const held = hold((url) => isPip(url, 'true'));
+    const input = { countries: ['KEN', 'IND'], year: '2020' };
+
+    await underFakeTime(async () => {
+      const start = Date.now();
+      const { elapsedMs } = await stepUntilSettled(() => failure(input));
+      expect(elapsedMs).toBe(50_000);
+
+      await vi.advanceTimersByTimeAsync(150_000);
+      expect(held).toHaveLength(1);
+      expect((held[0]?.abortedAt ?? 0) - start).toBe(90_000);
+
+      // The cut request failed, so it is not held: the same call asks again.
+      await stepUntilSettled(() => failure(input));
+      expect(held).toHaveLength(2);
+    });
+  });
+
+  it('settles a repeat that joined a request PIP never finished as a declared upstream_timeout at its 90 s cut', async () => {
+    serve(deadlineFixture);
+    const held = hold((url) => isPip(url, 'true'));
+    const input = { countries: ['KEN', 'IND'], year: '2020' };
+
+    await underFakeTime(async () => {
+      await stepUntilSettled(() => failure(input));
+      await vi.advanceTimersByTimeAsync(5_000);
+      // The repeat joins the request still running, 55 s into its 90 s.
+      const repeat = await stepUntilSettled(() => failure(input));
+
+      expect(held).toHaveLength(1);
+      expect(repeat.elapsedMs).toBe(35_000);
+      expect(repeat.value.error).toMatchObject({
+        code: JsonRpcErrorCode.Timeout,
+        message: 'PIP did not finish the request within the 90 s this server gives it.',
+        data: {
+          reason: 'upstream_timeout',
+          retryable: true,
+          countries: ['KEN', 'IND'],
+          recovery: {
+            hint: expect.stringMatching(/^PIP keeps nothing for a request it did not finish/),
+          },
+        },
+      });
+      expect(repeat.value.text).toContain(
+        'Recovery: PIP keeps nothing for a request it did not finish',
+      );
+    });
+  });
+
+  it('settles a caller abort as the cancellation and leaves a concurrent identical call its answer', async () => {
+    serve(deadlineFixture);
+    const leaving = new AbortController();
+    const serveHeld = hold((url) => isPip(url, 'true'), 5_000);
+    const serveRest = fetchMock.getMockImplementation() as typeof fetch;
+    // Cancel the first caller from inside the fetch, once the gap-filled request is in flight.
+    fetchMock.mockImplementation((input, init) => {
+      const pending = serveRest(input, init);
+      if (serveHeld.length === 1) setTimeout(() => leaving.abort(new Error('caller went away')), 0);
+      return pending;
+    });
+    const input = { countries: ['KEN', 'IND'], year: '2020' };
+
+    const { value } = await settledAfter(() =>
+      Promise.all([
+        runToolContract(worldbankGetPoverty, input as never, {
+          context: { signal: leaving.signal },
+        }),
+        runToolContract(worldbankGetPoverty, input as never),
+      ]),
+    );
+    const [left, stayed] = value;
+
+    expect(left.isError).toBe(true);
+    expect((left.structuredContent as { error: { code: number } }).error.code).toBe(
+      JsonRpcErrorCode.RequestCancelled,
+    );
+    expect(stayed.isError).toBeFalsy();
+    expect(summary(stayed.structuredContent as Structured)).toEqual([
+      ['IND', 2020, 'extrapolation'],
+      ['KEN', 2020, 'survey'],
+    ]);
+    // One request per pass, and the shared one never saw the caller's abort.
+    expect(pipRequests()).toHaveLength(2);
+    expect(serveHeld.map((request) => request.abortedAt)).toEqual([undefined]);
   });
 
   // ─── #53: two-character codes ─────────────────────────────────────────────
@@ -822,15 +1134,13 @@ describe('worldbank_get_poverty routing', () => {
       String(first.structured.appliedFilters.countries),
     ]);
 
+    expect(groupRequests()).toHaveLength(1);
     for (const echoed of emitted) {
-      const before = groupRequests().length;
       const again = await call({ countries: echoed, year: '2022' });
-      const request = groupRequests()[before];
 
-      expect(request?.searchParams.get('group_by')).toBe(
-        firstRequest?.searchParams.get('group_by'),
-      );
-      expect(request?.searchParams.get('country')).toBe(firstRequest?.searchParams.get('country'));
+      // Held responses are keyed by URL: the code sent back asks for the very
+      // request the first call made, so it is answered without a new one.
+      expect(groupRequests()).toEqual([firstRequest]);
       expect(again.structured.estimates.map((row) => row.countryCode)).toEqual(
         first.structured.estimates.map((row) => row.countryCode),
       );

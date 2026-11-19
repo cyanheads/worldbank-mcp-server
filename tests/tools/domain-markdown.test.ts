@@ -80,6 +80,7 @@ const projects = {
       financialTypes: [raw],
       majorSectors: [raw],
       sectors: [{ name: raw, code: raw, majorSector: raw, percent: null }],
+      themes: [{ name: raw, code: raw, parent: raw, percent: null }],
       url: raw,
       abstract: raw,
     },
@@ -90,7 +91,7 @@ it.each([
   ['data', () => worldbankGetData.format!(data), 7],
   ['countries', () => worldbankListCountries.format!(country), 3],
   ['poverty', () => worldbankGetPoverty.format!(poverty), 11],
-  ['projects', () => worldbankSearchProjects.format!(projects), 17],
+  ['projects', () => worldbankSearchProjects.format!(projects), 20],
 ] as const)('preserves each hostile %s field at its rendering boundary', (_name, render, count) => {
   const before = JSON.stringify([data, country, poverty, projects]);
   const text = render()
@@ -137,7 +138,9 @@ it('escapes caller text in each custom applied-filter trailer', () => {
     worldbankSearchProjects.enrichmentTrailer!.appliedFilters!.render!({
       query: raw,
       sector: [raw],
+      theme: [raw],
       includeAbstract: true,
+      includeThemes: true,
       page: 1,
       perPage: 1000,
       requestedPerPage: 2000,
@@ -150,7 +153,7 @@ it('escapes caller text in each custom applied-filter trailer', () => {
   expect(filters[2]).toContain(
     `countries=${escaped}, ppp_version=2021, release_version=${escaped}`,
   );
-  expect(filters[3]).toContain(`query=${escaped}, sector=${escaped}`);
+  expect(filters[3]).toContain(`query=${escaped}, sector=${escaped}, theme=${escaped}`);
   for (const text of filters)
     expect(text).toMatch(/per_page=(?:1000 \(requested 2000\)|300 \(requested 500\))$/);
 });

@@ -6,9 +6,15 @@
 /**
  * Most observations one worldbank_get_data page holds, on every data path — an
  * upstream page of the whole series, the rows a date window or `mrv`/`mrnev`
- * selects, and the source-scoped API's.
+ * selects, and the source-scoped API's. A standard row runs 125–197 B of
+ * `structuredContent` (mean 136 B) and about 21 B of `content[]`, so a full page
+ * stays under 800 KB of `structuredContent`. A source-scoped row also carries its
+ * `dimension`: with every field at its longest, a full page is 1,102,043 B of
+ * `structuredContent` (275.5 B a row) and 391,113 B of `content[]` (97.8 B).
+ * The whole-series path sends this size upstream as `per_page`, which the data
+ * endpoint rejects above 32,767.
  */
-export const MAX_OBSERVATIONS_PER_PAGE = 1000;
+export const MAX_OBSERVATIONS_PER_PAGE = 4000;
 
 /** Most entries one worldbank_list_countries page holds. */
 export const MAX_COUNTRIES_PER_PAGE = 300;

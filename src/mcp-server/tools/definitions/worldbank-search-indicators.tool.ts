@@ -24,7 +24,8 @@ import { getWorldBankApiService } from '@/services/worldbank/worldbank-service.j
 
 export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
   title: 'Search World Bank Indicators',
-  description: `Search the 29,500+ World Bank indicator catalog by keyword, topic, or source, returning indicator IDs and metadata for worldbank_get_data. Provide at least one of query, topic_id, or source_id; a topic and a source together narrow to indicators in both. A keyword query matches every term against indicator ID, name, and full description, in any word order, across the whole catalog or the whole selected topic or source; punctuation is ignored, so the query needs at least one letter or digit. Exact ID or name matches rank first, then names starting with the phrase as whole words, then whole-phrase matches, then matches where every term is a whole word of the ID or name, then other ID/name matches, then description-only matches; within each of those, World Development Indicators series come first, then other live sources, then archives, and a series comes ahead of its own breakdowns by sex, area, or age. Each indicator ID appears once, even where the catalog publishes it under two sources. Each result carries the first ${INDICATOR_NOTE_EXCERPT_CHARS} characters of its description; worldbank_get_indicator returns the whole of it. Find topic IDs with worldbank_list_topics and source IDs with worldbank_list_sources.`,
+  description:
+    'Search the World Bank indicator catalog by keyword, topic, or source for indicator IDs to pass to worldbank_get_data. Provide at least one of query, topic_id, or source_id; together they combine by AND. Exact ID or name matches rank first, then names starting with the phrase as whole words, whole-phrase matches, matches where every term is a whole word of the ID or name, other ID or name matches, and description-only matches; within each, World Development Indicators come first, then other live sources, then archives; among names starting with the phrase, one continuing it with ", total" leads its source (Population, total for population); and a series precedes its breakdowns by sex, area, or age. Each indicator ID appears once, even when two sources publish it.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   inputAliases: { limit: 'per_page' },
   input: z.object({
@@ -32,23 +33,21 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
       .string()
       .optional()
       .describe(
-        'Keyword search terms — an indicator name, ID, or any words from either (e.g. "GDP per capita", "NY.GDP.MKTP.CD", "CO2 emissions"). Every term must match; punctuation is ignored, so the query needs at least one letter or digit. At least one of query, topic_id, or source_id must be provided.',
+        'Keywords, an indicator name, or an ID (e.g. "GDP per capita", "NY.GDP.MKTP.CD"); every term must match the ID, name, or full description, in any order. Punctuation is ignored, so it needs a letter or digit.',
       ),
     topic_id: z
       .string()
       .regex(CATALOG_FILTER_ID, TOPIC_ID_MESSAGE)
       .optional()
-      .describe(
-        'Filter by topic ID (e.g. "1" for Agriculture, "3" for Economy & Growth). Use worldbank_list_topics to browse valid IDs.',
-      ),
+      .describe('Topic ID from worldbank_list_topics (e.g. "3" for Economy & Growth).'),
     source_id: z
       .string()
       .regex(CATALOG_FILTER_ID, SOURCE_ID_MESSAGE)
       .optional()
       .describe(
-        'Filter by data source ID (e.g. "2" for World Development Indicators). Use worldbank_list_sources to browse valid IDs.',
+        'Source ID from worldbank_list_sources (e.g. "2" for World Development Indicators).',
       ),
-    page: z.number().int().min(1).default(1).describe('Pagination page number (1-based).'),
+    page: z.number().int().min(1).default(1).describe('Page number, 1-based.'),
     per_page: perPageInput(MAX_INDICATORS_PER_PAGE),
   }),
   output: z.object({
@@ -56,18 +55,14 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
       .array(
         z
           .object({
-            id: z
-              .string()
-              .describe(
-                'Indicator ID (e.g. NY.GDP.PCAP.CD). Use as indicator_id in worldbank_get_data.',
-              ),
+            id: z.string().describe('Indicator ID (e.g. NY.GDP.PCAP.CD).'),
             name: z.string().describe('Indicator name.'),
             sourceId: z.string().describe('Source dataset ID.'),
             sourceName: z.string().describe('Source dataset name.'),
             sourceNote: z
               .string()
               .describe(
-                `Indicator description, cut to its first ${INDICATOR_NOTE_EXCERPT_CHARS} characters and marked with … when longer. worldbank_get_indicator returns it whole.`,
+                `Indicator description, cut to its first ${INDICATOR_NOTE_EXCERPT_CHARS} characters and marked with … when longer; worldbank_get_indicator returns it whole.`,
               ),
             topics: z
               .array(
@@ -76,13 +71,13 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
                     id: z.string().describe('Topic ID.'),
                     name: z.string().describe('Topic name.'),
                   })
-                  .describe('A thematic topic entry.'),
+                  .describe('A topic.'),
               )
-              .describe('Thematic topics this indicator belongs to.'),
+              .describe('Topics this indicator belongs to.'),
           })
-          .describe('A matching indicator with metadata.'),
+          .describe('A matching indicator.'),
       )
-      .describe('Matching indicators for this page.'),
+      .describe('Matching indicators on this page.'),
   }),
 
   // Agent-facing context: pagination totals, query echo, and empty-result guidance.
@@ -91,45 +86,29 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
   enrichment: {
     appliedFilters: z
       .object({
-        query: z
-          .string()
-          .optional()
-          .describe('Trimmed keyword query sent to the search, omitted when none was given.'),
-        topicId: z
-          .string()
-          .optional()
-          .describe('Topic ID the results were scoped to, omitted when none was given.'),
-        sourceId: z
-          .string()
-          .optional()
-          .describe('Source ID the results were scoped to, omitted when none was given.'),
-        perPage: z
-          .number()
-          .describe(
-            'Results per page actually served — the requested size or server default, reduced to the page cap when larger. totalPages is counted at this size.',
-          ),
+        query: z.string().optional().describe('query applied, trimmed.'),
+        topicId: z.string().optional().describe('topic_id applied.'),
+        sourceId: z.string().optional().describe('source_id applied.'),
+        perPage: z.number().describe('Page size served, after any reduction to the page maximum.'),
         requestedPerPage: z
           .number()
           .optional()
           .describe(
-            'Page size asked for, requested or server default, present only when it exceeded the page cap and perPage was reduced.',
+            'Page size asked for, or the server default; present only when perPage was reduced.',
           ),
       })
-      .describe(
-        'The effective search parameters, field by field — confirms which filter combination produced these results without parsing the effectiveQuery string, and the page size served.',
-      ),
-    effectiveQuery: z
-      .string()
-      .optional()
-      .describe('Active filters echoed: keyword, topic ID, and/or source ID that were applied.'),
-    totalCount: z.number().describe('Total matching indicators before pagination.'),
-    currentPage: z.number().describe('Current page number.'),
-    totalPages: z.number().describe('Total number of pages.'),
+      .describe('Parameters in force for these results; a filter not applied is omitted.'),
+    effectiveQuery: z.string().optional().describe('The applied filters as one string.'),
+    totalCount: z.number().describe('Matching indicators before pagination.'),
+    currentPage: z
+      .number()
+      .describe('Page number; past totalPages when the request ran off the end.'),
+    totalPages: z.number().describe('Total pages at perPage.'),
     notice: z
       .string()
       .optional()
       .describe(
-        'Recovery hint for an empty page — how to broaden the search when no indicators matched, or the page range that exists when the requested page is past the end — or for a page size reduced to the page cap.',
+        'Explains an empty result (how to broaden it), a page past the end, or a reduced page size.',
       ),
   },
 
@@ -165,7 +144,7 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
       reason: 'missing_filter',
       severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'None of query, topic_id, or source_id were provided.',
+      when: 'No query, topic_id, or source_id.',
       recovery:
         'Provide a keyword query, a topic_id from worldbank_list_topics, or a source_id from worldbank_list_sources.',
     },
@@ -173,7 +152,7 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
       reason: 'invalid_filter',
       severity: 'notice',
       code: JsonRpcErrorCode.NotFound,
-      when: 'The topic_id or source_id does not exist upstream.',
+      when: 'Unknown topic_id or source_id.',
       recovery:
         'Browse valid IDs with worldbank_list_topics or worldbank_list_sources, then retry with one of those.',
     },
@@ -181,9 +160,18 @@ export const worldbankSearchIndicators = tool('worldbank_search_indicators', {
       reason: 'empty_query',
       severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'The query contains no letters or digits once punctuation is ignored.',
+      when: 'query has no letter or digit.',
       recovery:
         'Provide a keyword with letters or digits, or omit query to browse by topic_id or source_id.',
+    },
+    {
+      reason: 'upstream_timeout',
+      code: JsonRpcErrorCode.Timeout,
+      retryable: true,
+      thrownBy: 'service',
+      when: "The World Bank Indicators API did not answer within the call's 50-second budget.",
+      recovery:
+        'The request is valid. Repeat the same call unchanged after about a minute: the World Bank Indicators API finishes a request after this server stops waiting and caches the answer, so the repeat is usually served from that cache. A changed call starts a new computation.',
     },
   ],
 

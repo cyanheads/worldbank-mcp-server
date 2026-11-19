@@ -6,14 +6,26 @@
  * @module tests/services/worldbank/source-scoped-data.test
  */
 
-import { JsonRpcErrorCode, type McpError } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { createInMemoryStorage, createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DimensionValue } from '@/services/worldbank/types.js';
 
+/** One attempt, handed the attempt handle the real `withRetry` passes. */
 vi.mock('@cyanheads/mcp-ts-core/utils', () => ({
   fetchWithTimeout: vi.fn(),
-  withRetry: vi.fn().mockImplementation((fn: () => unknown) => fn()),
+  withRetry: vi
+    .fn()
+    .mockImplementation(
+      (
+        fn: (attempt: { signal: AbortSignal; remainingMs: number }) => unknown,
+        options?: { signal?: AbortSignal; deadlineMs?: number },
+      ) =>
+        fn({
+          signal: options?.signal ?? new AbortController().signal,
+          remainingMs: options?.deadlineMs ?? Number.POSITIVE_INFINITY,
+        }),
+    ),
 }));
 
 vi.mock('@/config/server-config.js', () => ({
@@ -156,7 +168,10 @@ describe('WorldBankApiService.getData — source-scoped path', () => {
   >;
   let routes: Map<string, unknown>;
 
-  /** Answer every request by URL path; an unrouted path fails the test loudly. */
+  /**
+   * Answer every request by URL path; an unrouted path fails the test loudly. An
+   * `Error` entry is thrown, as `fetchWithTimeout` throws a failed status.
+   */
   function route(entries: Record<string, unknown>) {
     routes = new Map(Object.entries(entries));
     fetchMock.mockImplementation(async (url: string) => {
@@ -166,7 +181,16 @@ describe('WorldBankApiService.getData — source-scoped path', () => {
         : pathname;
       if (!routes.has(key)) throw new Error(`Unrouted upstream request: ${url}`);
       const body = routes.get(key);
+      if (body instanceof Error) throw body;
       return { text: async () => (typeof body === 'string' ? body : JSON.stringify(body)) };
+    });
+  }
+
+  /** The error `fetchWithTimeout` throws for a non-2xx status. */
+  function httpError(status: number, code: JsonRpcErrorCode) {
+    return new McpError(code, `Fetch failed. Status: ${status}`, {
+      status,
+      errorSource: 'FetchHttpError',
     });
   }
 
@@ -1671,7 +1695,7 @@ describe('WorldBankApiService.getData — source-scoped path', () => {
       'the catalog no longer lists the ID',
       [{ message: [{ id: '120', key: 'Invalid value', value: 'x' }] }],
     ],
-    ['the catalog lookup fails', '<!DOCTYPE html><html><body>503</body></html>'],
+    ['the catalog lookup answers HTTP 404', httpError(404, JsonRpcErrorCode.NotFound)],
   ])('keeps indicator_not_queryable when %s', async (_label, catalogBody) => {
     route({
       '/v2/country/SDN/indicator/SM.POP.REFG.OR': NOT_SERVED,
@@ -1690,6 +1714,31 @@ describe('WorldBankApiService.getData — source-scoped path', () => {
     expect(err.message).toContain('no catalog source could be resolved');
     expect(err.message).not.toContain('SDN');
   });
+
+  it.each([
+    ['an HTML error page', '<!DOCTYPE html><html><body>503</body></html>'],
+    ['HTTP 500', httpError(500, JsonRpcErrorCode.ServiceUnavailable)],
+  ])(
+    'reports a catalog lookup that fails with %s as unavailable, not as unqueryable',
+    async (_label, catalogBody) => {
+      route({
+        '/v2/country/SDN/indicator/SM.POP.REFG.OR': NOT_SERVED,
+        '/v2/indicator/SM.POP.REFG.OR': catalogBody,
+      });
+      const err = (await service
+        .getData(
+          { indicatorId: 'SM.POP.REFG.OR', countries: ['SDN'], page: 1, perPage: 50 },
+          createMockContext(),
+        )
+        .catch((e: unknown) => e)) as McpError;
+      expect(err).toMatchObject({ code: JsonRpcErrorCode.ServiceUnavailable });
+      expect(err.data?.reason).not.toBe('indicator_not_queryable');
+      expect(requestedPaths()).toEqual([
+        '/v2/country/SDN/indicator/SM.POP.REFG.OR',
+        '/v2/indicator/SM.POP.REFG.OR',
+      ]);
+    },
+  );
 
   it('keeps indicator_not_queryable, naming the source, when its layout cannot be addressed', async () => {
     route({

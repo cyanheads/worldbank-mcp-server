@@ -78,7 +78,7 @@ const services = vi.hoisted(() => ({
     indicators: [],
     total: 0,
     page: opts.page,
-    pages: 0,
+    pages: 1,
   })),
   searchProjects: vi.fn(async (opts: { page: number; perPage: number }) => ({
     projects: [],
@@ -188,7 +188,7 @@ describe('perPageInput', () => {
       type: 'integer',
       minimum: 1,
       description:
-        'Results per page (default: server default). Positive integers above 100 are served at that maximum with the requested and served sizes echoed and a notice. totalPages uses the served size.',
+        'Results per page (default: server default); sizes above 100 are served at that maximum, with a notice.',
     });
   });
 
@@ -251,7 +251,7 @@ describe('perPageInput', () => {
 const TOOLS = [
   {
     tool: worldbankGetData,
-    cap: 1000,
+    cap: 4000,
     args: { indicator_id: 'SP.POP.TOTL', countries: 'USA' },
     sent: () => services.getData.mock.calls[0]?.[0].perPage,
     filters: { indicatorId: 'SP.POP.TOTL', countries: 'USA', page: 1 },
@@ -289,8 +289,8 @@ const TOOLS = [
     cap: 1000,
     args: {},
     sent: () => services.searchProjects.mock.calls[0]?.[0].perPage,
-    filters: { includeAbstract: false, page: 1 },
-    trailer: 'include_abstract=false, page=1',
+    filters: { includeAbstract: false, includeThemes: false, page: 1 },
+    trailer: 'include_abstract=false, include_themes=false, page=1',
     empty:
       'No project matches this search. Filters combine by AND and match exactly. Widen the date window, add statuses, or drop words from the query, which requires every word to appear.',
   },
@@ -448,7 +448,7 @@ describe('per_page on the wire', () => {
       expect(schema, tool.name).toEqual({
         type: 'integer',
         minimum: 1,
-        description: `Results per page (default: server default). Positive integers above ${cap} are served at that maximum with the requested and served sizes echoed and a notice. totalPages uses the served size.`,
+        description: `Results per page (default: server default); sizes above ${cap} are served at that maximum, with a notice.`,
       });
     }
   });

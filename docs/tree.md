@@ -1,6 +1,6 @@
 # worldbank-mcp-server - Directory Structure
 
-Generated on: 2026-11-11 16:17:03
+Generated on: 2026-11-19 14:24:48
 
 ```text
 worldbank-mcp-server/
@@ -185,6 +185,7 @@ worldbank-mcp-server/
 │   │   │   ├── source-scoped.ts
 │   │   │   ├── types.ts
 │   │   │   └── worldbank-service.ts
+│   │   ├── call-deadline.ts
 │   │   ├── plain-prose.ts
 │   │   ├── response-budget.ts
 │   │   └── shared-load.ts
@@ -195,7 +196,9 @@ worldbank-mcp-server/
 │   ├── fixtures/
 │   │   └── indicator-ranking-catalog.json
 │   ├── helpers/
-│   │   └── linear-cpu-time.ts
+│   │   ├── held-fetch.ts
+│   │   ├── linear-cpu-time.ts
+│   │   └── served-prose.ts
 │   ├── prompts/
 │   ├── resources/
 │   │   ├── worldbank-country.resource.test.ts
@@ -211,7 +214,8 @@ worldbank-mcp-server/
 │   │   │   └── pip-service.test.ts
 │   │   ├── projects/
 │   │   │   ├── fixtures/
-│   │   │   │   └── social-union.json
+│   │   │   │   ├── social-union.json
+│   │   │   │   └── theme-lists.json
 │   │   │   ├── projects-service-http.test.ts
 │   │   │   └── projects-service.test.ts
 │   │   ├── worldbank/
@@ -219,6 +223,7 @@ worldbank-mcp-server/
 │   │   │   ├── source-scoped-data.test.ts
 │   │   │   ├── source-scoped.test.ts
 │   │   │   └── worldbank-service.test.ts
+│   │   ├── call-deadline.test.ts
 │   │   └── plain-prose.test.ts
 │   ├── tools/
 │   │   ├── catalog-markdown.test.ts
@@ -227,6 +232,7 @@ worldbank-mcp-server/
 │   │   ├── page-size-input.test.ts
 │   │   ├── page-size-reduced-notice.test.ts
 │   │   ├── service-errors-on-the-wire.test.ts
+│   │   ├── tools-list-prose.test.ts
 │   │   ├── worldbank-get-country.tool.test.ts
 │   │   ├── worldbank-get-data-countries.test.ts
 │   │   ├── worldbank-get-data-frequency.test.ts

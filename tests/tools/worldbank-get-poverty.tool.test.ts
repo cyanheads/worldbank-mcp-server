@@ -260,7 +260,7 @@ describe('worldbankGetPoverty', () => {
   });
 
   const SURVEY_ONLY_NOTICE =
-    'PIP did not return its gap-filled estimates for the surveyed economies, so their rows come from surveys alone. An estimate the surveys do not cover, such as a national figure for a year surveyed only in urban areas, may be missing; retry the same request to include it.';
+    'PIP did not return its gap-filled estimates for the surveyed economies, so their rows come from surveys alone. An estimate the surveys do not cover, such as a national figure for a year surveyed only in urban areas, may be missing; repeat the same request in about a minute to include it.';
 
   it('says on both surfaces that rows stand on surveys alone when the gap-filled estimates were unavailable', async () => {
     await stubService({ rows: [surveyRow], total: 1, gapFillUnavailable: true });
@@ -585,6 +585,7 @@ describe('worldbankGetPoverty', () => {
     ['invalid_parameter', JsonRpcErrorCode.ValidationError],
     ['ppp_version_unavailable', JsonRpcErrorCode.ValidationError],
     ['upstream_unavailable', JsonRpcErrorCode.ServiceUnavailable],
+    ['upstream_timeout', JsonRpcErrorCode.Timeout],
   ] as const)(
     'keeps the reason, its recovery, and the queried countries on a %s re-throw',
     async (reason, code) => {
@@ -622,6 +623,73 @@ describe('worldbankGetPoverty', () => {
     });
     expect(data).not.toHaveProperty('retryable');
     expect(textOf(result).trimEnd()).toMatch(/\(reason upstream_unavailable\)$/);
+  });
+
+  it("carries the call deadline's expiry to both surfaces as a retryable upstream_timeout with PIP's recovery", async () => {
+    const { callDeadlineExceeded } = await import('@/services/call-deadline.js');
+    const { getPipService } = await import('@/services/pip/pip-service.js');
+    vi.mocked(getPipService).mockReturnValue({
+      getPoverty: vi.fn().mockRejectedValue(callDeadlineExceeded('pip')),
+    } as never);
+    const tool = await loadTool();
+    const result = await runToolContract(tool, { countries: 'BOL', year: '2016' });
+
+    const error = (
+      result.structuredContent as {
+        error: { code: number; message: string; data: Record<string, unknown> };
+      }
+    ).error;
+    expect(error.code).toBe(JsonRpcErrorCode.Timeout);
+    expect(error.message).toBe(
+      "The World Bank Poverty and Inequality Platform (PIP) API did not complete the request within the call's 50 s deadline.",
+    );
+    expect(error.data).toMatchObject({
+      reason: 'upstream_timeout',
+      retryable: true,
+      budgetMs: 50_000,
+      countries: ['BOL'],
+      recovery: {
+        hint: 'The request is valid. Repeat the same call: this server keeps the PIP request running after the deadline and answers the repeat from its result.',
+      },
+    });
+    const text = textOf(result);
+    expect(text).toContain(error.message);
+    expect(text).toContain(
+      'Recovery: The request is valid. Repeat the same call: this server keeps the PIP request running',
+    );
+    expect(text).toMatch(/\(reason upstream_timeout/);
+  });
+
+  it('hands the service a call deadline started in the handler', async () => {
+    const { callDeadlineRemainingMs, CALL_DEADLINE_MS } = await import(
+      '@/services/call-deadline.js'
+    );
+    const getPoverty = await stubService({ rows: [surveyRow], total: 1 });
+    const tool = await loadTool();
+    await tool.handler(
+      tool.input.parse({ countries: 'USA' }),
+      createMockContext({ errors: tool.errors }),
+    );
+
+    const passed = getPoverty.mock.calls[0]?.[1];
+    expect(callDeadlineRemainingMs(passed)).toBeGreaterThan(CALL_DEADLINE_MS - 1_000);
+    expect(callDeadlineRemainingMs(passed)).toBeLessThanOrEqual(CALL_DEADLINE_MS);
+  });
+
+  it('echoes the poverty line sent while rows carry the line PIP applied, as the description says', async () => {
+    await stubService({ rows: [{ ...surveyRow, povertyLine: 6.95 }], total: 1 });
+    const tool = await loadTool();
+    const result = await runToolContract(tool, { countries: 'USA', poverty_line: 6.953 });
+
+    expect(result.structuredContent).toMatchObject({
+      estimates: [{ povertyLine: 6.95 }],
+      appliedFilters: { povertyLine: 6.953 },
+    });
+    expect(textOf(result)).toContain('**povertyLine:** 6.95/day PPP');
+    expect(textOf(result)).toContain('poverty_line=6.953');
+    expect(tool.input.shape.poverty_line.description).toMatch(
+      /rounds it to two decimals \(6\.953 is computed at 6\.95\): each row's povertyLine is the line applied, appliedFilters\.povertyLine the value sent/,
+    );
   });
 
   it('lets the recovery the tool chooses win over any recovery in the service data', async () => {

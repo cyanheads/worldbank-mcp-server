@@ -55,7 +55,7 @@ describe('worldbankListSources', () => {
     const { worldbankListSources } = await import(
       '@/mcp-server/tools/definitions/worldbank-list-sources.tool.js'
     );
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: worldbankListSources.errors });
     const input = worldbankListSources.input.parse({ page: 1 });
     const result = await worldbankListSources.handler(input, ctx);
     expect(result.sources).toHaveLength(2);
@@ -93,7 +93,7 @@ describe('worldbankListSources', () => {
     const { worldbankListSources } = await import(
       '@/mcp-server/tools/definitions/worldbank-list-sources.tool.js'
     );
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: worldbankListSources.errors });
     const input = worldbankListSources.input.parse({ page: 1 });
     await worldbankListSources.handler(input, ctx);
     const enrichment = getEnrichment(ctx);
@@ -134,7 +134,7 @@ describe('worldbankListSources', () => {
     const { worldbankListSources } = await import(
       '@/mcp-server/tools/definitions/worldbank-list-sources.tool.js'
     );
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: worldbankListSources.errors });
     await worldbankListSources.handler(worldbankListSources.input.parse({}), ctx);
     expect(getEnrichment(ctx).notice).toMatch(/returned no data sources/);
     expect(getEnrichment(ctx).notice).not.toMatch(/past the end/);
@@ -144,7 +144,7 @@ describe('worldbankListSources', () => {
     const { worldbankListSources } = await import(
       '@/mcp-server/tools/definitions/worldbank-list-sources.tool.js'
     );
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: worldbankListSources.errors });
     await worldbankListSources.handler(worldbankListSources.input.parse({ page: 1 }), ctx);
     expect(getEnrichment(ctx).notice).toBeUndefined();
   });
@@ -249,7 +249,7 @@ describe('worldbankListSources', () => {
     const { worldbankListSources } = await import(
       '@/mcp-server/tools/definitions/worldbank-list-sources.tool.js'
     );
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: worldbankListSources.errors });
     await worldbankListSources.handler(worldbankListSources.input.parse({}), ctx);
 
     expect(listSources.mock.calls[0]?.slice(0, 2)).toEqual([1, 100]);

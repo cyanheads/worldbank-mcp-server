@@ -1,8 +1,8 @@
 /**
  * @fileoverview Tests for worldbank_search_projects — ISO2 enforcement in the
- * handler, country-code normalization and the applied-filter echo, the abstract
- * opt-in, the three empty-result notices the zero-hit probe distinguishes,
- * error mapping, and format() parity.
+ * handler, country-code normalization and the applied-filter echo, the sector
+ * and theme filters, the abstract and theme opt-ins, the three empty-result
+ * notices the zero-hit probe distinguishes, error mapping, and format() parity.
  * @module tests/tools/worldbank-search-projects.tool.test
  */
 
@@ -57,6 +57,12 @@ const project = {
       percent: 15,
     },
   ] as Array<{ name: string; code: string; majorSector: string; percent: number | null }>,
+  themes: null as Array<{
+    name: string;
+    code: string;
+    parent: string | null;
+    percent: number | null;
+  }> | null,
   abstract: null as string | null,
   url: 'https://projects.worldbank.org/en/projects-operations/project-detail/P513080',
 };
@@ -226,6 +232,133 @@ describe('worldbankSearchProjects', () => {
     });
     expect(textOf(result)).toContain('sector=Education');
     expect(textOf(result)).toContain('Page 3 is past the end');
+  });
+
+  // ─── Themes ───────────────────────────────────────────────────────────────
+
+  it('passes normalized theme names and echoes them on both surfaces', async () => {
+    const search = await stubService({ projects: [project], total: 2142 });
+    const tool = await loadTool();
+    const result = await runToolContract(tool, {
+      theme: ['FY17 - Adaptation', 'Adaptation', ' Gender '],
+      status: ['Active'],
+    });
+    expect(search.mock.calls[0]?.[0]).toMatchObject({
+      themes: ['Adaptation', 'Gender'],
+      statuses: ['Active'],
+      includeThemes: false,
+    });
+    expect(result.structuredContent).toMatchObject({
+      appliedFilters: { theme: ['Adaptation', 'Gender'], status: 'Active', includeThemes: false },
+      totalCount: 2142,
+    });
+    expect(textOf(result)).toContain(
+      'status=Active, theme=Adaptation, Gender, include_abstract=false, include_themes=false',
+    );
+  });
+
+  it('leaves an empty theme array unset', async () => {
+    const search = await stubService({ projects: [project], total: 1 });
+    const tool = await loadTool();
+    const result = await runToolContract(tool, { theme: [] });
+    expect(search.mock.calls[0]?.[0]).not.toHaveProperty('themes');
+    expect(result.structuredContent).not.toHaveProperty('appliedFilters.theme');
+    expect(textOf(result)).not.toContain('theme=');
+  });
+
+  it.each(['', ' ', 'FY17 - ', 'Adaptation^Mitigation'])(
+    'reports invalid theme name %j with recovery on both surfaces, before any search',
+    async (name) => {
+      const search = await stubService({});
+      const tool = await loadTool();
+      const result = await runToolContract(tool, { theme: ['Adaptation', name] });
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ValidationError,
+          message: expect.stringMatching(/^Theme names must be nonblank/),
+          data: {
+            reason: 'invalid_theme_name',
+            retryable: false,
+            recovery: {
+              hint: 'Send each nonblank theme name in its own array element, without caret separators.',
+            },
+          },
+        },
+      });
+      expect(textOf(result)).toContain('reason invalid_theme_name');
+      expect(textOf(result)).toContain('Send each nonblank theme name');
+      expect(search).not.toHaveBeenCalled();
+    },
+  );
+
+  it('leaves themes out by default and echoes the applied choice on both surfaces', async () => {
+    const search = await stubService({ projects: [project], total: 1 });
+    const tool = await loadTool();
+    expect(tool.input.parse({}).include_themes).toBe(false);
+
+    const omitted = await runToolContract(tool, { countries: 'BR' });
+    expect(search.mock.calls[0]?.[0]).toMatchObject({ includeThemes: false });
+    expect(omitted.structuredContent).toMatchObject({
+      projects: [{ themes: null }],
+      appliedFilters: { includeThemes: false },
+    });
+    expect(textOf(omitted)).toContain('include_themes=false');
+    expect(textOf(omitted)).not.toContain('**themes:**');
+
+    const themed = { ...project, themes: [] };
+    await stubService({ projects: [themed], total: 1 });
+    const opted = await runToolContract(tool, { countries: 'BR', include_themes: true });
+    expect(opted.structuredContent).toMatchObject({
+      projects: [{ themes: [] }],
+      appliedFilters: { includeThemes: true },
+    });
+    expect(textOf(opted)).toContain('include_themes=true');
+    expect(textOf(opted)).toContain('- **themes:** none\n');
+  });
+
+  it('serves the maximum page size with themes requested, and says the size was reduced', async () => {
+    const themes = [{ name: 'Gender', code: '400000', parent: null, percent: 30 }];
+    const search = await stubService({ projects: [{ ...project, themes }], total: 1 });
+    const tool = await loadTool();
+    const result = await runToolContract(tool, { per_page: 1001, include_themes: true });
+    expect(search.mock.calls[0]?.[0]).toMatchObject({ perPage: 1000, includeThemes: true });
+    expect(result.structuredContent).toMatchObject({
+      projects: [{ themes }],
+      appliedFilters: { perPage: 1000, requestedPerPage: 1001, includeThemes: true },
+    });
+    expect(textOf(result)).toContain('- **themes:** Gender (400000 · parent null · 30%)\n');
+    expect(textOf(result)).toContain('per_page=1001 was reduced to 1000');
+  });
+
+  it('names theme with its own advice when a theme search is empty', async () => {
+    await stubService({ projects: [], total: 0 });
+    const tool = await loadTool();
+    const alone = await runToolContract(tool, { theme: ['adaptation'] });
+    const notice = (alone.structuredContent as { notice: string }).notice;
+    expect(notice).toMatch(/theme was applied/);
+    expect(notice).toMatch(/themes\[\]\.name/);
+    expect(notice).toMatch(/case/);
+    expect(notice).toMatch(/remove the theme filter/);
+    expect(textOf(alone)).toContain('themes\\[\\].name');
+
+    await stubService({ projects: [], total: 0, countryOnlyTotal: 412 });
+    const country = await runToolContract(tool, { countries: 'KE', theme: ['Invented Theme'] });
+    const countryNotice = (country.structuredContent as { notice: string }).notice;
+    expect(countryNotice).toMatch(/KE match 412 projects with every other filter removed/);
+    expect(countryNotice).toMatch(/so theme narrowed the result to nothing/);
+    expect(countryNotice).toMatch(/remove the theme filter/);
+  });
+
+  it('gives sector and theme advice together when both filters are in force', async () => {
+    await stubService({ projects: [], total: 0 });
+    const tool = await loadTool();
+    const ctx = createMockContext({ errors: tool.errors });
+    await tool.handler(tool.input.parse({ sector: ['Health'], theme: ['Gender'] }), ctx);
+    const notice = getEnrichment(ctx).notice as string;
+    expect(notice).toMatch(/sector, theme were applied/);
+    expect(notice).toMatch(/remove the sector filter/);
+    expect(notice).toMatch(/remove the theme filter/);
   });
 
   it('returns the projects the service resolved', async () => {
@@ -1019,6 +1152,87 @@ describe('worldbankSearchProjects', () => {
     );
   });
 
+  it('carries every theme field on both surfaces — null parents and shares, both taxonomies, an empty list', async () => {
+    const current = {
+      ...project,
+      id: 'P511160',
+      themes: [
+        {
+          name: 'Environment, Infrastructure, and Natural Resource Management',
+          code: '240000',
+          parent: null,
+          percent: 100,
+        },
+        {
+          name: 'Climate Change',
+          code: '240100',
+          parent: 'Environment, Infrastructure, and Natural Resource Management',
+          percent: 100,
+        },
+        { name: 'Adaptation', code: '240102', parent: 'Climate Change', percent: 50 },
+      ],
+    };
+    const legacy = {
+      ...project,
+      id: 'P170706',
+      themes: [
+        { name: 'FY17 - Private Sector Development', code: '20', parent: null, percent: 300 },
+        {
+          name: 'FY17 - Jobs',
+          code: '22',
+          parent: 'FY17 - Private Sector Development',
+          percent: 0,
+        },
+      ],
+    };
+    const unsplit = {
+      ...project,
+      id: 'P505889',
+      themes: [
+        { name: 'FY17 - Public Sector Management', code: '40', parent: null, percent: null },
+      ],
+    };
+    const themeless = { ...project, id: 'P515194', themes: [] };
+    await stubService({ projects: [current, legacy, unsplit, themeless], total: 4 });
+    const tool = await loadTool();
+    const result = await runToolContract(tool, { theme: ['Adaptation'], include_themes: true });
+
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({
+      projects: [
+        { themes: current.themes },
+        { themes: legacy.themes },
+        { themes: unsplit.themes },
+        { themes: [] },
+      ],
+    });
+    const text = textOf(result);
+    // Names carry commas, so entries join with `; `, after the sectors and before the url.
+    expect(text).toContain(
+      '- **themes:** Environment, Infrastructure, and Natural Resource Management (240000 · parent null · 100%); Climate Change (240100 · parent Environment, Infrastructure, and Natural Resource Management · 100%); Adaptation (240102 · parent Climate Change · 50%)\n- **url:**',
+    );
+    expect(text).toContain(
+      '- **themes:** FY17 - Private Sector Development (20 · parent null · 300%); FY17 - Jobs (22 · parent FY17 - Private Sector Development · 0%)\n',
+    );
+    expect(text).toContain(
+      '- **themes:** FY17 - Public Sector Management (40 · parent null · percent null)\n',
+    );
+    expect(text).toContain('(EEF · Education · 15%)\n- **themes:** none\n- **url:**');
+    expect(text.match(/\*\*themes:\*\*/g)).toHaveLength(4);
+  });
+
+  it('escapes Markdown in theme fields on content[] only', async () => {
+    const hostile = { name: 'A *b* [c]', code: 'X|Y', parent: '`m`', percent: 12.5 };
+    await stubService({ projects: [{ ...project, themes: [hostile] }], total: 1 });
+    const tool = await loadTool();
+    const result = await runToolContract(tool, { include_themes: true });
+
+    expect(result.structuredContent).toMatchObject({ projects: [{ themes: [hostile] }] });
+    expect(textOf(result)).toContain(
+      '- **themes:** A \\*b\\* \\[c\\] (X\\|Y · parent \\`m\\` · 12.5%)\n',
+    );
+  });
+
   // ─── Descriptions ─────────────────────────────────────────────────────────
 
   /** Sub-sector names that return active operations through the sector filter, measured 2026-11-11. */
@@ -1054,6 +1268,46 @@ describe('worldbankSearchProjects', () => {
     const notice = getEnrichment(ctx).notice as string;
     expect(notice).toMatch(/sectors\[\]\.name/);
     expect(notice).toMatch(/not the majorSectors names/);
+  });
+
+  /** Theme names that return active operations through the theme filter, measured 2026-11-19. */
+  const THEME_NAMES_WITH_ACTIVE_OPERATIONS = new Set([
+    'Adaptation',
+    'Gender',
+    'Climate Change',
+    'Climate change',
+    'FY17 - Climate change',
+  ]);
+
+  it('answers the climate-adaptation example with theme, citing only names that return operations', async () => {
+    const tool = await loadTool();
+    const themeInput = (tool.input.shape.theme as unknown as { description: string }).description;
+    const cited = [
+      ...[...tool.description.matchAll(/theme: (\[[^\]]*\])/g)].flatMap(
+        ([, list]) => JSON.parse(list as string) as string[],
+      ),
+      ...(/such as (.+?), (.+?), or (.+?),/.exec(themeInput)?.slice(1) ?? []),
+      ...(/pass both (.+?) and (.+?)\)/.exec(themeInput)?.slice(1) ?? []),
+    ];
+
+    expect(tool.description).toMatch(/climate adaptation projects[^.]*theme: \["Adaptation"\]/);
+    expect(cited.length).toBeGreaterThan(4);
+    for (const name of cited) expect(THEME_NAMES_WITH_ACTIVE_OPERATIONS).toContain(name);
+    expect(themeInput).toMatch(/themes\[\]\.name/);
+    expect(themeInput).toMatch(/taxonomies, never mixed on one project/);
+    const themeFields = (
+      tool.output.shape.projects as unknown as {
+        element: {
+          shape: {
+            themes: { unwrap(): { element: { shape: Record<string, { description?: string }> } } };
+          };
+        };
+      }
+    ).element.shape.themes.unwrap().element.shape;
+    expect(themeFields.code?.description).toMatch(/six digits in the current taxonomy/);
+    expect(themeInput).toMatch(/FY17 - /);
+    expect(themeInput).toMatch(/case-sensitive/);
+    expect(themeInput).toMatch(/at any share/);
   });
 
   /**
@@ -1180,7 +1434,9 @@ describe('worldbankSearchProjects', () => {
     ).element.shape;
 
     expect(item.totalCommitment?.description).not.toMatch(/Total World Bank commitment/);
-    expect(item.totalCommitment?.description).toMatch(/35\.8%/);
+    expect(item.totalCommitment?.description).toMatch(
+      /Null where no amount is published[^.]*not a zero commitment/,
+    );
     expect(item.grantAmount?.description).toMatch(/co-financ/);
     expect(item.grantAmount?.description).not.toMatch(/Grants window/i);
     expect(tool.description).toMatch(/financing windows/);

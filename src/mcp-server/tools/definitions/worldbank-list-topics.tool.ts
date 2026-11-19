@@ -5,13 +5,14 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { getWorldBankApiService } from '@/services/worldbank/worldbank-service.js';
 
 export const worldbankListTopics = tool('worldbank_list_topics', {
   title: 'List World Bank Topics',
   description:
-    'List all 21 World Bank thematic topics (Economy & Growth, Health, Education, and others) with descriptions. Use it to browse the indicator space by theme or to find a topic_id for worldbank_search_indicators.',
+    'List the 21 World Bank thematic topics (Economy & Growth, Health, Education, and others) with descriptions, to browse indicators by theme or find a topic_id for worldbank_search_indicators.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   input: z.object({}),
   output: z.object({
@@ -19,14 +20,26 @@ export const worldbankListTopics = tool('worldbank_list_topics', {
       .array(
         z
           .object({
-            id: z.string().describe('Topic ID for use in worldbank_search_indicators.'),
+            id: z.string().describe('Topic ID.'),
             name: z.string().describe('Topic name.'),
-            sourceNote: z.string().describe('Brief description of the topic.'),
+            sourceNote: z.string().describe('Topic description.'),
           })
-          .describe('A thematic topic entry.'),
+          .describe('A topic.'),
       )
-      .describe('All 21 World Bank thematic topics.'),
+      .describe('Every topic.'),
   }),
+
+  errors: [
+    {
+      reason: 'upstream_timeout',
+      code: JsonRpcErrorCode.Timeout,
+      retryable: true,
+      thrownBy: 'service',
+      when: "The World Bank Indicators API did not answer within the call's 50-second budget.",
+      recovery:
+        'The request is valid. Repeat the same call unchanged after about a minute: the World Bank Indicators API finishes a request after this server stops waiting and caches the answer, so the repeat is usually served from that cache. A changed call starts a new computation.',
+    },
+  ],
 
   async handler(_input, ctx) {
     ctx.log.info('Listing World Bank topics');

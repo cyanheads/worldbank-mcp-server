@@ -895,31 +895,89 @@ describe('an HTTP 400 answered with the "Request Error" page', () => {
   });
 });
 
+/**
+ * The origin computes a cold listed-country read for up to about 80 s, so one
+ * attempt holds for the whole 50 s call deadline rather than being cut and
+ * retried. The deadline itself is tabled in tests/services/call-deadline.test.ts.
+ */
 describe('a data request the origin stalls on', () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+  });
+
   afterEach(() => {
     vi.useRealTimers();
   });
 
-  it('is abandoned and retried within seconds when it reads listed countries', async () => {
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
-    // The first data request never answers until it is aborted; the retry is served normally.
-    fetchMock.mockImplementationOnce(
-      (_input, init) =>
-        new Promise((_resolve, reject) => {
-          init?.signal?.addEventListener('abort', () => reject(init.signal?.reason));
-        }),
-    );
-
-    let settled = false;
-    const pending = call({ countries: 'BR;ER', date_range: '2018:2020' }).finally(() => {
-      settled = true;
+  /**
+   * Hold the data request: answered by the fake after `answerAtMs` of fake time,
+   * or never when undefined; it rejects with its signal's reason once that aborts.
+   */
+  function holdData(answerAtMs?: number) {
+    const answer = fetchMock.getMockImplementation();
+    fetchMock.mockImplementation((input, init) => {
+      if (!String(input).includes('/indicator/')) return (answer as typeof fetch)(input, init);
+      return new Promise((resolve, reject) => {
+        const timer =
+          answerAtMs === undefined
+            ? undefined
+            : setTimeout(() => resolve((answer as typeof fetch)(input, init)), answerAtMs);
+        init?.signal?.addEventListener(
+          'abort',
+          () => {
+            clearTimeout(timer);
+            reject(init.signal?.reason);
+          },
+          { once: true },
+        );
+      });
     });
-    await vi.advanceTimersByTimeAsync(20_000);
+  }
 
-    expect(settled).toBe(true);
+  /** Track a call's settlement. */
+  function track(pending: ReturnType<typeof call>) {
+    const state = { settled: false };
+    pending.finally(() => {
+      state.settled = true;
+    });
+    return state;
+  }
+
+  const dataRequestCount = () =>
+    fetchMock.mock.calls.filter(([input]) => String(input).includes('/indicator/')).length;
+
+  it('holds one request open to the 50 s deadline and ends there as upstream_timeout', async () => {
+    holdData();
+    const pending = call({ countries: 'BR;ER', date_range: '2018:2020' });
+    const state = track(pending);
+
+    await vi.advanceTimersByTimeAsync(49_999);
+    expect(state.settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(state.settled).toBe(true);
+    const { isError, structured, text } = await pending;
+    expect(isError).toBe(true);
+    expect(structured.error).toMatchObject({
+      code: JsonRpcErrorCode.Timeout,
+      data: { reason: 'upstream_timeout', retryable: true, budgetMs: 50_000 },
+    });
+    expect(text).toContain('reason upstream_timeout');
+    expect(dataRequestCount()).toBe(1);
+  });
+
+  it('serves a first answer that arrives 40 s in', async () => {
+    holdData(40_000);
+    const pending = call({ countries: 'BR;ER', date_range: '2018:2020' });
+    const state = track(pending);
+
+    await vi.advanceTimersByTimeAsync(40_000);
+
+    expect(state.settled).toBe(true);
     const { isError, structured } = await pending;
     expect(isError).toBeFalsy();
     expect(cells(structured.data)).toEqual(truth(GDP, ['BRA', 'ERI'], ['2020', '2019', '2018']));
+    expect(dataRequestCount()).toBe(1);
   });
 });
 

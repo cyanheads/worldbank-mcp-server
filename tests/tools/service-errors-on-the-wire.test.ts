@@ -1,24 +1,38 @@
 /**
- * @fileoverview Service errors as a client receives them. worldbank_get_poverty
- * and worldbank_search_projects run against their real services with only the
- * network stubbed, so each upstream rejection passes through the framework's
- * real error-body capture, the service's classification, the tool's re-throw,
- * and the framework's error assembly before anything is asserted.
+ * @fileoverview Service errors as a client receives them. Tools run against their
+ * real services with only the network stubbed, so each upstream rejection passes
+ * through the framework's real error-body capture, the service's classification,
+ * the tool's re-throw, and the framework's error assembly before anything is
+ * asserted: worldbank_get_poverty's and worldbank_search_projects' upstream
+ * rejections, and every tool's and resource's call deadline.
  * @module tests/tools/service-errors-on-the-wire.test
  */
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import type { AnyResourceDefinition } from '@cyanheads/mcp-ts-core/resources';
 import {
   createInMemoryStorage,
   createMockContext,
   runToolContract,
 } from '@cyanheads/mcp-ts-core/testing';
+import type { AnyToolDefinition } from '@cyanheads/mcp-ts-core/tools';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { worldbankCountryResource } from '@/mcp-server/resources/definitions/worldbank-country.resource.js';
+import { worldbankIndicatorResource } from '@/mcp-server/resources/definitions/worldbank-indicator.resource.js';
+import { worldbankGetCountry } from '@/mcp-server/tools/definitions/worldbank-get-country.tool.js';
+import { worldbankGetData } from '@/mcp-server/tools/definitions/worldbank-get-data.tool.js';
+import { worldbankGetIndicator } from '@/mcp-server/tools/definitions/worldbank-get-indicator.tool.js';
 import { worldbankGetPoverty } from '@/mcp-server/tools/definitions/worldbank-get-poverty.tool.js';
+import { worldbankListCountries } from '@/mcp-server/tools/definitions/worldbank-list-countries.tool.js';
+import { worldbankListSources } from '@/mcp-server/tools/definitions/worldbank-list-sources.tool.js';
+import { worldbankListTopics } from '@/mcp-server/tools/definitions/worldbank-list-topics.tool.js';
+import { worldbankSearchIndicators } from '@/mcp-server/tools/definitions/worldbank-search-indicators.tool.js';
 import { worldbankSearchProjects } from '@/mcp-server/tools/definitions/worldbank-search-projects.tool.js';
+import { CALL_DEADLINE_MS, callDeadlineExceeded } from '@/services/call-deadline.js';
 import { initPipService } from '@/services/pip/pip-service.js';
 import { initProjectsService } from '@/services/projects/projects-service.js';
 import { initWorldBankApiService } from '@/services/worldbank/worldbank-service.js';
+import { held } from '../helpers/held-fetch.js';
 
 vi.mock('@/config/server-config.js', () => ({
   getServerConfig: vi.fn().mockReturnValue({
@@ -563,4 +577,213 @@ describe('service errors on the wire', () => {
       await expect(call).rejects.toBe(controller.signal.reason);
     },
   );
+
+  // ─── The call deadline ────────────────────────────────────────────────────
+
+  /**
+   * The 50 s deadline itself is tabled at its seam (tests/services/call-deadline.test.ts)
+   * and per service path in the service tests. These prove the wiring: a request
+   * the upstream holds reaches the client at the deadline as the declared
+   * upstream_timeout, carrying the recovery its service names.
+   */
+  describe('a call the upstream holds past its deadline', () => {
+    const INDICATORS_HINT = (
+      callDeadlineExceeded('indicators').data?.recovery as { hint: string } | undefined
+    )?.hint;
+    const PROJECTS_HINT = (
+      callDeadlineExceeded('projects').data?.recovery as { hint: string } | undefined
+    )?.hint;
+
+    /** Settle `pending` at the deadline: still open 1 ms before it, settled on it. */
+    async function atDeadline<T>(pending: Promise<T>): Promise<T> {
+      let settled = false;
+      const tracked = pending.finally(() => {
+        settled = true;
+      });
+      tracked.catch(() => {});
+      await vi.advanceTimersByTimeAsync(CALL_DEADLINE_MS - 1);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(settled).toBe(true);
+      return tracked;
+    }
+
+    /** The declared upstream_timeout entry of a tool or resource contract. */
+    function declared(errors: AnyToolDefinition['errors']) {
+      return errors?.find((entry) => entry.reason === 'upstream_timeout');
+    }
+
+    beforeEach(() => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+      // A fresh service per call: a held shared load must not carry into the next one.
+      initWorldBankApiService({} as never, createInMemoryStorage());
+      fetchMock.mockImplementation((_input, init) => held(init));
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    const INDICATORS_TOOLS: Array<{ definition: AnyToolDefinition; input: object }> = [
+      {
+        definition: worldbankGetData,
+        input: { indicator_id: 'SP.POP.TOTL', countries: 'USA', date_range: '2020:2022' },
+      },
+      { definition: worldbankGetIndicator, input: { indicator_id: 'SP.POP.TOTL' } },
+      { definition: worldbankGetCountry, input: { country_code: 'KEN' } },
+      { definition: worldbankListCountries, input: {} },
+      { definition: worldbankListTopics, input: {} },
+      { definition: worldbankListSources, input: {} },
+      { definition: worldbankSearchIndicators, input: { query: 'population' } },
+    ];
+
+    it.each(INDICATORS_TOOLS.map((row) => ({ name: row.definition.name, ...row })))(
+      '$name reports a held Indicators API read as the declared upstream_timeout on both surfaces',
+      async ({ definition, input }) => {
+        const { error, text } = failure(
+          await atDeadline(runToolContract(definition, input as never)),
+        );
+
+        expect(declared(definition.errors)).toMatchObject({
+          code: JsonRpcErrorCode.Timeout,
+          retryable: true,
+          recovery: INDICATORS_HINT,
+        });
+        expect(error.code).toBe(JsonRpcErrorCode.Timeout);
+        expect(error.message).toContain('World Bank Indicators API');
+        expect(error.data).toMatchObject({
+          reason: 'upstream_timeout',
+          retryable: true,
+          recovery: { hint: INDICATORS_HINT },
+        });
+        expect(text).toContain(`Recovery: ${INDICATORS_HINT}`);
+        expect(text.trimEnd()).toMatch(/\(reason upstream_timeout · retryable\)$/);
+      },
+    );
+
+    it.each([
+      {
+        name: worldbankIndicatorResource.name,
+        definition: worldbankIndicatorResource as AnyResourceDefinition,
+        params: { indicatorId: 'SP.POP.TOTL' },
+      },
+      {
+        name: worldbankCountryResource.name,
+        definition: worldbankCountryResource as AnyResourceDefinition,
+        params: { countryCode: 'KEN' },
+      },
+    ])(
+      '$name rejects a held Indicators API read with the declared upstream_timeout',
+      async ({ definition, params }) => {
+        const ctx = createMockContext({ errors: definition.errors });
+        const pending = Promise.resolve(
+          definition.handler(definition.params?.parse(params) as never, ctx),
+        );
+
+        await expect(atDeadline(pending)).rejects.toMatchObject({
+          code: JsonRpcErrorCode.Timeout,
+          data: {
+            reason: 'upstream_timeout',
+            retryable: true,
+            recovery: { hint: INDICATORS_HINT },
+          },
+        });
+        expect(declared(definition.errors)).toMatchObject({
+          code: JsonRpcErrorCode.Timeout,
+          retryable: true,
+          recovery: INDICATORS_HINT,
+        });
+      },
+    );
+
+    it('worldbank_search_projects reports a held Projects API request as the declared upstream_timeout on both surfaces', async () => {
+      const { error, text } = failure(
+        await atDeadline(runToolContract(worldbankSearchProjects, { query: 'water' })),
+      );
+
+      expect(declared(worldbankSearchProjects.errors)).toMatchObject({
+        code: JsonRpcErrorCode.Timeout,
+        retryable: true,
+        recovery: PROJECTS_HINT,
+      });
+      expect(error.code).toBe(JsonRpcErrorCode.Timeout);
+      expect(error.message).toContain('World Bank Projects API');
+      expect(error.data).toMatchObject({
+        reason: 'upstream_timeout',
+        retryable: true,
+        recovery: { hint: PROJECTS_HINT },
+      });
+      expect(text).toContain(`Recovery: ${PROJECTS_HINT}`);
+      expect(text.trimEnd()).toMatch(/\(reason upstream_timeout · retryable\)$/);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('worldbank_search_projects reports a country listing held past the deadline as upstream_timeout, naming the listing and the ISO2 workaround', async () => {
+      const { error, text } = failure(
+        await atDeadline(runToolContract(worldbankSearchProjects, { countries: 'BRA' })),
+      );
+
+      expect(error.code).toBe(JsonRpcErrorCode.Timeout);
+      expect(error.message).toMatch(/World Bank Indicators API country listing/);
+      expect(error.data).toMatchObject({
+        reason: 'upstream_timeout',
+        retryable: true,
+        budgetMs: CALL_DEADLINE_MS,
+      });
+      const hint = (error.data.recovery as { hint: string }).hint;
+      expect(hint.startsWith(`${INDICATORS_HINT} `)).toBe(true);
+      expect(hint).toMatch(/ISO2 code needs no country-listing lookup/);
+      expect(text).toContain(`Recovery: ${hint}`);
+      // Nothing reached the Projects API.
+      for (const [input] of fetchMock.mock.calls) {
+        expect(String(input)).toMatch(/^https:\/\/api\.worldbank\.org\/v2\/country\?/);
+      }
+    });
+
+    it('worldbank_search_projects spends one deadline across the country lookup and the Projects request', async () => {
+      fetchMock.mockImplementation((input, init) => {
+        const url = String(input instanceof Request ? input.url : input);
+        if (!url.startsWith('https://api.worldbank.org/v2/country?')) return held(init);
+        // The listing answers 30 s in, leaving the Projects request 20 s.
+        return new Promise((resolve) => {
+          setTimeout(
+            () =>
+              resolve(
+                Response.json([
+                  { page: 1, pages: 1, per_page: '10000', total: 1 },
+                  [
+                    {
+                      id: 'BRA',
+                      iso2Code: 'BR',
+                      name: 'Brazil',
+                      region: { id: 'LCN', value: 'Latin America & Caribbean' },
+                      incomeLevel: { id: 'UMC', value: 'Upper middle income' },
+                      lendingType: { id: 'IBD', value: 'IBRD' },
+                      capitalCity: 'Brasilia',
+                      longitude: '-47.9292',
+                      latitude: '-15.7801',
+                    },
+                  ],
+                ]),
+              ),
+            30_000,
+          );
+        });
+      });
+
+      const { error } = failure(
+        await atDeadline(runToolContract(worldbankSearchProjects, { countries: 'BRA' })),
+      );
+
+      expect(error.data).toMatchObject({
+        reason: 'upstream_timeout',
+        recovery: { hint: PROJECTS_HINT },
+      });
+      const projects = fetchMock.mock.calls.filter(([input]) =>
+        String(input).startsWith('https://search.worldbank.org/api/v3/projects?'),
+      );
+      expect(projects).toHaveLength(1);
+      expect(new URL(String(projects[0]?.[0])).searchParams.get('countrycode_exact')).toBe('BR');
+    });
+  });
 });

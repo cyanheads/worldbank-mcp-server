@@ -99,7 +99,7 @@ const EMPTY_COUNTRIES_MESSAGE = 'Provide at least one country code, or "all" for
 
 export const worldbankGetData = tool('worldbank_get_data', {
   title: 'Get World Bank Indicator Data',
-  description: `Query World Bank indicator values for one or more countries across a time range — the primary data-access tool; find indicator_id values with worldbank_search_indicators. Observations carry a null value where data is not available for a country×year cell, which is common for sparse series. Set at most one of date_range (a time window), mrv (the latest N periods across the requested countries), or mrnev (each country's own latest N values). Some series, such as Global Economic Monitor's, publish quarterly or monthly values beside annual ones: frequency picks the form mrv and mrnev select from (annual by default), and a date_range's own form (2024, 2024Q1, 2024M01) picks it for a window. lastUpdated gives the serving source's last update date, the data vintage to cite. For "all" countries, page through the results at up to ${MAX_OBSERVATIONS_PER_PAGE} per page, since the API returns several hundred entries per indicator. Indicators the standard data endpoint does not serve — WDI Database Archives, PEFA, ICP, GDLD, International Debt Statistics: DSSI, Food Prices for Nutrition — are answered from their own dataset instead; the response then carries sourceScoped, naming that dataset and the release, classification, sector, or counterpart area applied (see dimension_value), because those values can be archived or superseded figures rather than current ones.`,
+  description: `Query one World Bank indicator's values for countries across periods — the primary data tool; find indicator_id with worldbank_search_indicators. Set at most one of date_range, mrv, or mrnev, and frequency only without date_range. For "all" countries, page at up to ${MAX_OBSERVATIONS_PER_PAGE} per page. Indicators the standard data endpoint does not serve — WDI Database Archives, PEFA, ICP, GDLD, International Debt Statistics: DSSI, Food Prices for Nutrition — are answered from their own dataset; the response then carries sourceScoped, naming the dataset and the dimension value applied, since those values can be archived or superseded figures.`,
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   inputAliases: { limit: 'per_page' },
   input: z.object({
@@ -108,22 +108,18 @@ export const worldbankGetData = tool('worldbank_get_data', {
       .regex(CATALOG_FILTER_ID, SOURCE_ID_MESSAGE)
       .optional()
       .describe(
-        'Select this source dataset explicitly, including subnational sources. Use worldbank_list_countries with the same source_id for its canonical entity IDs. Omission preserves the standard dataset and automatic fallback.',
+        'Source dataset to read, subnational ones included (IDs from worldbank_list_sources); worldbank_list_countries with the same source_id lists its entity IDs. Omit for the standard endpoint with automatic fallback.',
       ),
     indicator_id: z
       .string()
       .regex(INDICATOR_ID, INDICATOR_ID_MESSAGE)
-      .describe(
-        'One indicator code to query (e.g. NY.GDP.PCAP.CD, SP.POP.TOTL) — not "all" or a list of codes. Use worldbank_search_indicators to find valid IDs.',
-      ),
+      .describe('One indicator ID (e.g. NY.GDP.PCAP.CD), not "all" or a list.'),
     countries: z
       .union([
         z
           .string()
           .regex(COUNTRY_LIST_CONTENT, EMPTY_COUNTRIES_MESSAGE)
-          .describe(
-            'A single country code, a list separated by commas, semicolons, or pipes, or "all".',
-          ),
+          .describe('One code, or several in one string.'),
         z
           .array(z.string().describe('A country code.'))
           .min(1)
@@ -133,12 +129,10 @@ export const worldbankGetData = tool('worldbank_get_data', {
            * entry, so an array holding nothing but separators must not reach it.
            */
           .refine((codes) => splitCountryCodes(codes).length > 0, EMPTY_COUNTRIES_MESSAGE)
-          .describe(
-            'An array of country codes; an element holding several codes separated by commas, semicolons, or pipes is split too.',
-          ),
+          .describe('Codes as an array.'),
       ])
       .describe(
-        'Country codes. Accepts: ISO2 (US, CN), ISO3 (USA, CHN), regional aggregate codes (EAS, LCN, MEA, SAS, SSF, ECS, NAC), income group codes (HIC, UMC, LMC, LIC), world code (WLD), or "all" on its own for every entry (use pagination). Pass a single code, an array, or one string separated by commas, semicolons, or pipes (US,JP · US;JP · US|JP). At least one code is required — an empty value, or one made only of separators, is rejected rather than treated as "all".',
+        'ISO2 (US) or ISO3 (USA) codes, regional (EAS, SSF), income (HIC, LMC), or world (WLD) aggregates, or "all" alone for every entry. One code, an array, or codes separated by commas, semicolons, or pipes (US,JP · US;JP · US|JP), in a string or an array element. An empty or separator-only value is rejected, never read as "all".',
       ),
     date_range: z
       .string()
@@ -154,7 +148,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
       )
       .optional()
       .describe(
-        "Time window to filter observations to. Accepts a whole year (`2020`), a quarter (`2020Q1`), or a month (`2020M03`), or a range of two periods of the same type separated by a colon, earliest first (`2010:2023`, `2020Q1:2021Q4`, `2020M01:2020M06`); a range running latest first is rejected. On a series publishing more than one period form, the window's form picks which: `2024` returns the annual value, `2024Q1:2024Q4` the quarters, `2024M01:2024M12` the months, and a quarter or month window is null-filled where the series has none (a notice then names the other forms). On a series with one form, a window at another form keeps the periods it overlaps (`2019:2021` on a quarterly series returns its twelve quarters). A window covering no part of the series returns zero observations rather than the full series. Mutually exclusive with mrv, mrnev, and frequency.",
+        "A period, or two of the same form joined by a colon, earliest first: years (`2020`, `2010:2023`), quarters (`2020Q1:2021Q4`), or months (`2020M01:2020M06`). On a series publishing several forms the window's form picks the periods, null-filled where the series lacks it (with a notice); on a single-form series a window at another form keeps the periods it overlaps (`2019:2021` on a quarterly series gives twelve quarters). A window outside the series returns no observations.",
       ),
     mrv: z
       .number()
@@ -163,7 +157,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
       .max(100)
       .optional()
       .describe(
-        "Return the N most recent periods (1–100) holding a value for any requested country, clamped to the length of the series. Every requested country comes back at those periods, null where it has no value there rather than with its own older values; mrnev returns each country's own latest values instead. The periods are annual unless frequency names another form (a series with no annual periods keeps its own). Rows are mrv × countries, so page through them with per_page. Mutually exclusive with date_range and mrnev.",
+        'The N latest periods (1–100, at most the series length) where any requested country has a value; every country comes back at those periods, null where it has none. Rows are mrv × countries.',
       ),
     mrnev: z
       .number()
@@ -172,7 +166,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
       .max(100)
       .optional()
       .describe(
-        "Return each requested country's own N most recent periods (1–100) holding a value — its latest non-null observations, however far back they sit. A country with fewer values in the series returns the ones it has, and a country with none returns no rows. The periods are annual unless frequency names another form (a series with no annual periods keeps its own). Mutually exclusive with date_range and mrv.",
+        "Each requested country's own N latest non-null values (1–100), however far back; a country with fewer returns those it has, and one with none returns no rows.",
       ),
     frequency: z
       .union([
@@ -183,60 +177,46 @@ export const worldbankGetData = tool('worldbank_get_data', {
       ])
       .optional()
       .describe(
-        'The period form to return, for series such as Global Economic Monitor\'s that publish quarterly or monthly values beside annual ones: annual (the default), quarterly, or monthly. With mrv or mrnev it picks the form they select from — frequency "monthly" with mrv 3 returns the three latest months, where mrv 3 alone returns the three latest years. With neither, it returns the whole series at that form. A series that does not publish the form returns an empty result with a notice saying so, except that with neither mrv nor mrnev a source that null-fills the form (Global Economic Monitor) returns null rows, and a page of them carries a notice. Mutually exclusive with date_range, whose own form (2024, 2024Q1, 2024M01) picks the periods of a window.',
+        'Period form, for series that also publish quarterly or monthly values (Global Economic Monitor): annual (default; a series with no annual periods keeps its own), quarterly, or monthly. It applies to mrv and mrnev ("monthly" with mrv 3 gives the three latest months), or alone to the whole series. A form the series lacks returns no rows, or null rows on a whole-series read from a source that null-fills it; a notice says so.',
       ),
     dimension_value: z
       .string()
       .optional()
       .describe(
-        'For indicators answered from their own dataset (the response carries sourceScoped), the value of that dataset\'s extra dimension to query, by id or by label, matched case-insensitively: a WDI Database Archives release ("202503" or "2025 Mar"), an ICP or Food Prices for Nutrition classification ("PPPGlob", "FPN 5.0"), a GDLD sector ("WHT"), or an International Debt Statistics counterpart area ("730" or "China"). Ids are matched first, across every dataset that carries the indicator; a label must match in full, ignoring case and spacing, and a label several values share is rejected with their ids. Omit it for the default, which sourceScoped.dimension reports: the only value when the dataset has one, "WLD" (World) for counterpart areas, the newest WDI Database Archives release holding data for the requested countries and periods (the newest release when none does), or otherwise every value with each row labelled. A value the dataset lists neither as an id nor as a label is rejected with every valid id beside its label, and a value for an indicator the standard data endpoint serves is rejected too.',
+        'For a source-scoped indicator (the response carries sourceScoped), the value of its dataset\'s extra dimension, by id or full label, case-insensitively, ids matched first: a WDI Database Archives release ("202503" or "2025 Mar"), an ICP or Food Prices for Nutrition classification ("PPPGlob", "FPN 5.0"), a GDLD sector ("WHT"), or an International Debt Statistics counterpart area ("730" or "China"). Omit for the default, which sourceScoped.dimension reports.',
       ),
-    page: z.number().int().min(1).default(1).describe('Pagination page number (1-based).'),
+    page: z.number().int().min(1).default(1).describe('Page number, 1-based.'),
     per_page: perPageInput(MAX_OBSERVATIONS_PER_PAGE),
   }),
   output: z.object({
     sourceId: z
       .string()
       .optional()
-      .describe(
-        'Serving source ID, present only when established by the selected source or upstream response.',
-      ),
+      .describe('ID of the source that served the values, when known.'),
     data: z
       .array(
         z
           .object({
             countryCode: z
               .string()
-              .describe(
-                'ISO2 code of the country or aggregate (US, XD for High income), or the canonical opaque entity ID for a source-only entity.',
-              ),
+              .describe("ISO2 code (US; XD for High income), or a source-only entity's opaque ID."),
             countryIso3: z
               .string()
               .describe(
-                'Three-character code of the country or aggregate (USA, HIC) — the form the countries input takes. Empty only for an entity the World Bank country listing does not carry.',
+                'Three-character code (USA, HIC), the form countries takes; empty for an entity the World Bank country listing lacks.',
               ),
             countryName: z.string().describe('Country or aggregate name.'),
-            date: z
-              .string()
-              .describe(
-                'Period of observation: a year (2020), quarter (2020Q1), or month (2020M03).',
-              ),
+            date: z.string().describe('Period: year (2020), quarter (2020Q1), or month (2020M03).'),
             value: z
               .number()
               .nullable()
               .describe(
-                'Indicator value. Null when data is not available for this country×year cell.',
+                'Indicator value; null where the series has no data for this country and period, common in sparse series.',
               ),
             obsStatus: z
               .string()
-              .describe(
-                'Observation status code (empty string when no special status; non-empty values signal data quality notes).',
-              ),
-            isAggregate: z
-              .boolean()
-              .describe(
-                'True when this row is a regional or income-group aggregate rather than an individual country.',
-              ),
+              .describe('Observation status code flagging a data-quality note; empty when none.'),
+            isAggregate: z.boolean().describe('True for a regional or income-group aggregate.'),
             dimension: z
               .object({
                 id: z.string().describe('Dimension value id, e.g. "202503".'),
@@ -244,16 +224,16 @@ export const worldbankGetData = tool('worldbank_get_data', {
               })
               .optional()
               .describe(
-                "The value of the dataset's extra dimension (sourceScoped.dimension.concept) this row belongs to. Present on source-scoped rows from a dataset that has one.",
+                "This row's value of the dataset's extra dimension, on source-scoped rows of a dataset that has one.",
               ),
           })
-          .describe('A single country×period observation.'),
+          .describe('One country-period observation.'),
       )
-      .describe('Indicator observations for this page. Null values are common for sparse series.'),
+      .describe('Observations on this page.'),
     sourceScoped: z
       .object({
-        sourceId: z.string().describe('ID of the World Bank data source that served the values.'),
-        sourceName: z.string().describe('Name of that data source, e.g. "WDI Database Archives".'),
+        sourceId: z.string().describe('Serving source ID.'),
+        sourceName: z.string().describe('Serving source name, e.g. "WDI Database Archives".'),
         dimension: z
           .object({
             concept: z
@@ -271,34 +251,26 @@ export const worldbankGetData = tool('worldbank_get_data', {
                 'every_value',
               ])
               .describe(
-                'How the value was chosen: requested (dimension_value), only_value (the only one the dataset lists), world_total (WLD, all counterpart areas), newest_with_data (newest release holding a value for the requested countries and periods), newest (newest release; none holds a value in that scope), or every_value (no single value; each row carries its own).',
+                "How the value was chosen: requested (dimension_value), only_value (the dataset's only value), world_total (WLD, all counterpart areas), newest_with_data (newest release with a value for the requested countries and periods), newest (newest release; none has one), or every_value (each row carries its own).",
               ),
             id: z.string().nullable().describe('Applied value id; null for every_value.'),
             label: z.string().nullable().describe('Applied value label; null for every_value.'),
           })
           .nullable()
-          .describe('The dimension value applied; null when the dataset has no extra dimension.'),
-        note: z
-          .string()
-          .describe(
-            'States that the values came from the source-scoped data API rather than the standard World Bank data endpoint, and may be archived or superseded figures.',
-          ),
+          .describe('Dimension value applied; null when the dataset has no extra dimension.'),
+        note: z.string().describe('Provenance note for these values.'),
       })
       .optional()
       .describe(
-        'Present when the source-scoped data API served the explicitly selected source or an automatic fallback dataset.',
+        'Present when the source-scoped data API served the values, for a source_id or the fallback.',
       ),
     indicator: z
       .object({
-        id: z.string().describe('Indicator ID echoed for chaining context.'),
+        id: z.string().describe('Indicator ID.'),
         name: z.string().describe('Indicator name.'),
       })
-      .describe('Indicator metadata echoed from the response.'),
-    nullCount: z
-      .number()
-      .describe(
-        'Count of null values on this page — indicates data sparsity for the requested filter.',
-      ),
+      .describe('The indicator queried.'),
+    nullCount: z.number().describe('Null values on this page.'),
   }),
 
   // Agent-facing context: pagination totals and query orientation. Kept out of the
@@ -306,70 +278,42 @@ export const worldbankGetData = tool('worldbank_get_data', {
   enrichment: {
     appliedFilters: z
       .object({
-        sourceId: z
-          .string()
-          .optional()
-          .describe('Explicit source_id requested, omitted for automatic routing.'),
+        sourceId: z.string().optional().describe('source_id requested.'),
         indicatorId: z.string().describe('Indicator ID queried.'),
         countries: z
           .string()
-          .describe(
-            'Country codes as requested, normalized — array elements and strings separated by commas, semicolons, or pipes are split and rejoined with semicolons, the separator the API takes.',
-          ),
-        dateRange: z
-          .string()
-          .optional()
-          .describe('Date window applied, omitted when none was requested.'),
-        mrv: z
-          .number()
-          .optional()
-          .describe('Most-recent-values count applied, omitted when none was requested.'),
-        mrnev: z
-          .number()
-          .optional()
-          .describe('Most-recent-non-empty-values count applied, omitted when none was requested.'),
-        frequency: z
-          .enum(FREQUENCIES)
-          .optional()
-          .describe(
-            'Period form applied (annual, quarterly, monthly), omitted when none was requested.',
-          ),
-        dimensionValue: z
-          .string()
-          .optional()
-          .describe('dimension_value as requested, omitted when none was given.'),
-        page: z.number().describe('Page number requested.'),
-        perPage: z
-          .number()
-          .describe(
-            'Results per page actually served — the requested size or server default, reduced to the page cap when larger. totalPages is counted at this size.',
-          ),
+          .describe('Country codes as requested, split and rejoined with semicolons.'),
+        dateRange: z.string().optional().describe('date_range applied.'),
+        mrv: z.number().optional().describe('mrv applied.'),
+        mrnev: z.number().optional().describe('mrnev applied.'),
+        frequency: z.enum(FREQUENCIES).optional().describe('frequency applied.'),
+        dimensionValue: z.string().optional().describe('dimension_value requested.'),
+        page: z.number().describe('Page requested.'),
+        perPage: z.number().describe('Page size served, after any reduction to the page maximum.'),
         requestedPerPage: z
           .number()
           .optional()
           .describe(
-            'Page size asked for, present only when it exceeded the page cap and perPage was reduced.',
+            'Page size asked for, or the server default; present only when perPage was reduced.',
           ),
       })
-      .describe(
-        'The effective parameters sent to the World Bank API — confirms country code normalization and which filters were in force for these observations.',
-      ),
-    totalCount: z.number().describe('Total observations before pagination.'),
+      .describe('Parameters in force for these observations; a filter not applied is omitted.'),
+    totalCount: z.number().describe('Observations before pagination.'),
     currentPage: z
       .number()
-      .describe('Page number requested — past totalPages when the request ran off the end.'),
-    totalPages: z.number().describe('Total number of pages.'),
+      .describe('Page number; past totalPages when the request ran off the end.'),
+    totalPages: z.number().describe('Total pages at perPage.'),
     lastUpdated: z
       .string()
       .optional()
       .describe(
-        'Last update date of the World Bank source that served these values (YYYY-MM-DD) — the data vintage to cite with them. Omitted when upstream reports none, as for an empty result.',
+        'Last update (YYYY-MM-DD) of the source that served these values, the vintage to cite; omitted when upstream reports none.',
       ),
     notice: z
       .string()
       .optional()
       .describe(
-        'Recovery hint for an empty result set — how to broaden the query when nothing matched, whether the series publishes the requested frequency, or the page range that exists when the requested page is past the end — a quarter or month date_range whose observations are all null, with the same span at the other period forms, a frequency page whose observations are all null, a page size reduced to the page cap, and, for source-scoped data, the requested country codes the serving dataset publishes nothing for.',
+        'Explains an empty result, a frequency the series lacks, a page past the end, an all-null date_range or frequency page, a reduced page size, or countries a source-scoped dataset lacks.',
       ),
   },
 
@@ -419,14 +363,14 @@ export const worldbankGetData = tool('worldbank_get_data', {
       reason: 'source_not_queryable',
       severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'The selected source has no supported country/series/time layout.',
+      when: 'The source lacks a country/series/time layout.',
       recovery: 'Choose another source with worldbank_list_sources.',
     },
     {
       reason: 'invalid_params',
       severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'More than one of date_range, mrv, and mrnev is provided, or frequency is provided with date_range.',
+      when: 'More than one of date_range, mrv, and mrnev, or frequency with date_range.',
       recovery:
         "Keep one of date_range, mrv, or mrnev and remove the others: date_range for a time window, mrv for the latest periods across the countries, mrnev for each country's own latest values. Drop frequency when date_range is set: the window's own period form (2024, 2024Q1:2024Q4, 2024M01:2024M12) already picks the periods.",
     },
@@ -434,7 +378,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
       reason: 'mixed_all_selector',
       severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'countries combines "all" with one or more country codes.',
+      when: 'countries mixes "all" with codes.',
       recovery:
         'Pass "all" on its own for every entry, or drop it and list only the country codes.',
     },
@@ -442,7 +386,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
       reason: 'reversed_date_range',
       severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'date_range names a range whose first period comes after its second.',
+      when: 'date_range runs latest first.',
       recovery:
         'Swap the two periods so date_range runs earliest period first, e.g. 2010:2020 rather than 2020:2010.',
     },
@@ -450,7 +394,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
       reason: 'multiple_indicators',
       severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'The indicator ID is "all", which selects every indicator rather than one.',
+      when: 'indicator_id is "all".',
       recovery:
         'Pass a single indicator ID; use worldbank_search_indicators to find the indicator to query.',
     },
@@ -458,14 +402,14 @@ export const worldbankGetData = tool('worldbank_get_data', {
       reason: 'indicator_not_found',
       severity: 'notice',
       code: JsonRpcErrorCode.NotFound,
-      when: 'The indicator ID does not exist.',
+      when: 'Unknown indicator_id.',
       recovery: 'Use worldbank_search_indicators to find valid indicator IDs by keyword or topic.',
     },
     {
       reason: 'indicator_not_queryable',
       severity: 'notice',
       code: JsonRpcErrorCode.NotFound,
-      when: 'The standard data endpoint does not serve the indicator, and no catalog source can serve it through the source-scoped data API instead — the catalog no longer lists the ID, the catalog lookup failed, or the source is not organized by country, series, and time plus at most one further dimension.',
+      when: 'Neither the standard data endpoint nor a source-scoped dataset can serve the indicator.',
       recovery:
         'Changing the countries, dates, or dimension_value will not help. Use worldbank_search_indicators to find another indicator for the same measure.',
     },
@@ -473,7 +417,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
       reason: 'unknown_dimension_value',
       severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
-      when: "dimension_value is neither an id nor a label the indicator's dataset lists for its extra dimension.",
+      when: "dimension_value matches no id or label of the dataset's extra dimension.",
       recovery:
         'Pass one of the ids the error message lists for this indicator, or the label quoted beside one in full, or omit dimension_value to use the default the response reports.',
     },
@@ -481,7 +425,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
       reason: 'ambiguous_dimension_value',
       severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'dimension_value matches no id, and the first dataset whose labels carry it gives that label to more than one value.',
+      when: 'dimension_value is a label several values share.',
       recovery:
         'Pass one of the ids the error message names in place of the label; each id selects one of the values sharing it.',
     },
@@ -489,14 +433,14 @@ export const worldbankGetData = tool('worldbank_get_data', {
       reason: 'dimension_not_applicable',
       severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'dimension_value is given for an indicator the standard data endpoint serves, or whose dataset has no dimension beyond country, series, and time.',
+      when: 'dimension_value is given for an indicator with no extra dimension.',
       recovery: 'Remove dimension_value; this indicator has no extra dimension to select.',
     },
     {
       reason: 'source_scope_too_large',
       severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'A source-scoped query would read more rows (countries × periods × unpinned dimension values) than one request allows.',
+      when: 'A source-scoped query exceeds the per-request row limit.',
       recovery:
         'Narrow countries or date_range, or pin dimension_value; a narrower call reports the default value it applied in sourceScoped.dimension, which can then be pinned.',
     },
@@ -504,24 +448,33 @@ export const worldbankGetData = tool('worldbank_get_data', {
       reason: 'country_not_found',
       severity: 'notice',
       code: JsonRpcErrorCode.NotFound,
-      when: 'One or more country codes are invalid. The message and countryCodes name the codes the World Bank country listing lacks, or every requested code when it lacks none.',
+      when: 'One or more country codes are invalid.',
       recovery: 'Use worldbank_list_countries to browse valid ISO2, ISO3, and aggregate codes.',
     },
     {
       reason: 'indicator_and_country_not_found',
       severity: 'notice',
       code: JsonRpcErrorCode.NotFound,
-      when: 'The indicator ID and the country codes are both invalid. The codes are named as on country_not_found.',
+      when: 'Both indicator_id and country codes are invalid.',
       recovery:
         'Look the indicator up with worldbank_search_indicators and the codes with worldbank_list_countries before retrying.',
     },
     {
       reason: 'upstream_inconsistent',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: "The World Bank API answered a data read, and its one re-read, with rows that do not fit the request — its response cache served another query's result — so nothing was served.",
+      when: "The API's response cache answered a data read and its re-read with another query's rows.",
       recovery:
         'Retry later, or change the countries list, which sends a request the stale cached answer does not match.',
       retryable: true,
+    },
+    {
+      reason: 'upstream_timeout',
+      code: JsonRpcErrorCode.Timeout,
+      retryable: true,
+      thrownBy: 'service',
+      when: "The World Bank Indicators API did not answer every read within the call's 50-second budget.",
+      recovery:
+        'The request is valid. Repeat the same call unchanged after about a minute: the World Bank Indicators API finishes a request after this server stops waiting and caches the answer, so the repeat is usually served from that cache. A changed call starts a new computation.',
     },
   ],
 

@@ -23,11 +23,16 @@ import {
   validationError,
 } from '@cyanheads/mcp-ts-core/errors';
 import type { StorageService } from '@cyanheads/mcp-ts-core/storage';
-import { fetchWithTimeout, withRetry } from '@cyanheads/mcp-ts-core/utils';
+import { fetchWithTimeout } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
+import {
+  type CallAttempt,
+  retryWithinCallDeadline,
+  withCallDeadline,
+} from '@/services/call-deadline.js';
 import { plainProse } from '@/services/plain-prose.js';
 import { MAX_COUNTRIES_PER_PAGE, MAX_OBSERVATIONS_PER_PAGE } from '@/services/response-budget.js';
-import { sharedLoadContext, untilAborted } from '@/services/shared-load.js';
+import { awaitSharedLoad, sharedLoadContext } from '@/services/shared-load.js';
 import {
   fullSpan,
   type LatestSelection,
@@ -78,8 +83,15 @@ import type {
   WbPage,
 } from './types.js';
 
-/** Minimal request-context shape that satisfies fetchWithTimeout and withRetry. */
+/** Minimal request-context shape that satisfies fetchWithTimeout. */
 type ReqCtx = Context & Record<string, unknown>;
+
+/** How one request is fetched; see `WorldBankApiService.fetchWithRetry`. */
+type FetchOptions = {
+  /** Per-attempt timeout inside a shared load; on a caller's path the call deadline sets it. */
+  loadAttemptMs?: number;
+  expectedStatuses?: number[];
+};
 
 // ─── Error detection ─────────────────────────────────────────────────────────
 
@@ -142,20 +154,26 @@ const DATA_PAGE_SIZE = 20_000;
  */
 const REREAD_PAGE_SIZE = DATA_PAGE_SIZE - 1;
 
-/** Timeout for ordinary single-page requests. */
+/**
+ * Per-attempt timeout of an ordinary single-page request inside a shared load. A
+ * request on a caller's path has no fixed cut: each attempt gets what the call
+ * deadline leaves.
+ */
 const REQUEST_TIMEOUT_MS = 15_000;
 
 /**
- * Timeout for exhaustive fetches. The full indicator catalog is ~15 MB and
- * takes seconds to transfer even on a good day, so it gets far more headroom
- * than the small requests {@link REQUEST_TIMEOUT_MS} was sized for.
+ * Per-attempt timeout of an exhaustive listing inside a shared load. The full
+ * indicator catalog is ~15 MB and takes seconds to transfer even on a good day,
+ * so it gets far more headroom than {@link REQUEST_TIMEOUT_MS}.
  */
 const BULK_TIMEOUT_MS = 60_000;
 
 /**
  * Bound on a reference load shared by concurrent callers, which runs under no
- * caller's signal: a bulk request's own timeout across the framework's default
- * retry budget of four attempts, with room for the backoff between them.
+ * caller's signal or call deadline: a bulk request's own timeout across the
+ * framework's default retry budget of four attempts, with room for the backoff
+ * between them. A caller stops waiting at its deadline; the load runs on to this
+ * bound and caches what it gets for the next call.
  */
 const REFERENCE_LOAD_TIMEOUT_MS = 4 * BULK_TIMEOUT_MS + 15_000;
 
@@ -241,16 +259,22 @@ function isWbErrorEnvelope(data: unknown): data is WbErrorEnvelope {
 
 // ─── Normalization helpers ────────────────────────────────────────────────────
 
+/**
+ * Names are trimmed: upstream pads some at an edge (source 81
+ * " International Debt Statistics: DSSI", topic 11 "Poverty " on indicator
+ * rows, which `/topic` lists trimmed), so one name would otherwise read two ways
+ * across tools.
+ */
 function normalizeIndicator(raw: RawIndicator): Indicator {
   return {
     id: raw.id ?? '',
-    name: raw.name ?? '',
+    name: raw.name?.trim() ?? '',
     sourceId: raw.source?.id ?? '',
-    sourceName: raw.source?.value ?? '',
+    sourceName: raw.source?.value?.trim() ?? '',
     sourceNote: plainProse(raw.sourceNote ?? ''),
     topics: (raw.topics ?? [])
       .filter((t): t is typeof t & { id: string } => typeof t.id === 'string' && t.id.length > 0)
-      .map((t) => ({ id: t.id, name: t.value ?? '' })),
+      .map((t) => ({ id: t.id, name: t.value?.trim() ?? '' })),
   };
 }
 
@@ -258,7 +282,7 @@ function normalizeIndicatorDetail(raw: RawIndicator): IndicatorDetail {
   return {
     ...normalizeIndicator(raw),
     unit: raw.unit ?? '',
-    sourceOrganization: raw.sourceOrganization ?? '',
+    sourceOrganization: raw.sourceOrganization?.trim() ?? '',
   };
 }
 
@@ -361,10 +385,11 @@ function normalizeTopic(raw: RawTopic): Topic {
   };
 }
 
+/** The name is trimmed, as {@link normalizeIndicator} trims the same name on indicator rows. */
 function normalizeSource(raw: RawSource): Source {
   return {
     id: raw.id ?? '',
-    name: raw.name ?? '',
+    name: raw.name?.trim() ?? '',
     code: raw.code ?? '',
     lastUpdated: raw.lastupdated ?? '',
     dataAvailability: raw.dataavailability ?? '',
@@ -508,19 +533,49 @@ function seriesFamily(id: string): string {
 const DESCRIPTION_ONLY_TIER = 5;
 
 /**
- * Rank the hits so a caller who typed something specific gets it first: by
- * match tier, then by source within a tier, then in catalog order, except that
- * a series family is gathered at its first member's place, fewest ID segments
- * first. Without this, `Population, total` buries `SP.POP.TOTL` behind whichever
- * loosely-related indicators happen to sort earlier upstream, `GDP per capita`
- * leads with a regional dataset's copy of the series, and `access to electricity`
- * with the rural rate, which the catalog lists ahead of the total. Both sorts are
- * stable, so catalog order breaks the remaining ties.
+ * Whether `name` continues the normalized `phrase` with `, total`, its last word
+ * allowed the plural `s` or `es` the starts-with tier allows — how the catalog
+ * names a measure's headline series (`Population, total`, `Roads, total network
+ * (km)`) beside its breakdowns (`Population density`, `Unemployment, youth
+ * total`). Read on the raw name, since normalizing drops the comma: the archived
+ * `Internet total monthly price` does not continue `internet` this way.
  */
-function rankHits(hits: ReadonlyArray<{ indicator: Indicator; tier: number }>): Indicator[] {
+function continuesWithTotal(name: string, phrase: string): boolean {
+  for (let comma = name.indexOf(','); comma !== -1; comma = name.indexOf(',', comma + 1)) {
+    const head = normalizeForMatch(name.slice(0, comma));
+    if (
+      (head === phrase || head === `${phrase}s` || head === `${phrase}es`) &&
+      /^\s*total\b/i.test(name.slice(comma + 1))
+    )
+      return true;
+  }
+  return false;
+}
+
+/**
+ * Rank the hits so a caller who typed something specific gets it first: by
+ * match tier, then by source within a tier, then — among names starting with
+ * the phrase — a name continuing it with `, total` ({@link continuesWithTotal}),
+ * then in catalog order, except that a series family is gathered at its first
+ * member's place, fewest ID segments first. Without this, `Population, total`
+ * buries `SP.POP.TOTL` behind whichever loosely-related indicators happen to
+ * sort earlier upstream, `population` reaches it only after `Population density`
+ * and the age bands, `GDP per capita` leads with a regional dataset's copy of the
+ * series, and `access to electricity` with the rural rate, which the catalog
+ * lists ahead of the total. Both sorts are stable, so catalog order breaks the
+ * remaining ties.
+ */
+function rankHits(
+  hits: ReadonlyArray<{ indicator: Indicator; tier: number }>,
+  phrase: string,
+): Indicator[] {
   const ranked = hits
-    .map((hit) => ({ ...hit, source: sourceRank(hit.indicator) }))
-    .sort((a, b) => a.tier - b.tier || a.source - b.source);
+    .map((hit) => ({
+      ...hit,
+      source: sourceRank(hit.indicator),
+      headline: hit.tier === 1 && continuesWithTotal(hit.indicator.name, phrase) ? 0 : 1,
+    }))
+    .sort((a, b) => a.tier - b.tier || a.source - b.source || a.headline - b.headline);
   const familyLead = new Map<string, number>();
   return ranked
     .map((hit, index) => {
@@ -564,7 +619,7 @@ function matchIndicators(indicators: readonly Indicator[], query: string): Indic
       hits.push({ indicator, tier: DESCRIPTION_ONLY_TIER });
     }
   }
-  return rankHits(hits);
+  return rankHits(hits, phrase);
 }
 
 // ─── Observation reads ───────────────────────────────────────────────────────
@@ -770,11 +825,12 @@ export class WorldBankApiService {
    * Serve `key` from the reference cache, loading it once per TTL window. A TTL
    * of 0 disables retention, though concurrent callers still share one load.
    *
-   * `load` receives the context to fetch with: a signal of its own
-   * ({@link sharedLoadContext}), not the first caller's, because every
-   * concurrent caller waits on the same load. Each caller waits only until its
-   * own signal aborts, so one caller cancelling fails that caller alone, and a
-   * load every caller abandoned still completes and caches for the next one.
+   * `load` receives the context to fetch with: a signal and bound of its own
+   * ({@link sharedLoadContext}) and no call deadline, not the first caller's,
+   * because every concurrent caller waits on the same load. Each caller waits
+   * only until its own signal aborts or its call deadline passes, so one caller
+   * cancelling or running out of time fails that caller alone, and a load every
+   * caller abandoned still completes and caches for the next one.
    */
   private cachedReference<T>(
     key: string,
@@ -796,7 +852,7 @@ export class WorldBankApiService {
         .finally(() => this.referenceInFlight.delete(key));
       this.referenceInFlight.set(key, pending);
     }
-    return untilAborted(pending, ctx.signal);
+    return awaitSharedLoad(pending, ctx, 'indicators');
   }
 
   /** Build a fully-qualified URL with format=json always appended. */
@@ -809,16 +865,19 @@ export class WorldBankApiService {
     return `${this.baseUrl}${path}?${qs.toString()}`;
   }
 
-  /** Fetch a URL, detect HTML error pages, and return the parsed JSON. */
+  /**
+   * Fetch a URL in one attempt, detect HTML error pages, and return the parsed
+   * JSON. The attempt's timeout bounds the body read too.
+   */
   private async fetchJson<T>(
     url: string,
     ctx: Context,
-    timeoutMs: number,
+    { signal, timeoutMs }: CallAttempt,
     expectedStatuses?: number[],
   ): Promise<T> {
     const reqCtx = ctx as ReqCtx;
     const response = await fetchWithTimeout(url, timeoutMs, reqCtx, {
-      signal: ctx.signal,
+      signal,
       ...(expectedStatuses && { expectedStatuses }),
     }).catch((err: unknown) => {
       throw isTransientRequestError(err)
@@ -851,7 +910,10 @@ export class WorldBankApiService {
   }
 
   /**
-   * Fetch JSON with retry wrapping the full pipeline.
+   * Fetch JSON with retry wrapping the full pipeline, under the call deadline
+   * `ctx` carries: each attempt gets what the deadline leaves, and expiry is the
+   * typed `upstream_timeout`. Inside a shared load, which carries no deadline,
+   * each attempt gets `loadAttemptMs` instead.
    *
    * @param expectedStatuses - Non-OK statuses the caller handles itself, which
    *   the framework then logs at debug rather than error. Still thrown.
@@ -859,15 +921,14 @@ export class WorldBankApiService {
   private fetchWithRetry<T>(
     url: string,
     ctx: Context,
-    timeoutMs: number = REQUEST_TIMEOUT_MS,
-    expectedStatuses?: number[],
+    { loadAttemptMs = REQUEST_TIMEOUT_MS, expectedStatuses }: FetchOptions = {},
   ): Promise<T> {
-    return withRetry(() => this.fetchJson<T>(url, ctx, timeoutMs, expectedStatuses), {
-      operation: 'WorldBankApiService.fetch',
-      context: ctx as ReqCtx,
-      baseDelayMs: 1000,
-      signal: ctx.signal,
-    });
+    return retryWithinCallDeadline(
+      ctx,
+      'indicators',
+      (attempt) => this.fetchJson<T>(url, ctx, attempt, expectedStatuses),
+      { attemptTimeoutMs: loadAttemptMs, baseDelayMs: 1000 },
+    );
   }
 
   /**
@@ -880,10 +941,11 @@ export class WorldBankApiService {
   private async fetchLookup<T>(
     url: string,
     ctx: Context,
-    timeoutMs: number = REQUEST_TIMEOUT_MS,
   ): Promise<WbEnvelope<T> | WbErrorEnvelope> {
     try {
-      return await this.fetchWithRetry<WbEnvelope<T> | WbErrorEnvelope>(url, ctx, timeoutMs, [404]);
+      return await this.fetchWithRetry<WbEnvelope<T> | WbErrorEnvelope>(url, ctx, {
+        expectedStatuses: [404],
+      });
     } catch (err) {
       if (isUpstreamNotFound(err)) return PATH_NOT_FOUND_ENVELOPE;
       throw err;
@@ -908,14 +970,16 @@ export class WorldBankApiService {
     path: string,
     params: Record<string, string | number | undefined>,
     ctx: Context,
-    { perPage = BULK_PAGE_SIZE, idInPath = false, timeoutMs = BULK_TIMEOUT_MS } = {},
+    { perPage = BULK_PAGE_SIZE, idInPath = false } = {},
   ): Promise<{ paging: WbPage; items: T[] } | WbErrorEnvelope> {
     const requestPage = (page: number) => {
       const url = this.buildUrl(path, { ...params, page, per_page: perPage });
       ctx.log.debug('Fetching upstream page', { url });
       return idInPath
-        ? this.fetchLookup<T>(url, ctx, timeoutMs)
-        : this.fetchWithRetry<WbEnvelope<T> | WbErrorEnvelope>(url, ctx, timeoutMs);
+        ? this.fetchLookup<T>(url, ctx)
+        : this.fetchWithRetry<WbEnvelope<T> | WbErrorEnvelope>(url, ctx, {
+            loadAttemptMs: BULK_TIMEOUT_MS,
+          });
     };
 
     const first = await requestPage(1);
@@ -954,6 +1018,7 @@ export class WorldBankApiService {
   // ─── Topics ──────────────────────────────────────────────────────────────
 
   async listTopics(ctx: Context): Promise<Topic[]> {
+    ctx = withCallDeadline(ctx);
     const url = this.buildUrl('/topic');
     ctx.log.debug('Fetching topics', { url });
 
@@ -969,6 +1034,7 @@ export class WorldBankApiService {
     perPage: number,
     ctx: Context,
   ): Promise<{ sources: Source[]; total: number; page: number; pages: number }> {
+    ctx = withCallDeadline(ctx);
     const url = this.buildUrl('/source', { page, per_page: perPage });
     ctx.log.debug('Fetching sources', { url });
 
@@ -1014,6 +1080,7 @@ export class WorldBankApiService {
     },
     ctx: Context,
   ): Promise<{ indicators: Indicator[]; total: number; page: number; pages: number }> {
+    ctx = withCallDeadline(ctx);
     const { query, topicId, sourceId, page, perPage } = opts;
 
     // Matching ignores everything but letters and digits, so a query made only
@@ -1051,7 +1118,8 @@ export class WorldBankApiService {
         indicators: (items ?? []).map(normalizeIndicator),
         total: paging.total,
         page: paging.page,
-        pages: paging.pages,
+        // Upstream counts an empty scope as 0 pages; every paged tool counts it as 1.
+        pages: Math.max(1, paging.pages),
       };
     }
 
@@ -1071,11 +1139,12 @@ export class WorldBankApiService {
       indicators: matches.slice(start, start + perPage),
       total: matches.length,
       page,
-      pages: Math.ceil(matches.length / perPage),
+      pages: Math.max(1, Math.ceil(matches.length / perPage)),
     };
   }
 
   async getIndicator(indicatorId: string, ctx: Context): Promise<IndicatorDetail> {
+    ctx = withCallDeadline(ctx);
     const url = this.buildUrl(`/indicator/${encodeURIComponent(indicatorId)}`);
     ctx.log.debug('Fetching indicator', { indicatorId, url });
 
@@ -1113,9 +1182,11 @@ export class WorldBankApiService {
 
   /**
    * Fetch every catalog row for an indicator ID — empty when the catalog doesn't
-   * list it. Called only from the data endpoint's error path: its envelope never
-   * names the rejected path segment, and `/indicator/{id}` is unambiguous by
-   * construction.
+   * list it (its invalid-value envelope, or an HTTP 404). Called only from the
+   * data endpoint's error path: its envelope never names the rejected path
+   * segment, and `/indicator/{id}` is unambiguous by construction. A lookup that
+   * fails keeps its own classification, a retryable timeout or unavailability,
+   * since it settles nothing about the indicator.
    */
   private async lookupCatalogRows(indicatorId: string, ctx: Context): Promise<Indicator[]> {
     const url = this.buildUrl(`/indicator/${encodeURIComponent(indicatorId)}`);
@@ -1129,31 +1200,12 @@ export class WorldBankApiService {
   }
 
   /**
-   * The catalog rows behind an id-175 rejection, which name the source(s) whose
-   * source-scoped data API can serve the indicator instead. A failed lookup yields
-   * no rows rather than an unrelated upstream error: the rejection alone already
-   * settles that the standard endpoint won't serve the indicator.
-   */
-  private async catalogRowsForUnserved(indicatorId: string, ctx: Context): Promise<Indicator[]> {
-    try {
-      return await this.lookupCatalogRows(indicatorId, ctx);
-    } catch (err) {
-      if (ctx.signal.aborted) throw err;
-      ctx.log.warning('Catalog lookup failed; no source to route the unserved indicator to', {
-        indicatorId,
-        error: err instanceof Error ? err.message : String(err),
-      });
-      return [];
-    }
-  }
-
-  /**
    * The error for an indicator neither data path can serve: the standard endpoint
    * rejected it with id 175, and no catalog source resolved to a source-scoped
    * layout the tool can address.
    */
   private indicatorNotQueryable(indicatorId: string, rows: Indicator[], detail: string): McpError {
-    const sourceNames = [...new Set(rows.map((row) => row.sourceName.trim()).filter(Boolean))];
+    const sourceNames = [...new Set(rows.map((row) => row.sourceName).filter(Boolean))];
     const name = rows[0]?.name;
     const label = name ? `"${indicatorId}" (${name})` : `"${indicatorId}"`;
     const cause =
@@ -1191,7 +1243,7 @@ export class WorldBankApiService {
       return this.fetchWithRetry<(TBody & { pages?: number | string }) | WbErrorEnvelope>(
         url,
         ctx,
-        BULK_TIMEOUT_MS,
+        { loadAttemptMs: BULK_TIMEOUT_MS },
       );
     };
 
@@ -1380,7 +1432,7 @@ export class WorldBankApiService {
           { reason: 'indicator_not_found', indicatorId, sourceId: opts.sourceId },
         );
     } else {
-      catalogRows = await this.catalogRowsForUnserved(indicatorId, ctx);
+      catalogRows = await this.lookupCatalogRows(indicatorId, ctx);
     }
     if (catalogRows.length === 0)
       throw this.indicatorNotQueryable(indicatorId, catalogRows, detail);
@@ -1568,10 +1620,10 @@ export class WorldBankApiService {
     /** Page size actually served: the requested size, reduced to the page cap when larger. */
     perPage: number;
   }> {
+    ctx = withCallDeadline(ctx);
     const { region, incomeLevel, lendingType, includeAggregates, filter, page } = opts;
     const perPage = Math.min(opts.perPage, MAX_COUNTRIES_PER_PAGE);
     if (opts.sourceId !== undefined) {
-      ctx = { ...ctx, signal: AbortSignal.any([ctx.signal, AbortSignal.timeout(50_000)]) };
       if (region || incomeLevel || lendingType || includeAggregates)
         throw validationError(
           'Source entity listings do not establish global region, income, lending or aggregate classifications. Remove region, income_level, lending_type and include_aggregates=true when source_id is set.',
@@ -1662,6 +1714,7 @@ export class WorldBankApiService {
   }
 
   async getCountry(countryCode: string, ctx: Context): Promise<Country> {
+    ctx = withCallDeadline(ctx);
     const url = this.buildUrl(`/country/${encodeURIComponent(countryCode)}`);
     ctx.log.debug('Fetching country', { countryCode, url });
 
@@ -1738,7 +1791,7 @@ export class WorldBankApiService {
    * under that code. Served from the cached country index.
    */
   async lookupCountry(code: string, ctx: Context): Promise<CountryEntity | undefined> {
-    const { entities } = await this.loadCountryIndex(ctx);
+    const { entities } = await this.loadCountryIndex(withCallDeadline(ctx));
     return entities.get(code.trim().toUpperCase());
   }
 
@@ -1780,13 +1833,14 @@ export class WorldBankApiService {
   }
 
   /**
-   * Every page of one data request over `date`, at `perPage` rows a page. A read
-   * of every entry can run to megabytes a page and gets the bulk timeout. A read
-   * of listed countries is small and gets the ordinary one: the origin sometimes
-   * holds a request for about a minute before answering, and a retry after the
-   * ordinary timeout answers it sooner. Pages are fetched sequentially and each
-   * is reduced to observations before the next request; repeated indicator,
-   * unit, and decimal fields do not accumulate with the scope.
+   * Every page of one data request over `date`, at `perPage` rows a page. Each
+   * request is bounded by the call deadline alone, with no shorter per-attempt cut:
+   * the API computes a never-requested read once (seconds to over a minute) and
+   * caches it whether or not anyone waits, so an attempt held open collects that
+   * computation the moment it completes, where an attempt abandoned early leaves
+   * the next one to start over or catch the cache. Pages are fetched sequentially
+   * and each is reduced to observations before the next request; repeated
+   * indicator, unit, and decimal fields do not accumulate with the scope.
    */
   private async readSeries(
     path: string,
@@ -1794,7 +1848,6 @@ export class WorldBankApiService {
     perPage: number,
     ctx: Context,
   ): Promise<SeriesRead | WbErrorEnvelope> {
-    const timeoutMs = /^\/country\/all\//i.test(path) ? BULK_TIMEOUT_MS : REQUEST_TIMEOUT_MS;
     const items: Observation[] = [];
     const countries: ObservationCountries = new Map();
     let paging: WbPage | undefined;
@@ -1802,7 +1855,7 @@ export class WorldBankApiService {
     let page = 1;
     let pages: number | undefined;
     while (true) {
-      const next = await this.readSeriesPage(path, date, page, perPage, ctx, timeoutMs, countries);
+      const next = await this.readSeriesPage(path, date, page, perPage, ctx, countries);
       if (isWbErrorEnvelope(next)) return next;
       paging ??= next.paging;
       pages ??= standardPageCount(paging, next.items.length);
@@ -1820,12 +1873,11 @@ export class WorldBankApiService {
     page: number,
     perPage: number,
     ctx: Context,
-    timeoutMs = REQUEST_TIMEOUT_MS,
     countries?: ObservationCountries,
   ): Promise<SeriesRead | WbErrorEnvelope> {
     const url = this.buildUrl(path, { date, page, per_page: perPage });
     ctx.log.debug('Fetching upstream page', { url });
-    const body = await this.fetchLookup<RawDataPoint>(url, ctx, timeoutMs);
+    const body = await this.fetchLookup<RawDataPoint>(url, ctx);
     if (isWbErrorEnvelope(body)) return body;
     const [paging, items] = body;
     const indicator = items?.[0]?.indicator;
@@ -1871,7 +1923,8 @@ export class WorldBankApiService {
     const { indicatorId, frequency, page, perPage } = opts;
     let { items } = read;
     let total = Number(read.paging.total ?? 0);
-    let pages = Number(read.paging.pages ?? 0);
+    // An empty series is one page, not the 0 upstream counts.
+    let pages = Math.max(1, Number(read.paging.pages ?? 0));
     let periodForms = formsOf(items.map(OBSERVATION_READER.period));
 
     if (frequency) {
@@ -2064,14 +2117,12 @@ export class WorldBankApiService {
    * overlap with the window: `2019:2021` keeps a quarterly series' twelve quarters.
    */
   async getData(requested: GetDataOptions, ctx: Context): Promise<DataResult> {
+    ctx = withCallDeadline(ctx);
     const opts = { ...requested, perPage: Math.min(requested.perPage, MAX_OBSERVATIONS_PER_PAGE) };
     const { indicatorId, countries, dateRange, dimensionValue, frequency, page, perPage } = opts;
     const latest = latestSelection(opts);
     if (opts.sourceId !== undefined)
-      return this.serveFromSource(opts, 'Explicitly selected source', {
-        ...ctx,
-        signal: AbortSignal.any([ctx.signal, AbortSignal.timeout(50_000)]),
-      });
+      return this.serveFromSource(opts, 'Explicitly selected source', ctx);
 
     const codes = Array.isArray(countries) ? countries : countries.split(';');
     const path = this.dataPath(codes, indicatorId);

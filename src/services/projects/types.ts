@@ -29,6 +29,32 @@ export interface RawMajorSector {
 }
 
 /**
+ * One theme a project is tagged with, at any of `theme_list`'s three levels.
+ * Measured over 2,646 active projects (2026-11-19): every entry carries a name
+ * and a code, while the share, a numeric string, is absent on 942 of 49,497
+ * entries and exceeds 100 on a few FY17 ones (`"300"`). Two taxonomies never mix
+ * on one project — current names with six-digit codes (`240102`) and `FY17 - `
+ * names with two- or three-digit codes (`812`) — and 23 current names are stored
+ * only with a leading space, which `theme_exact` matches only as stored. The
+ * upstream `seqno` ordinal is not read.
+ */
+export interface RawTheme {
+  code?: string | null;
+  name?: string | null;
+  percent?: string | null;
+}
+
+/** A level-2 `theme2` entry, with the level-3 themes listed under it. */
+export interface RawTheme2 extends RawTheme {
+  theme3?: RawTheme[] | null;
+}
+
+/** A level-1 `theme_list` entry, with the level-2 themes listed under it. */
+export interface RawTheme1 extends RawTheme {
+  theme2?: RawTheme2[] | null;
+}
+
+/**
  * One project record, as the endpoint returns it under the requested `fl` field
  * list. Every field is optional: coverage is uneven across a portfolio that
  * reaches back to 1947. Measured over all 28,074 records, only `id`,
@@ -39,7 +65,9 @@ export interface RawMajorSector {
  * on 35.8% of 28,153 records (2026-09-25), always on the same rows. `pdo`, the
  * development objective, comes back only when `fl` names it, and is absent on
  * 42% of 28,238 records (2026-11-11) — on 6% of active operations; 163 values
- * carry HTML tags or entities.
+ * carry HTML tags or entities. `theme_list` is absent on 159 of 2,646 active
+ * operations (2026-11-19), most of them approved this year, though the index
+ * still tags some of those under `theme_exact`.
  *
  * `curr_total_commitment` is the project page's "Commitment Amount": IBRD plus
  * IDA (`curr_ibrd_commitment` + `curr_ida_commitment`, IDA grants included)
@@ -66,6 +94,7 @@ export interface RawProject {
   projectfinancialtype?: string[] | null;
   regionname?: string | null;
   status?: string | null;
+  theme_list?: RawTheme1[] | null;
 }
 
 /**
@@ -93,6 +122,26 @@ export interface ProjectSector {
    * Share of the project's commitment, in percent. Null on every entry of a
    * project whose shares are all zero, which publishes no split — 6,227 of
    * 23,377 sectored projects (2026-11-11); a zero inside a published split stays 0.
+   */
+  percent: number | null;
+}
+
+/** One theme of a project, any level, as the tool layer consumes it. */
+export interface ProjectTheme {
+  /** Theme code: six digits in the current taxonomy (`240102`), two or three in FY17 (`812`). */
+  code: string;
+  /** Theme name, trimmed, any `FY17 - ` prefix kept: the value the `theme` filter takes. */
+  name: string;
+  /**
+   * Name of the theme one level up, trimmed; null at level 1. A name listed at
+   * two levels (`Rural Development`) yields two entries this tells apart.
+   */
+  parent: string | null;
+  /**
+   * The share upstream publishes, in percent. Shares overlap rather than split:
+   * they sum past 100 within a level, and a few FY17 entries exceed 100 on
+   * their own. Null where none is published, and on every entry of a project
+   * whose shares are all zero or absent; a zero inside a published split stays 0.
    */
   percent: number | null;
 }
@@ -139,6 +188,12 @@ export interface ProjectSummary {
   sectors: ProjectSector[];
   /** `Active`, `Closed`, `Dropped`, or `Pipeline`. */
   status: string;
+  /**
+   * The three-level theme classification flattened depth-first in upstream
+   * order, each entry naming its parent. Null when `includeThemes` was not
+   * requested; empty when the project publishes no `theme_list`.
+   */
+  themes: ProjectTheme[] | null;
   /**
    * Commitment amount in USD as the project page reports it: IBRD + IDA + the
    * grant amount. Null on projects that publish no commitment amount.

@@ -1,7 +1,7 @@
 /**
  * @fileoverview Search the World Bank lending portfolio — active, closed,
  * dropped, and pipeline operations — by free text, country, region, status,
- * sector, financing window, and board approval date.
+ * sector, theme, financing window, and board approval date.
  * @module mcp-server/tools/definitions/worldbank-search-projects.tool
  */
 
@@ -11,7 +11,15 @@ import { escapeMarkdownInline, markdownLink } from '@cyanheads/mcp-ts-core/utils
 import { pagePastEndNotice } from '@/mcp-server/tools/page-past-end-notice.js';
 import { pageSizeReducedNotice } from '@/mcp-server/tools/page-size-reduced-notice.js';
 import { perPageInput, resolvePerPage } from '@/mcp-server/tools/per-page.js';
-import { normalizeSectorNames } from '@/services/projects/normalize-sector-names.js';
+import {
+  CALL_DEADLINE_MS,
+  isCallDeadlineExceeded,
+  withCallDeadline,
+} from '@/services/call-deadline.js';
+import {
+  normalizeSectorNames,
+  normalizeThemeNames,
+} from '@/services/projects/normalize-sector-names.js';
 import { toPortfolioCode } from '@/services/projects/portfolio-country-codes.js';
 import { getProjectsService } from '@/services/projects/projects-service.js';
 import { MAX_PROJECTS_PER_PAGE } from '@/services/response-budget.js';
@@ -78,7 +86,7 @@ function isCalendarDate(value: string): boolean {
 export const worldbankSearchProjects = tool('worldbank_search_projects', {
   title: 'Search World Bank Projects',
   description:
-    'Search the World Bank lending portfolio — the individual loans, credits, and grants the Bank finances — by free text, country, region, status, sector, financing window (IBRD, IDA, Grants, Other), and board approval date. Returns the project ID, name, development objective, borrowing country, region, status, board approval and closing dates, the commitment amount in USD with its IBRD, IDA, and grant parts, financing windows, major sectors, the sub-sectors under them with the share of the commitment each carries, and a link to the project page. This is the operations catalogue, not the statistics catalogue: use it for "what is the World Bank funding in Kenya", "which climate adaptation projects are active", or "how much was committed to education in South Asia since 2020". For development statistics and time series, use worldbank_search_indicators and worldbank_get_data instead. sector takes the sub-sector names rows list in sectors[].name, not the majorSectors names — for education commitments, sector: ["Primary Education", "Secondary Education", "Tertiary Education"] rather than a free-text query, which also matches incidental prose. Those are three of the Education sub-sectors, so read sectors[].name on a few matching rows to collect the rest before totalling a whole sector. A project matches when it lists a sector at any share, so a sector total weights each totalCommitment by the percent that sector carries. Countries take the ISO3 or ISO2 codes the other tools take (BRA or BR), and multi-country operations carry a World Bank regional code such as 3W or 3E; WDI aggregates such as SSF or WLD are rejected, since the portfolio lists operations by economy — use region for those. Every filter is an exact match upstream and combines with the others by AND, so a narrow search can legitimately return nothing; when it does, the response says whether the country codes matched anything on their own.',
+    'Search the World Bank lending portfolio — the loans, credits, and grants the Bank finances — by free text, country, region, status, sector, theme, financing windows, and board approval date. Returns each operation\'s objective, borrower, status, dates, USD commitment with its IBRD, IDA, and grant parts, financing windows, sectors with their shares, optional themes and abstract, and project page. Use it for questions such as "what is the World Bank funding in Kenya" or "which climate adaptation projects are active" (theme: ["Adaptation"], status: ["Active"]); for development statistics, use worldbank_search_indicators and worldbank_get_data. Prefer the sector and theme filters to a free-text query, which also matches incidental prose: education commitments start from sector: ["Primary Education", "Secondary Education", "Tertiary Education"], three of the Education sub-sectors rows list in sectors[].name — read it on matching rows for the rest. Filters match exactly and combine by AND, so a narrow search can return nothing.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   inputAliases: { limit: 'per_page' },
   input: z.object({
@@ -86,50 +94,48 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
       .string()
       .optional()
       .describe(
-        'Free-text search across project names, abstracts, and objectives. Every word must appear, so extra words narrow the result. A balanced quoted phrase and AND or OR between words parse; brackets, braces, an unmatched double quote, a slash between words, a trailing backslash, an AND or OR at either end, a trailing NOT, and # are not. Omit to browse the portfolio by filter alone. Results come newest board approval first either way.',
+        'Free text matched against project names, abstracts, and objectives; every word must appear. A quoted phrase and AND or OR between words parse; brackets, braces, an unmatched double quote, a slash between words, a trailing backslash, an AND or OR at either end, a trailing NOT, and # are rejected. Omit to browse by filter alone.',
       ),
     countries: z
       .union([
+        z.string().describe('One code, or several separated by commas, semicolons, or pipes.'),
         z
-          .string()
-          .describe(
-            'A single country code, or a list of them separated by commas, semicolons, or pipes.',
-          ),
-        z
-          .array(z.string().describe('An ISO3, ISO2, or World Bank regional code.'))
-          .describe(
-            'An array of country codes; an element holding several codes separated by commas, semicolons, or pipes is split too.',
-          ),
+          .array(z.string())
+          .describe('Codes; an element holding several separated codes is split too.'),
       ])
       .optional()
       .describe(
-        'Borrowing countries: an economy by ISO3 or ISO2 code (BRA or BR), or a World Bank regional code for a multi-country operation (3W for Western and Central Africa, 3E for Eastern and Southern Africa, 4E for East Asia and Pacific). 3A is the pre-split Africa code, found only on closed and dropped operations. Several codes — an array, or one string separated by commas, semicolons, or pipes — are combined as OR: a project matching any of them is returned. A value made only of separators is rejected rather than read as every country. Yemen, DR Congo, West Bank and Gaza, and Timor-Leste are searched under the legacy codes the portfolio files them by (RY, ZR, GZ, TP), which are also accepted as sent. A WDI aggregate (SSF, WLD, SAS) is rejected; use region for a regional search. Omit for every country.',
+        'Borrowing economies by ISO3 or ISO2 code (BRA or BR), or World Bank regional codes for multi-country operations (3W Western and Central Africa, 3E Eastern and Southern Africa, 4E East Asia and Pacific); 3A is the pre-split Africa code, on closed and dropped operations only. Several codes combine as OR. Yemen, DR Congo, West Bank and Gaza, and Timor-Leste are searched under their legacy portfolio codes (RY, ZR, GZ, TP), also accepted as sent. WDI aggregates (SSF, WLD) are rejected: use region. Omit for every country.',
       ),
     status: z
       .array(z.enum(PROJECT_STATUSES))
       .optional()
       .describe(
-        'Lifecycle stages to include, combined as OR. "Active" is under implementation, "Pipeline" is approved but not yet effective, "Closed" has finished disbursing, and "Dropped" was abandoned before approval. Most of the portfolio is closed, so omitting this returns mostly historical operations.',
+        'Lifecycle stages, combined as OR: Active (under implementation), Pipeline (approved, not yet effective), Closed (finished disbursing), Dropped (abandoned before approval). Omitted, results are mostly closed operations.',
       ),
     sector: z
-      .array(
-        z.string().describe('A sub-sector name from sectors[].name, optionally prefixed FY17 - .'),
-      )
+      .array(z.string())
       .optional()
       .describe(
-        'Sub-sector names exactly as rows list them in sectors[].name, such as Primary Education or FY17 - Social Protection — not the majorSectors names, and not sector codes. Each name is searched in its bare and FY17 - spellings at once, and several names combine as OR. A project matches when it lists the sector at any share, so a sector total weights each commitment by sectors[].percent. Unknown names return no matches; each name must be nonblank and contain no caret. Combines with other filters by AND.',
+        'Sub-sector names as rows list them in sectors[].name, such as Primary Education or FY17 - Social Protection, not majorSectors names or sector codes. Each name matches in its bare and FY17 - spellings; several combine as OR. A project matches at any share, so weight a sector total by sectors[].percent. Unknown names match nothing; a name must be nonblank with no caret.',
+      ),
+    theme: z
+      .array(z.string())
+      .optional()
+      .describe(
+        'Theme names as rows list them in themes[].name (set include_themes), at any of the three levels, such as Adaptation, Gender, or FY17 - Climate change, not theme codes. Each name matches in its bare and FY17 - spellings; several combine as OR. Matching is case-sensitive, and the current and FY17 taxonomies, never mixed on one project, spell some themes differently (pass both Climate Change and Climate change), so check themes[].name on rows of each before relying on one spelling. A project matches at any share, and shares overlap, so weight or threshold by themes[].percent. Unknown names match nothing; a name must be nonblank with no caret.',
       ),
     region: z
       .array(z.enum(PROJECT_REGIONS))
       .optional()
       .describe(
-        'World Bank operational regions to include, combined as OR. These are the lending regions the portfolio is organized by, not the WDI aggregate codes worldbank_get_data accepts. Africa is the pre-split region, found only on closed and dropped operations; current African operations sit under Eastern and Southern Africa or Western and Central Africa.',
+        'World Bank lending regions, combined as OR; not WDI aggregate codes. Africa is the pre-split region, on closed and dropped operations only; current African operations sit under Eastern and Southern Africa or Western and Central Africa.',
       ),
     financial_type: z
       .array(z.enum(FINANCING_WINDOWS))
       .optional()
       .describe(
-        `Financing windows to include, combined as OR: a project matches when its financialTypes holds any of them. ${FINANCING_WINDOWS.join(', ')} are the complete set, case-sensitive. A project that publishes no financing window — 36% of the portfolio, older and dropped operations mostly — never matches. The Grants window says how an operation is financed; it is not the grantAmount figure.`,
+        'Financing windows, combined as OR, matched against financialTypes; a project that publishes none never matches.',
       ),
     approved_from: z
       .union([
@@ -137,11 +143,11 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
         z
           .string()
           .regex(CALENDAR_DATE, 'approved_from must be a calendar date as YYYY-MM-DD.')
-          .describe('Earliest board approval date to include.'),
+          .describe('A date as YYYY-MM-DD.'),
       ])
       .optional()
       .describe(
-        'Earliest board approval date, as YYYY-MM-DD and inclusive. It must be a real calendar day (2024-02-29, not 2023-02-29) and, when approved_to is also set, on or before it. Board approval is the date the Bank committed to the operation; pipeline projects carry a scheduled date in the future.',
+        'Earliest board approval date, inclusive: a real calendar day, on or before approved_to.',
       ),
     approved_to: z
       .union([
@@ -149,19 +155,21 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
         z
           .string()
           .regex(CALENDAR_DATE, 'approved_to must be a calendar date as YYYY-MM-DD.')
-          .describe('Latest board approval date to include.'),
+          .describe('A date as YYYY-MM-DD.'),
       ])
       .optional()
-      .describe(
-        'Latest board approval date, as YYYY-MM-DD and inclusive. It must be a real calendar day.',
-      ),
+      .describe('Latest board approval date, inclusive: a real calendar day.'),
     include_abstract: z
       .boolean()
       .default(false)
+      .describe("Include each project's full abstract; page size is unchanged."),
+    include_themes: z
+      .boolean()
+      .default(false)
       .describe(
-        "Include each project's complete abstract without changing page size. A project with no abstract reports null; appliedFilters.includeAbstract distinguishes omission from unavailable text.",
+        "Include each project's themes; page size is unchanged, though themes can roughly triple a page. The theme filter works without it.",
       ),
-    page: z.number().int().min(1).default(1).describe('Pagination page number (1-based).'),
+    page: z.number().int().min(1).default(1).describe('Page number, 1-based.'),
     per_page: perPageInput(MAX_PROJECTS_PER_PAGE),
   }),
   output: z.object({
@@ -169,67 +177,67 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
       .array(
         z
           .object({
-            id: z.string().describe('World Bank project ID, e.g. P513206.'),
+            id: z.string().describe('Project ID, such as P513206.'),
             name: z.string().describe('Project name.'),
             objective: z
               .string()
               .nullable()
               .describe(
-                'Project development objective — what the operation sets out to achieve — as plain text, with markup removed and entities decoded. Null where the project publishes none: 6% of active operations and most dropped ones. A few values stop at 8,000 characters, cut short upstream.',
+                'Development objective as plain text; null where none is published. Upstream cuts a few at 8,000 characters.',
               ),
             status: z.string().describe('Lifecycle stage: Active, Closed, Dropped, or Pipeline.'),
             countryCodes: z
               .array(z.string())
               .describe(
-                "Two-character code of the borrowing country — the economy's ISO2 code, which chains into the other tools (YE for Yemen, though the portfolio files it under RY), or a World Bank regional code such as 3W for a multi-country operation. Upstream publishes it as a list, though every project in the portfolio carries exactly one.",
+                "The borrower's ISO2 code, which the other tools take (YE for Yemen, filed upstream as RY), or a World Bank regional code (3W) for a multi-country operation; one per project.",
               ),
-            countryName: z.string().describe('Borrowing country, as the portfolio names it.'),
-            regionName: z.string().describe('World Bank operational region.'),
+            countryName: z.string().describe('Borrower, as the portfolio names it.'),
+            regionName: z.string().describe('World Bank lending region.'),
             boardApprovalDate: z
               .string()
               .nullable()
               .describe(
-                'Date the Board approved the operation, as YYYY-MM-DD. A future date belongs to a pipeline project with a scheduled board date.',
+                "Board approval date, YYYY-MM-DD; a future date is a pipeline project's scheduled one.",
               ),
             closingDate: z
               .string()
               .nullable()
               .describe(
-                'Scheduled or actual closing date, as YYYY-MM-DD. Null on roughly 44% of the portfolio, which publishes none — almost all dropped operations among them.',
+                'Scheduled or actual closing date, YYYY-MM-DD; null where none is published, as on most dropped operations.',
               ),
             totalCommitment: z
               .number()
               .nullable()
               .describe(
-                "Commitment amount in USD as the project page reports it: ibrdCommitment + idaCommitment + grantAmount. Null on 35.8% of the portfolio (28,153 projects, 2026-09-25), which publishes no amount — dropped and older operations mostly — and that is not the same as a commitment of zero. It can include other agencies' co-financing through grantAmount; World Bank lending alone is ibrdCommitment + idaCommitment.",
+                'Commitment in USD as the project page reports it: ibrdCommitment + idaCommitment + grantAmount. Null where no amount is published, mostly on dropped and older operations — not a zero commitment. Bank lending alone is ibrdCommitment + idaCommitment.',
               ),
             ibrdCommitment: z
               .number()
               .nullable()
               .describe(
-                'IBRD commitment in USD. Null when the project publishes no IBRD or IDA amount, as on a grant-only operation — not a commitment of zero.',
+                'IBRD commitment in USD; null, not zero, when no IBRD or IDA amount is published, as on a grant-only operation.',
               ),
             idaCommitment: z
               .number()
               .nullable()
               .describe(
-                'IDA commitment in USD, IDA grants included. Null when the project publishes no IBRD or IDA amount — not a commitment of zero.',
+                'IDA commitment in USD, IDA grants included; null on the same terms as ibrdCommitment.',
               ),
             grantAmount: z
               .number()
               .nullable()
               .describe(
-                "Grant amount in USD: trust-fund grants and, on some operations, other agencies' co-financing recorded on the project, so it is not all World Bank money. Counted in totalCommitment. It is its own figure, unrelated to which financialTypes the project lists.",
+                "Grant amount in USD: trust-fund grants and, on some operations, other agencies' co-financing, so not all World Bank money. Independent of financialTypes.",
               ),
             financialTypes: z
               .array(z.string())
               .describe(
-                `Financing windows behind the operation: ${FINANCING_WINDOWS.join(', ')} — the values financial_type filters on. A blended operation lists more than one; empty where the project publishes none.`,
+                'Financing windows, the values financial_type takes; several on a blended operation, empty where none is published.',
               ),
             majorSectors: z
               .array(z.string())
               .describe(
-                'Major sectors the operation is classified under, e.g. Health, Education, Transportation. Empty where the portfolio publishes no sector classification. The sector filter takes the sub-sector names in sectors, not these.',
+                'Major sectors, such as Health or Education; empty where none is published. Not accepted by the sector filter.',
               ),
             sectors: z
               .array(
@@ -237,101 +245,106 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
                   .object({
                     name: z
                       .string()
-                      .describe(
-                        'Sub-sector name, e.g. Primary Education or FY17 - Social Protection: the value the sector filter takes.',
-                      ),
-                    code: z.string().describe('Sector code, e.g. EEP.'),
-                    majorSector: z
-                      .string()
-                      .describe('The majorSectors name this sub-sector is listed under.'),
+                      .describe('Sub-sector name, the value the sector filter takes.'),
+                    code: z.string().describe('Sector code, such as EEP.'),
+                    majorSector: z.string().describe('Its majorSectors name.'),
                     percent: z
                       .number()
                       .nullable()
                       .describe(
-                        'Share of the commitment, in percent; the shares of a project usually sum to 100. Null on every entry of a project that publishes no split — its upstream shares are all zero — which is not a share of zero.',
+                        'Share of the commitment in percent, usually summing to 100; null on every entry of a project that publishes no split, which is not a zero share.',
                       ),
                   })
-                  .describe('One sub-sector of the operation.'),
+                  .describe('A sub-sector.'),
               )
+              .describe('Sub-sectors in upstream order; empty where none is published.'),
+            themes: z
+              .array(
+                z
+                  .object({
+                    name: z.string().describe('Theme name, the value the theme filter takes.'),
+                    code: z
+                      .string()
+                      .describe(
+                        'Theme code: six digits in the current taxonomy (240102), two or three in the FY17 one (812).',
+                      ),
+                    parent: z
+                      .string()
+                      .nullable()
+                      .describe(
+                        'Theme one level up; null at the top level. A name at two levels appears twice, told apart by parent.',
+                      ),
+                    percent: z
+                      .number()
+                      .nullable()
+                      .describe(
+                        'Published share in percent. Shares overlap, so they do not add up across themes, and a few older ones exceed 100. Null where none is published, and on every entry of a project whose shares are all zero, which is not a zero share.',
+                      ),
+                  })
+                  .describe('A theme, at any level.'),
+              )
+              .nullable()
               .describe(
-                'Sub-sectors the operation is classified under, in upstream order, each with its major sector and share. Empty where the portfolio publishes no sector classification. A sector total weights totalCommitment by percent.',
+                'Themes at all three levels, flattened in upstream order. Null unless include_themes is set; empty where none is published, including some recent operations the theme filter still matches.',
               ),
             abstract: z
               .string()
               .nullable()
               .describe(
-                'Complete project abstract as plain text. Null when include_abstract was not requested or the project publishes none; appliedFilters.includeAbstract distinguishes them.',
+                'Full abstract as plain text; null when include_abstract is false or none is published.',
               ),
             url: z.string().describe('Project page on projects.worldbank.org.'),
           })
-          .describe('One World Bank lending operation.'),
+          .describe('A lending operation.'),
       )
-      .describe(
-        'Projects on this page, newest board approval date first with or without query, and projects with no board date last. Pagination walks the same order.',
-      ),
+      .describe('Projects on this page, newest board approval first and undated ones last.'),
   }),
 
   enrichment: {
     appliedFilters: z
       .object({
-        query: z.string().optional().describe('Free-text query applied, omitted when none.'),
+        query: z.string().optional().describe('Query applied.'),
         countries: z
           .string()
           .optional()
           .describe(
-            'Country codes as sent upstream — each resolved to the code the portfolio keys on (BRA → BR, YEM or YE → RY), uppercased, deduplicated, and comma-joined here for readability, though the API itself takes them caret-separated. Omitted when no country filter was applied.',
+            "Country codes as sent, each resolved to the portfolio's code (BRA → BR, YEM → RY), comma-joined.",
           ),
-        status: z.string().optional().describe('Statuses applied, omitted when none.'),
-        region: z.string().optional().describe('Regions applied, omitted when none.'),
+        status: z.string().optional().describe('Statuses applied.'),
+        region: z.string().optional().describe('Regions applied.'),
         sector: z
           .array(z.string())
           .optional()
-          .describe(
-            'Sector names applied, deduplicated with the leading FY17 prefix removed; omitted when none.',
-          ),
-        financialType: z
-          .string()
+          .describe('Sector names applied, deduplicated, FY17 - prefix removed.'),
+        theme: z
+          .array(z.string())
           .optional()
-          .describe('Financing windows applied, comma-joined, omitted when none.'),
-        approvedFrom: z
-          .string()
-          .optional()
-          .describe('Earliest board approval date applied, omitted when none.'),
-        approvedTo: z
-          .string()
-          .optional()
-          .describe('Latest board approval date applied, omitted when none.'),
-        includeAbstract: z
-          .boolean()
-          .describe(
-            'Whether abstracts were requested, including the server default of false. A null abstract means "not requested" when this is false and "none published" when it is true.',
-          ),
-        page: z.number().describe('Page number requested.'),
-        perPage: z
-          .number()
-          .describe(
-            'Results per page actually served — the requested size or server default, reduced to the page cap when larger. totalPages is counted at this size.',
-          ),
+          .describe('Theme names applied, deduplicated, FY17 - prefix removed, case kept.'),
+        financialType: z.string().optional().describe('Financing windows applied, comma-joined.'),
+        approvedFrom: z.string().optional().describe('Earliest board approval date applied.'),
+        approvedTo: z.string().optional().describe('Latest board approval date applied.'),
+        includeAbstract: z.boolean().describe('Whether abstracts were requested.'),
+        includeThemes: z.boolean().describe('Whether themes were requested.'),
+        page: z.number().describe('Page requested.'),
+        perPage: z.number().describe('Page size served, after any reduction to the page maximum.'),
         requestedPerPage: z
           .number()
           .optional()
           .describe(
-            'Page size asked for, requested or server default, present only when it exceeded the page cap and perPage was reduced.',
+            'Page size asked for, or the server default; present only when perPage was reduced.',
           ),
       })
-      .describe(
-        'The effective search sent upstream — confirms country-code normalization and which filters were in force for these results.',
-      ),
-    totalCount: z.number().describe('Total projects matching the search, before pagination.'),
+      .describe('The search as sent upstream; a filter not applied is omitted.'),
+    totalCount: z.number().describe('Matching projects before pagination.'),
     currentPage: z
       .number()
-      .describe('Page number requested — past totalPages when the request ran off the end.'),
-    totalPages: z.number().describe('Total number of pages.'),
+      .describe('Page number; past totalPages when the request ran off the end.'),
+    totalPages: z.number().describe('Total pages at perPage.'),
     notice: z
       .string()
       .optional()
       .describe(
-        'Context for an empty result set — including whether the country filter matched anything on its own — for a page past the end of the results, or for a page size reduced to the maximum.',
+        'Explains an empty result (including whether the country codes match on their own), a page past the end, or a reduced page size.',
       ),
   },
 
@@ -360,6 +373,9 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
           ...(filters.sector === undefined
             ? []
             : [`sector=${filters.sector.map(escapeMarkdownInline).join(', ')}`]),
+          ...(filters.theme === undefined
+            ? []
+            : [`theme=${filters.theme.map(escapeMarkdownInline).join(', ')}`]),
           ...(filters.financialType === undefined
             ? []
             : [`financial_type=${escapeMarkdownInline(filters.financialType)}`]),
@@ -370,6 +386,7 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
             ? []
             : [`approved_to=${escapeMarkdownInline(filters.approvedTo)}`]),
           `include_abstract=${filters.includeAbstract}`,
+          `include_themes=${filters.includeThemes}`,
           `page=${filters.page}`,
           `per_page=${filters.perPage}${filters.requestedPerPage === undefined ? '' : ` (requested ${filters.requestedPerPage})`}`,
         ].join(', ')}`,
@@ -381,16 +398,24 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
       reason: 'invalid_sector_name',
       code: JsonRpcErrorCode.ValidationError,
       severity: 'notice',
-      when: 'A sector name is blank after normalization or contains a caret separator.',
+      when: 'A sector name is blank or contains a caret.',
       recovery:
         'Send each nonblank sector name in its own array element, without caret separators.',
+      thrownBy: 'service',
+    },
+    {
+      reason: 'invalid_theme_name',
+      code: JsonRpcErrorCode.ValidationError,
+      severity: 'notice',
+      when: 'A theme name is blank or contains a caret.',
+      recovery: 'Send each nonblank theme name in its own array element, without caret separators.',
       thrownBy: 'service',
     },
     {
       reason: 'invalid_country_code',
       severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'A countries entry resolves to no economy: it is not two or three letters or digits, no economy in the World Bank country index has that three-character code, or it is a WDI aggregate such as SSF or WLD, which the portfolio lists no operations under. Also when countries holds only separators and so names no code at all.',
+      when: 'A country code is malformed, unknown, or a WDI aggregate, or countries holds only separators.',
       recovery:
         'Pass each economy by an ISO3 or ISO2 code worldbank_list_countries lists, or a World Bank regional code such as 3W for multi-country operations. For every project in a region, drop the aggregate code and set the region filter instead.',
     },
@@ -398,7 +423,7 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
       reason: 'invalid_date',
       severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'approved_from or approved_to is shaped YYYY-MM-DD but names no real day — a month outside 01–12, or a day outside its month.',
+      when: 'approved_from or approved_to is not a real calendar day.',
       recovery:
         'Correct the date to a real calendar day as YYYY-MM-DD, such as 2024-02-29 or 2023-02-28, and retry.',
     },
@@ -406,7 +431,7 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
       reason: 'reversed_date_range',
       severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'approved_from falls after approved_to, an interval no project can match.',
+      when: 'approved_from is after approved_to.',
       recovery:
         'Swap the two dates so approved_from is on or before approved_to, or drop one of them for an open-ended window.',
     },
@@ -414,7 +439,7 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
       reason: 'invalid_query',
       severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'The Projects API could not parse query and answered HTTP 400, or query contains #, which the API answers with rows unrelated to the search.',
+      when: 'query has syntax the Projects API cannot parse, or contains #.',
       recovery:
         'Remove from query any brackets or braces, an unmatched double quote, a slash between words, a trailing backslash, a #, an AND or OR at either end, and a trailing NOT, then search again. Plain words, a balanced quoted phrase, and AND or OR between words all parse.',
     },
@@ -422,24 +447,40 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
       reason: 'page_out_of_range',
       severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'The requested page starts past the 100,000-result offset the Projects API serves.',
+      when: 'The page starts past the 100,000-result offset the Projects API serves.',
       recovery:
         'Lower the page number, or add a filter so the matches fit inside the range the API pages through.',
     },
     {
       reason: 'upstream_unavailable',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'The Projects API answered with a non-success status other than a query it could not parse — a rate limit, a timeout, a 5xx — or with an HTML error page, or the World Bank Indicators API country listing that resolves an ISO3 code could not be loaded.',
+      when: 'The Projects API failed (a rate limit, a 408, a 5xx, or an HTML error page), or the country listing that resolves ISO3 codes did not load.',
       recovery:
         'Retry the same search once; if it keeps failing, the Projects API is down or has moved, and no change to the search will help.',
+    },
+    {
+      reason: 'upstream_timeout',
+      code: JsonRpcErrorCode.Timeout,
+      retryable: true,
+      thrownBy: 'service',
+      when: "The call's 50-second budget ran out before the Projects API or the ISO3 country listing answered.",
+      recovery:
+        'Retry the call shortly, or narrow the request so the World Bank Projects API has less to return.',
     },
   ],
 
   async handler(input, ctx) {
+    /**
+     * One deadline for the whole call, started before anything waits: the ISO3
+     * lookup through the Indicators API and the Projects requests spend the same
+     * budget, never one each.
+     */
+    const call = withCallDeadline(ctx);
     const codes = input.countries === undefined ? [] : splitCountryCodes(input.countries);
     const statuses = input.status ?? [];
     const regions = input.region ?? [];
     const sectors = normalizeSectorNames(input.sector ?? []);
+    const themes = normalizeThemeNames(input.theme ?? []);
     const financialTypes = input.financial_type ?? [];
     const query = input.query?.trim() ? input.query.trim() : undefined;
     const approvedFrom = input.approved_from || undefined;
@@ -513,15 +554,30 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
      * 7E, 8S) are regional codes that select multi-country operations only, 18
      * for 8S against 2,371 for the South Asia region — so it is rejected rather
      * than mapped. An index that fails to load is reported as the upstream
-     * failure it is, naming the listing; a cancellation of this call is the
+     * failure it is, naming the listing, and one still loading when the call
+     * deadline passes as the timeout it is; a cancellation of this call is the
      * caller's and propagates untouched.
      */
     const lookups = await Promise.all(
       codes.map((code) =>
-        code.length === 3 ? getWorldBankApiService().lookupCountry(code, ctx) : undefined,
+        code.length === 3 ? getWorldBankApiService().lookupCountry(code, call) : undefined,
       ),
     ).catch((err: unknown) => {
       if (ctx.signal.aborted) throw err;
+      if (isCallDeadlineExceeded(err)) {
+        const hint = (err.data?.recovery as { hint?: string } | undefined)?.hint;
+        throw ctx.fail(
+          'upstream_timeout',
+          `The World Bank Indicators API country listing, which resolves an ISO3 code to the code the portfolio keys on, did not load within the call's ${CALL_DEADLINE_MS / 1000} s deadline.`,
+          {
+            ...err.data,
+            recovery: {
+              hint: `${hint ? `${hint} ` : ''}Passing each economy by its ISO2 code needs no country-listing lookup.`,
+            },
+          },
+          { cause: err },
+        );
+      }
       throw ctx.fail(
         'upstream_unavailable',
         'The World Bank Indicators API country listing, which resolves an ISO3 code to the code the portfolio keys on, could not be loaded.',
@@ -583,14 +639,16 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
           statuses: [...statuses],
           regions: [...regions],
           ...(sectors.length > 0 && { sectors }),
+          ...(themes.length > 0 && { themes }),
           financialTypes: [...financialTypes],
           ...(approvedFrom !== undefined && { approvedFrom }),
           ...(approvedTo !== undefined && { approvedTo }),
           includeAbstract: input.include_abstract,
+          includeThemes: input.include_themes,
           page: input.page,
           perPage: pageSize.served,
         },
-        ctx,
+        call,
       );
     } catch (err) {
       if (err instanceof McpError) {
@@ -621,10 +679,12 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
         ...(statuses.length > 0 && { status: statuses.join(',') }),
         ...(regions.length > 0 && { region: regions.join(',') }),
         ...(sectors.length > 0 && { sector: sectors }),
+        ...(themes.length > 0 && { theme: themes }),
         ...(financialTypes.length > 0 && { financialType: financialTypes.join(',') }),
         ...(approvedFrom !== undefined && { approvedFrom }),
         ...(approvedTo !== undefined && { approvedTo }),
         includeAbstract: input.include_abstract,
+        includeThemes: input.include_themes,
         page: input.page,
         perPage: result.perPage,
         ...(result.perPage < pageSize.requested && { requestedPerPage: pageSize.requested }),
@@ -634,10 +694,19 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
 
     const notices: string[] = [];
     if (result.total === 0) {
-      const sectorAdvice =
-        sectors.length > 0
-          ? ' The sector filter matches the sub-sector names rows list in sectors[].name exactly, in bare and FY17 - spellings, not the majorSectors names. Check each name against sectors[].name on a search without the filter, or remove the sector filter and retry.'
-          : '';
+      // How to check each name filter in force; both match only names the rows list.
+      const nameAdvice = [
+        ...(sectors.length > 0
+          ? [
+              ' The sector filter matches the sub-sector names rows list in sectors[].name exactly, in bare and FY17 - spellings, not the majorSectors names. Check each name against sectors[].name on a search without the filter, or remove the sector filter and retry.',
+            ]
+          : []),
+        ...(themes.length > 0
+          ? [
+              ' The theme filter matches the names rows list in themes[].name exactly, case included, in bare and FY17 - spellings, and the two taxonomies spell some themes differently. Check each name against themes[].name on a search without the filter and with include_themes, or remove the theme filter and retry.',
+            ]
+          : []),
+      ].join('');
       /**
        * An exact-match filter that matches nothing is a plain zero-hit upstream,
        * so an empty result has to say which filter emptied it. The enum-backed
@@ -651,6 +720,7 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
         ...(statuses.length > 0 ? ['status'] : []),
         ...(regions.length > 0 ? ['region'] : []),
         ...(sectors.length > 0 ? ['sector'] : []),
+        ...(themes.length > 0 ? ['theme'] : []),
         ...(financialTypes.length > 0 ? ['financial_type'] : []),
         ...(approvedFrom === undefined ? [] : ['approved_from']),
         ...(approvedTo === undefined ? [] : ['approved_to']),
@@ -658,7 +728,7 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
 
       if (result.countryOnlyTotal === 0) {
         notices.push(
-          `No project carries country code(s) ${codeList}, with every other filter removed: either the portfolio uses no such code, or that economy has no World Bank lending history. Economies are searched by ISO2, an ISO3 code resolved to it, and multi-country operations by a regional code such as 3W.${sectorAdvice}`,
+          `No project carries country code(s) ${codeList}, with every other filter removed: either the portfolio uses no such code, or that economy has no World Bank lending history. Economies are searched by ISO2, an ISO3 code resolved to it, and multi-country operations by a regional code such as 3W.${nameAdvice}`,
         );
       } else if (result.countryOnlyTotal !== null) {
         /**
@@ -671,13 +741,13 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
             ? ' That count is for the codes combined, so one of them may still be unused by the portfolio — re-run with a single code to check it on its own.'
             : '';
         notices.push(
-          `No project matches every filter at once. Country code(s) ${codeList} match ${result.countryOnlyTotal} projects with every other filter removed, so ${otherFilters.join(', ')} narrowed the result to nothing — drop or widen ${otherFilters.length === 1 ? 'it' : 'one of them'} and retry.${perCodeCaveat}${sectorAdvice}`,
+          `No project matches every filter at once. Country code(s) ${codeList} match ${result.countryOnlyTotal} projects with every other filter removed, so ${otherFilters.join(', ')} narrowed the result to nothing — drop or widen ${otherFilters.length === 1 ? 'it' : 'one of them'} and retry.${perCodeCaveat}${nameAdvice}`,
         );
       } else {
         // No probe count to lean on, so name every filter in force, countries included.
         const applied = [...(countryCodes.length > 0 ? ['countries'] : []), ...otherFilters];
         notices.push(
-          `No project matches this search. Filters combine by AND and match exactly${applied.length > 0 ? ` — ${applied.join(', ')} ${applied.length === 1 ? 'was' : 'were'} applied` : ''}. Widen the date window, add statuses, or drop words from the query, which requires every word to appear.${sectorAdvice}`,
+          `No project matches this search. Filters combine by AND and match exactly${applied.length > 0 ? ` — ${applied.join(', ')} ${applied.length === 1 ? 'was' : 'were'} applied` : ''}. Widen the date window, add statuses, or drop words from the query, which requires every word to appear.${nameAdvice}`,
         );
       }
     } else if (result.projects.length === 0) {
@@ -729,10 +799,16 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
     const sector = (entry: (typeof result.projects)[number]['sectors'][number]) =>
       `${escapeMarkdownInline(entry.name)} (${escapeMarkdownInline(entry.code)} · ${escapeMarkdownInline(entry.majorSector)} · ${entry.percent === null ? 'percent null' : `${entry.percent}%`})`;
 
+    /** `name (code · parent name · share)`, nulls spelled out; theme names carry commas too. */
+    const theme = (entry: NonNullable<(typeof result.projects)[number]['themes']>[number]) =>
+      `${escapeMarkdownInline(entry.name)} (${escapeMarkdownInline(entry.code)} · parent ${entry.parent === null ? 'null' : escapeMarkdownInline(entry.parent)} · ${entry.percent === null ? 'percent null' : `${entry.percent}%`})`;
+
     /**
-     * A row with no objective or abstract gets no line for it: format() sees only
-     * the rows, and the applied-filters trailer's include_abstract says whether
-     * abstracts were requested at all.
+     * A row with no objective or abstract gets no line for it, nor a row whose
+     * themes were not requested: format() sees only the rows, and the
+     * applied-filters trailer's include_abstract and include_themes say whether
+     * either was requested at all. Requested themes a project does not publish
+     * render as none.
      */
     for (const project of result.projects) {
       lines.push(`\n${escapeMarkdownInline(project.name)} (${escapeMarkdownInline(project.id)})`);
@@ -745,8 +821,10 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
         // Major-sector names carry commas too (Agriculture, Fishing and Forestry).
         `- **majorSectors:** ${project.majorSectors.map(escapeMarkdownInline).join('; ') || 'none'}`,
         `- **sectors:** ${project.sectors.map(sector).join('; ') || 'none'}`,
-        `- **url:** ${markdownLink(project.url, project.url)}`,
       );
+      if (project.themes !== null)
+        lines.push(`- **themes:** ${project.themes.map(theme).join('; ') || 'none'}`);
+      lines.push(`- **url:** ${markdownLink(project.url, project.url)}`);
       if (project.abstract !== null)
         lines.push(`- **abstract:** ${escapeMarkdownInline(project.abstract)}`);
     }
