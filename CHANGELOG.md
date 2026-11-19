@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.6.2](changelog/0.6.x/0.6.2.md) — 2026-11-19
+
+One 50 s deadline per call across every upstream request, with a retryable upstream_timeout whose repeat is answered, a theme filter and themes output on worldbank_search_projects, 4,000-row worldbank_get_data pages, and a tool catalog cut 43.7% in served prose.
+
 ## [0.6.1](changelog/0.6.x/0.6.1.md) — 2026-11-11
 
 Project objectives and sub-sectors, a country and entity filter, dimension values by label, per_page clamping on every paged tool with WORLDBANK_CLAMP_LIMITS, and fixes for PIP single-year estimates and project sector matching.
