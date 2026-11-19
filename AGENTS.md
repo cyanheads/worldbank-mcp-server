@@ -407,6 +407,12 @@ security: false                            # optional — true ONLY for a source
 
 ---
 
+## Dependency holds
+
+`vitest` is held at exactly 5.1.0 (allowlisted in `devcheck.config.json` `outdated.allowlist`): 5.1.1 forks a worker watchdog and calls `child.channel.unref()`, which Bun's `child_process` lacks, so `bun --bun run test` cannot start any worker. Lift the hold once a vitest release runs the Bun lane.
+
+---
+
 ## Imports
 
 ```ts
