@@ -11,9 +11,6 @@
     ],
     "ignorePatterns": []
   },
-  "outdated": {
-    "allowlist": ["vitest"]
-  },
   "lint": {},
   "packaging": {
     "pluginManifests": true
