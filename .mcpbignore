@@ -13,6 +13,8 @@
 /tsconfig*.json
 /vitest.config.ts
 /coverage/
+/.vitest/
+/node_modules/.vitest-cache/
 /tests/
 /src/
 /scripts/
