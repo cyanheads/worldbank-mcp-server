@@ -354,6 +354,164 @@ describe('worldbank_get_poverty routing', () => {
 
   // ─── Surveyed economies, one year ─────────────────────────────────────────
 
+  it.each([
+    [undefined, 3, 0.4645],
+    [6.953, 6.95, 0.8747],
+  ])(
+    'uses the default or fixed poverty line %s without a population share',
+    async (line, applied, headcount) => {
+      serve(() => [surveyRow('KEN', 2021, { poverty_line: applied, headcount })]);
+      const { structured, text } = await call({
+        countries: 'KEN',
+        year: '2021',
+        fill_gaps: false,
+        ...(line === undefined ? {} : { poverty_line: line }),
+      });
+
+      const params = pipRequests()[0]?.searchParams;
+      expect(params?.get('povline')).toBe(line === undefined ? null : String(line));
+      expect(params?.has('popshare')).toBe(false);
+      expect(structured.estimates[0]).toMatchObject({ povertyLine: applied, headcount });
+      expect(structured.appliedFilters).not.toHaveProperty('populationShare');
+      expect(text).toContain(`**povertyLine:** ${applied}/day PPP`);
+      expect(text).not.toContain('population_share=');
+      if (line === undefined) {
+        expect(structured.appliedFilters).not.toHaveProperty('povertyLine');
+        expect(text).not.toContain('poverty_line=');
+      } else {
+        expect(structured.appliedFilters.povertyLine).toBe(line);
+        expect(text).toContain(`poverty_line=${line}`);
+      }
+    },
+  );
+
+  it.each([
+    ['2021', 2.7459, 0.3999, 'survey', null],
+    ['2024', 2.8599, 0.4, 'extrapolation', 'projection'],
+  ])(
+    'returns the inverse poverty threshold for %s on both surfaces',
+    async (year, line, headcount, estimationType, estimateType) => {
+      serve((params) => {
+        if (params.get('fill_gaps') === 'true') {
+          return [
+            estimateRow('KEN', Number(year), {
+              poverty_line: line,
+              headcount: 0.4,
+              estimate_type: estimateType,
+            }),
+          ];
+        }
+        return year === '2021' ? [surveyRow('KEN', 2021, { poverty_line: line, headcount })] : [];
+      });
+      const { structured, text } = await call({ countries: 'KEN', year, population_share: 0.4 });
+
+      expect(
+        pipRequests().map(({ searchParams }) => [
+          searchParams.get('fill_gaps'),
+          searchParams.get('popshare'),
+          searchParams.get('povline'),
+          searchParams.get('version'),
+        ]),
+      ).toEqual([
+        ['false', '0.4', null, '20260922_2021_01_02_PROD'],
+        ['true', '0.4', null, '20260922_2021_01_02_PROD'],
+      ]);
+      expect(structured.estimates).toEqual([
+        expect.objectContaining({ povertyLine: line, headcount, estimationType, estimateType }),
+      ]);
+      expect(structured.appliedFilters).toMatchObject({ populationShare: 0.4 });
+      expect(structured.appliedFilters).not.toHaveProperty('povertyLine');
+      expect(text).toContain(`**povertyLine:** ${line}/day PPP`);
+      expect(text).toContain(`**headcount:** ${headcount} |`);
+      expect(text).toContain('population_share=0.4');
+    },
+  );
+
+  it.each([0, 1, -0.2, 1.2, '0.4'])('rejects invalid population_share %s', async (share) => {
+    const { error, text } = await failure({ countries: 'KE', population_share: share });
+    expect(error.data).toMatchObject({ reason: 'invalid_arguments' });
+    expect(text).toContain('population_share');
+    expect(requested()).toHaveLength(0);
+  });
+
+  it('caches each population share separately on the same country and year', async () => {
+    serve((params) => [
+      surveyRow(
+        'KEN',
+        2021,
+        params.get('popshare') === '0.2'
+          ? { poverty_line: 2.0475, headcount: 0.1999 }
+          : { poverty_line: 2.7459, headcount: 0.3999 },
+      ),
+    ]);
+    const values = [];
+    for (const share of [0.2, 0.4, 0.2]) {
+      const { structured } = await call({
+        countries: 'KEN',
+        year: '2021',
+        fill_gaps: false,
+        population_share: share,
+      });
+      const row = structured.estimates[0];
+      values.push([row?.povertyLine, row?.headcount]);
+    }
+    expect(values).toEqual([
+      [2.0475, 0.1999],
+      [2.7459, 0.3999],
+      [2.0475, 0.1999],
+    ]);
+    expect(pipRequests().map((url) => url.searchParams.get('popshare'))).toEqual(['0.2', '0.4']);
+  });
+
+  it('rejects a population share paired with a zero poverty line before an ISO2 lookup', async () => {
+    const { error, text } = await failure({
+      countries: 'KE',
+      population_share: 0.4,
+      poverty_line: 0,
+    });
+    expect(error.data).toMatchObject({ reason: 'invalid_params', retryable: false });
+    expect(text).toContain('Recovery:');
+    expect(text).toContain('Choose population_share for a threshold or poverty_line for a share.');
+    expect(requested()).toHaveLength(0);
+  });
+
+  it.each([['SSF'], [['KEN', 'SSF']], [['KEN', 'ZG']]])(
+    'rejects a population share with aggregate selection %j',
+    async (countries) => {
+      serve(() => undefined);
+      const { error, text } = await failure({ countries, population_share: 0.4 });
+      expect(error.data).toMatchObject({
+        reason: 'aggregate_filter_conflict',
+        parameters: ['population_share'],
+        countryCodes: 'SSF',
+        retryable: false,
+      });
+      expect(text).toContain('Recovery:');
+      expect(text).toContain('population_share');
+      expect([...pipRequests(), ...groupRequests()]).toHaveLength(0);
+    },
+  );
+
+  it('echoes a population share on an empty result, a maximum-sized page, and a page past the end', async () => {
+    serve((params) =>
+      params.get('year') === '2024'
+        ? []
+        : Array.from({ length: 1001 }, (_, index) => surveyRow('KEN', 1000 + index)),
+    );
+    const input = { countries: 'KEN', population_share: 0.4, fill_gaps: false };
+    for (const [options, count, notice] of [
+      [{ year: '2024' }, 0, 'No estimates returned.'],
+      [{ per_page: 1000 }, 1000, 'per_page=1000'],
+      [{ per_page: 1000, page: 3 }, 0, 'Page 3 is past the end'],
+    ] as const) {
+      const { structured, text } = await call({ ...input, ...options });
+      expect(structured.estimates).toHaveLength(count);
+      expect(structured.appliedFilters.populationShare).toBe(0.4);
+      expect(text).toContain('population_share=0.4');
+      expect(text).toContain(notice);
+    }
+  });
+
   it('answers a surveyed year with its survey row in place of the gap-filled twin, and no gap-filled notice', async () => {
     // Release 20260922, PPP 2021: USA 2022 is 0.014 in the survey series, 0.0132 gap-filled.
     serve((params) =>
@@ -1513,6 +1671,45 @@ describe('worldbank_get_poverty routing', () => {
   });
 
   // ─── #57: model-estimate-only economies ───────────────────────────────────
+
+  it('carries the population share through the model-only fallback and surveyed retry', async () => {
+    serve((params) => {
+      const country = params.get('country');
+      if (country === 'KEN') return [surveyedYear(params, 'KEN', 2020)];
+      if (country !== 'all' || params.get('fill_gaps') !== 'true') return;
+      return [
+        estimateRow('AFG', 2020, { estimation_type: 'CMD estimation' }),
+        estimateRow('NGA', 2020),
+      ];
+    });
+    const { structured, text } = await call({
+      countries: ['KEN', 'AFG'],
+      year: '2020',
+      population_share: 0.2,
+    });
+
+    expect(summary(structured)).toEqual([
+      ['AFG', 2020, 'CMD estimation'],
+      ['KEN', 2020, 'survey'],
+    ]);
+    expect(
+      pipRequests().map(({ searchParams }) => [
+        searchParams.get('country'),
+        searchParams.get('fill_gaps'),
+        searchParams.get('popshare'),
+      ]),
+    ).toEqual(
+      expect.arrayContaining([
+        ['KEN,AFG', 'false', '0.2'],
+        ['KEN,AFG', 'true', '0.2'],
+        ['KEN', 'false', '0.2'],
+        ['KEN', 'true', '0.2'],
+        ['all', 'true', '0.2'],
+      ]),
+    );
+    expect(text).toContain('population_share=0.2');
+    expect(text).toContain('**estimationType:** CMD estimation');
+  });
 
   it('answers a model-estimate-only economy from the all-economy response, narrowed to it', async () => {
     serve((params) =>

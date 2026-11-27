@@ -44,6 +44,7 @@ const cases: Array<[AnyToolDefinition, string[], string[]]> = [
       'ambiguous_aggregate',
       'unserved_aggregate',
       'aggregate_filter_conflict',
+      'invalid_params',
       'invalid_parameter',
       'ppp_version_unavailable',
     ],

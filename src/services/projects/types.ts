@@ -79,15 +79,20 @@ export interface RawTheme1 extends RawTheme {
  */
 export interface RawProject {
   boardapprovaldate?: string | null;
+  borrower?: string | null;
   closingdate?: string | null;
   countrycode?: string[] | null;
   countryname?: string | null;
   curr_ibrd_commitment?: string | null;
   curr_ida_commitment?: string | null;
+  curr_project_cost?: string | null;
   curr_total_commitment?: string | null;
+  esrc_ovrl_risk_rate?: string | null;
   grantamt?: string | null;
   id?: string | null;
+  impagency?: string | null;
   major_sectors?: RawMajorSector[] | null;
+  parentprojid?: string | null;
   pdo?: string | null;
   project_abstract?: string | null;
   project_name?: string | null;
@@ -156,6 +161,7 @@ export interface ProjectSummary {
   abstract: string | null;
   /** Board approval date as `YYYY-MM-DD`, narrowed from the upstream timestamp. */
   boardApprovalDate: string | null;
+  borrower: string | null;
   closingDate: string | null;
   /**
    * Two-character codes: the WDI ISO2 code for an economy — the four legacy
@@ -165,6 +171,8 @@ export interface ProjectSummary {
    */
   countryCodes: string[];
   countryName: string;
+  /** Overall environmental and social risk code as published. */
+  esRiskRating: string | null;
   /** `IBRD`, `IDA`, `Grants`, or `Other`; a project may carry more than one. */
   financialTypes: string[];
   /**
@@ -178,11 +186,15 @@ export interface ProjectSummary {
   id: string;
   /** IDA commitment in USD, IDA grants included. */
   idaCommitment: number | null;
+  implementingAgency: string | null;
   /** Major sector names, deduplicated, in the order upstream lists them. */
   majorSectors: string[];
   name: string;
   /** Project development objective (`pdo`) as plain text, trimmed; null when none is published. */
   objective: string | null;
+  parentProjectId: string | null;
+  /** Reported cost in USD, including Bank and non-Bank funding. */
+  projectCost: number | null;
   regionName: string;
   /** Sub-sectors in upstream order, each under its major sector; empty when none are published. */
   sectors: ProjectSector[];

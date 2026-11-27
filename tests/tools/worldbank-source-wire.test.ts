@@ -303,6 +303,52 @@ describe('World Bank source and exhaustive pagination wire contracts', () => {
         '/v2/sources/57/version',
       ]);
     });
+
+    it('discloses missing source IDs after selecting a dimension and before paging', async () => {
+      const opaque = 'test_province_a';
+      const scopedRoutes = {
+        ...routes,
+        '/v2/sources/6/country': listing([
+          ['ZMB', 'Zambia'],
+          [opaque, 'Province A'],
+        ]),
+        '/v2/sources/6/country/ZMB%3Btest_province_a/series/DT.DOD.DPPG.CD/counterpart-area/730':
+          observation('730', 'China', 5386396180.7),
+      };
+      network.mockImplementation(async (input) => {
+        const pathname = new URL(String(input)).pathname;
+        if (!Object.hasOwn(scopedRoutes, pathname)) throw new Error(`unexpected path ${pathname}`);
+        return Response.json(scopedRoutes[pathname as keyof typeof scopedRoutes]);
+      });
+      const args = {
+        source_id: '6',
+        indicator_id: 'DT.DOD.DPPG.CD',
+        dimension_value: '730',
+        countries: ['ZMB', 'TEST_Province_a'],
+        mrnev: 1,
+        per_page: 1,
+      };
+
+      for (const page of [1, 2]) {
+        const result = await runToolContract(worldbankGetData, { ...args, page });
+        expect(result.isError, JSON.stringify(result.structuredContent)).toBeFalsy();
+        expect(result.structuredContent).toMatchObject({
+          totalCount: 1,
+          totalPages: 1,
+          notice: expect.stringContaining('No non-null value selected for TEST_Province_a.'),
+        });
+        expect(textOf(result)).toContain('No non-null value selected for TEST_Province_a.');
+      }
+
+      const invalid = await runToolContract(worldbankGetData, {
+        ...args,
+        countries: ['ZMB', 'ZZZ'],
+      });
+      expect(invalid.structuredContent).toMatchObject({
+        error: { data: { reason: 'country_not_found' } },
+      });
+      expect(textOf(invalid)).toContain('country_not_found');
+    });
   });
 
   it('surfaces a source request held to the call deadline as upstream_timeout instead of empty data', async () => {

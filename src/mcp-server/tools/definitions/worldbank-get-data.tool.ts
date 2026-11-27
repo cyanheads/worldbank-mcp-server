@@ -101,7 +101,13 @@ export const worldbankGetData = tool('worldbank_get_data', {
   title: 'Get World Bank Indicator Data',
   description: `Query one World Bank indicator's values for countries across periods — the primary data tool; find indicator_id with worldbank_search_indicators. Set at most one of date_range, mrv, or mrnev, and frequency only without date_range. For "all" countries, page at up to ${MAX_OBSERVATIONS_PER_PAGE} per page. Indicators the standard data endpoint does not serve — WDI Database Archives, PEFA, ICP, GDLD, International Debt Statistics: DSSI, Food Prices for Nutrition — are answered from their own dataset; the response then carries sourceScoped, naming the dataset and the dimension value applied, since those values can be archived or superseded figures.`,
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
-  inputAliases: { limit: 'per_page' },
+  inputAliases: {
+    limit: 'per_page',
+    country: 'countries',
+    country_codes: 'countries',
+    indicator: 'indicator_id',
+    date: 'date_range',
+  },
   input: z.object({
     source_id: z
       .string()
@@ -313,7 +319,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
       .string()
       .optional()
       .describe(
-        'Explains an empty result, a frequency the series lacks, a page past the end, an all-null date_range or frequency page, a reduced page size, or countries a source-scoped dataset lacks.',
+        'Explains empty or all-null results, missing countries or periods, a page past the end, or a reduced page size.',
       ),
   },
 
@@ -462,7 +468,7 @@ export const worldbankGetData = tool('worldbank_get_data', {
     {
       reason: 'upstream_inconsistent',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: "The API's response cache answered a data read and its re-read with another query's rows.",
+      when: 'The Indicators API returned conflicting data reads for a valid request.',
       recovery:
         'Retry later, or change the countries list, which sends a request the stale cached answer does not match.',
       retryable: true,
@@ -660,7 +666,16 @@ export const worldbankGetData = tool('worldbank_get_data', {
           : undefined;
     const notices: string[] = [];
     const published = (result.periodForms ?? []).map((form) => FORM_FREQUENCY[form]);
-    if (result.total === 0 && frequency && published.length > 0 && !published.includes(frequency)) {
+    if (result.overlapCheckUnavailable) {
+      notices.push(
+        `The World Bank returned no rows for "${dateRange}". It could not check overlapping periods at another frequency. Repeat the same call to check coverage.`,
+      );
+    } else if (
+      result.total === 0 &&
+      frequency &&
+      published.length > 0 &&
+      !published.includes(frequency)
+    ) {
       notices.push(
         `"${result.indicator.id}" publishes no ${frequency} periods — only ${published.join(' and ')} ones — ` +
           `so frequency "${frequency}" has nothing to return. Use frequency "${published[0]}", or omit frequency.`,
@@ -719,6 +734,14 @@ export const worldbankGetData = tool('worldbank_get_data', {
       notices.push(
         `${sourceName} (source ${sourceId}) publishes no data for ${uncovered.join(', ')}, so ` +
           `${uncovered.length === 1 ? 'that code was' : 'those codes were'} left out of the query.`,
+      );
+    }
+    if (result.missingLatestCodes?.length) {
+      notices.push(`No non-null value selected for ${result.missingLatestCodes.join(', ')}.`);
+    }
+    if (result.unresolvedLatestCodes?.length) {
+      notices.push(
+        `Could not check ${result.unresolvedLatestCodes.join(', ')} against the selected values because the country index was unavailable.`,
       );
     }
     if (notices.length > 0) ctx.enrich.notice(notices.join(' '));

@@ -18,12 +18,14 @@ import { createInMemoryStorage, runToolContract } from '@cyanheads/mcp-ts-core/t
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { worldbankGetData } from '@/mcp-server/tools/definitions/worldbank-get-data.tool.js';
 import { initWorldBankApiService } from '@/services/worldbank/worldbank-service.js';
+import { held } from '../helpers/held-fetch.js';
 
 vi.mock('@/config/server-config.js', () => ({
   getServerConfig: vi.fn().mockReturnValue({
     apiBaseUrl: 'https://api.worldbank.org/v2',
     defaultPerPage: 50,
     catalogCacheTtlMs: 60_000,
+    clampLimits: true,
   }),
 }));
 
@@ -302,6 +304,7 @@ function periodsFor(series: Series, date: string | null): string[] {
   const atForm = series.calendar[formOf(start)];
   const inside = (atForm ?? []).filter((p) => p >= start && p <= end);
   if (series.family === 'fill') return inside;
+  if (start === end) return inside;
   return inside.length > 0 ? inside : wholeSeries(series);
 }
 
@@ -443,6 +446,215 @@ afterEach(() => {
 // ─── Characterization: behaviour that stays ───────────────────────────────────
 
 describe('behaviour without frequency', () => {
+  it.each(['deadline', 'caller'])(
+    'settles a held overlap check at the %s boundary',
+    async (boundary) => {
+      vi.useFakeTimers();
+      const controller = new AbortController();
+      try {
+        fetchMock.mockImplementation(async (input, init) => {
+          if (new URL(String(input)).searchParams.get('date') === '1900') {
+            return Response.json([{ page: 1, pages: 0, total: 0 }, []]);
+          }
+          if (boundary === 'caller') controller.abort();
+          return held(init);
+        });
+        const pending = runToolContract(
+          worldbankGetData,
+          {
+            countries: 'USA',
+            indicator_id: 'NY.GDP.MKTP.CD',
+            date_range: '1900',
+          },
+          { context: { signal: controller.signal } },
+        );
+        await vi.advanceTimersByTimeAsync(50_000);
+        const result = await pending;
+        if (boundary === 'caller') {
+          expect(result.structuredContent).toMatchObject({
+            error: { code: JsonRpcErrorCode.RequestCancelled },
+          });
+        } else {
+          expect(result.structuredContent).toMatchObject({
+            data: [],
+            totalCount: 0,
+            notice: expect.stringContaining('could not check overlapping periods'),
+          });
+        }
+        expect(fetchMock).toHaveBeenCalledTimes(3);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it.each(['sentinel', 'forbidden', 'malformed'])(
+    'keeps the confirmed empty result and discloses an unavailable overlap check (%s)',
+    async (failure) => {
+      fetchMock.mockImplementation(async (input) => {
+        const url = new URL(String(input));
+        if (url.searchParams.get('date') === '1900') {
+          return Response.json([
+            { page: 1, pages: 0, total: 0, sourceid: '2', lastupdated: '2026-11-01' },
+            [],
+          ]);
+        }
+        expect(url.searchParams.get('date')).toBe('1900:1901');
+        if (failure === 'forbidden') return new Response('', { status: 403 });
+        if (failure === 'malformed') return new Response('{');
+        return Response.json([{ message: [{ id: '120', value: 'Invalid value' }] }]);
+      });
+      const { structured, text } = await call({
+        countries: 'USA',
+        indicator_id: 'NY.GDP.MKTP.CD',
+        date_range: '1900',
+      });
+      expect(structured).toMatchObject({
+        data: [],
+        totalCount: 0,
+        sourceId: '2',
+        lastUpdated: '2026-11-01',
+      });
+      expect(structured.notice).toContain('could not check overlapping periods');
+      expect(text).toContain('could not check overlapping periods');
+    },
+  );
+
+  it.each(['2020', '2020:2020'])(
+    'recovers a one-year window %s on a quarterly series',
+    async (date_range) => {
+      const args = {
+        indicator_id: 'DP.DOD.DECD.CR.BC.CD',
+        countries: 'CL',
+        date_range,
+        per_page: 2,
+      };
+      const first = await call(args);
+      const second = await call({ ...args, page: 2 });
+      const past = await call({ ...args, page: 3 });
+
+      expect(first.structured.data.map((row) => row.date)).toEqual(['2020Q4', '2020Q3']);
+      expect(second.structured.data.map((row) => row.date)).toEqual(['2020Q2', '2020Q1']);
+      for (const result of [first, second, past]) {
+        expect(result.structured).toMatchObject({
+          totalCount: 4,
+          totalPages: 2,
+          appliedFilters: { dateRange: date_range },
+        });
+        expect(result.text).toContain(`date_range=${date_range}`);
+      }
+      expect(second.text).toContain('2020Q1');
+      expect(past.structured.data).toEqual([]);
+      expect(past.text).toContain('Page 3 is past the end');
+    },
+  );
+
+  it('recovers an annual observation for an in-year quarterly singleton', async () => {
+    const { structured, text } = await call({
+      indicator_id: 'NY.GDP.PCAP.CD',
+      countries: 'KE',
+      date_range: '2020Q1',
+    });
+
+    expect(structured.data.map((row) => row.date)).toEqual(['2020']);
+    expect(structured.totalCount).toBe(1);
+    expect(text).toContain('2020');
+  });
+
+  it('does not recover unknown periods or a different form from a mixed-form response', async () => {
+    const indicator_id = 'DP.DOD.DECD.CR.BC.CD';
+    polluted.push(
+      EMPTY_ENVELOPE,
+      EMPTY_ENVELOPE,
+      bodyAt(indicator_id, [
+        ['CHL', '2020Q1'],
+        ['CHL', '2021'],
+        ['CHL', 'unexpected'],
+      ]),
+    );
+    const { structured, text } = await call({ indicator_id, countries: 'CL', date_range: '2020' });
+
+    expect(structured).toMatchObject({ data: [], totalCount: 0 });
+    expect(text).toContain('No observations returned');
+    expect(dates()).toEqual(['2020', '2020', '2020:2021']);
+  });
+
+  it.each([
+    ['9999', '9998:9999', '9999Q1'],
+    ['9999Q4', '9999Q3:9999Q4', '9999'],
+    ['9999M12', '9999M11:9999M12', '9999'],
+  ])(
+    'keeps the recovery window for %s inside the supported calendar',
+    async (date_range, window, matchingPeriod) => {
+      const indicator_id = 'DP.DOD.DECD.CR.BC.CD';
+      polluted.push(
+        EMPTY_ENVELOPE,
+        EMPTY_ENVELOPE,
+        bodyAt(indicator_id, [['CHL', matchingPeriod]]),
+      );
+      const { structured } = await call({ indicator_id, countries: 'CL', date_range });
+      expect(structured.data.map((row) => row.date)).toEqual([matchingPeriod]);
+      expect(dates()).toEqual([date_range, date_range, window]);
+    },
+  );
+
+  it('confirms a polluted recovery read at another page size and preserves the original filters', async () => {
+    const indicator_id = 'DP.DOD.DECD.CR.BC.CD';
+    polluted.push(EMPTY_ENVELOPE, EMPTY_ENVELOPE, bodyAt(indicator_id, [['CHL', '2025']]));
+    const { structured, text } = await call({
+      indicator_id,
+      countries: 'CL',
+      date_range: '2020',
+      per_page: 4001,
+    });
+
+    expect(structured).toMatchObject({
+      appliedFilters: { dateRange: '2020', perPage: 4000, requestedPerPage: 4001 },
+      totalCount: 4,
+      lastUpdated: DEBT.lastUpdated,
+    });
+    expect(text).toContain('was reduced to 4000');
+    expect(text).toContain(DEBT.lastUpdated);
+    expect(dates()).toEqual(['2020', '2020', '2020:2021', '2020:2021']);
+    expect(dataRequests[2]?.searchParams.get('per_page')).not.toBe(
+      dataRequests[3]?.searchParams.get('per_page'),
+    );
+  });
+
+  it('keeps the original empty response when two suspect recovery reads disagree', async () => {
+    const indicator_id = 'DP.DOD.DECD.CR.BC.CD';
+    polluted.push(
+      EMPTY_ENVELOPE,
+      EMPTY_ENVELOPE,
+      bodyAt(indicator_id, [['CHL', '2025']]),
+      bodyAt(indicator_id, [['CHL', '2024']]),
+    );
+    const { isError, structured, text } = await call({
+      indicator_id,
+      countries: 'CL',
+      date_range: '2020',
+    });
+
+    expect(isError).toBeFalsy();
+    expect(structured).toMatchObject({ data: [], totalCount: 0 });
+    expect(structured.notice).toContain('could not check overlapping periods');
+    expect(text).toContain('Repeat the same call');
+    expect(dates()).toEqual(['2020', '2020', '2020:2021', '2020:2021']);
+  });
+
+  it('serves a mixed-form singleton at the requested form, including a native null', async () => {
+    const { structured, text } = await call({
+      indicator_id: 'CPTOTSAXN',
+      countries: 'KE',
+      date_range: '2024Q1',
+    });
+
+    expect(cells(structured.data)).toEqual(['KEN 2024Q1 null']);
+    expect(structured.notice).toContain('Every observation in date_range "2024Q1" is null');
+    expect(text).toContain(structured.notice);
+    expect(dates()).toEqual(['2024Q1']);
+  });
+
   it('keeps the twelve quarters a year window overlaps on a quarterly-only series, from one request', async () => {
     const { structured } = await call({
       indicator_id: 'DP.DOD.DECD.CR.BC.CD',

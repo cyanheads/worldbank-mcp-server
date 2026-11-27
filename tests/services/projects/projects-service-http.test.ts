@@ -8,14 +8,19 @@
  */
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createInMemoryStorage, createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import {
+  createInMemoryStorage,
+  createMockContext,
+  runToolContract,
+} from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { worldbankSearchProjects } from '@/mcp-server/tools/definitions/worldbank-search-projects.tool.js';
 import {
   CALL_DEADLINE_MS,
   isCallDeadlineExceeded,
   withCallDeadline,
 } from '@/services/call-deadline.js';
-import { ProjectsService } from '@/services/projects/projects-service.js';
+import { initProjectsService, ProjectsService } from '@/services/projects/projects-service.js';
 import { answerAfter, held } from '../../helpers/held-fetch.js';
 
 vi.mock('@/config/server-config.js', () => ({
@@ -24,6 +29,7 @@ vi.mock('@/config/server-config.js', () => ({
     pipBaseUrl: 'https://api.worldbank.org/pip/v1',
     projectsBaseUrl: 'https://search.worldbank.org/api/v3',
     defaultPerPage: 50,
+    clampLimits: true,
     catalogCacheTtlMs: 60_000,
   }),
 }));
@@ -87,6 +93,220 @@ describe('ProjectsService over the real fetch and retry path', () => {
   afterEach(() => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
+  });
+
+  it('probes an empty filtered search with only its country codes', async () => {
+    fetchMock
+      .mockResolvedValueOnce(Response.json({ total: '0', projects: {} }))
+      .mockResolvedValueOnce(Response.json({ total: '834', projects: {} }));
+    const service = new ProjectsService({} as never, createInMemoryStorage());
+    const result = await service.searchProjects(
+      { ...baseOpts, countryCodes: ['BR'], statuses: ['Active'] },
+      createMockContext(),
+    );
+
+    expect(result).toMatchObject({ countryOnlyTotal: 834, projects: [], total: 0 });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const probe = new URL(String(fetchMock.mock.calls[1]?.[0])).searchParams;
+    expect(probe.get('countrycode_exact')).toBe('BR');
+    expect(probe.get('rows')).toBe('0');
+    expect(probe.has('status_exact')).toBe(false);
+  });
+
+  it('projects and renders published portfolio metadata, zero cost, and absent fields', async () => {
+    initProjectsService({} as never, createInMemoryStorage());
+    fetchMock.mockResolvedValueOnce(
+      Response.json({
+        total: '3',
+        projects: {
+          P517775: {
+            id: 'P517775',
+            curr_project_cost: '10000000000',
+            curr_total_commitment: '5000000',
+            esrc_ovrl_risk_rate: 'M',
+            parentprojid: 'P180547',
+          },
+          P519330: { id: 'P519330', curr_project_cost: '0' },
+          P510604: {
+            id: 'P510604',
+            countryname: 'Eastern and Southern Africa',
+            borrower: 'Eastern Africa Power Pool',
+            impagency: 'Eastern Africa Power Pool General Secretariat',
+          },
+        },
+      }),
+    );
+
+    const result = await runToolContract(worldbankSearchProjects, { per_page: 3 });
+    expect(result.structuredContent).toMatchObject({
+      projects: [
+        {
+          id: 'P517775',
+          projectCost: 10_000_000_000,
+          totalCommitment: 5_000_000,
+          esRiskRating: 'M',
+          parentProjectId: 'P180547',
+          borrower: null,
+          implementingAgency: null,
+        },
+        { id: 'P519330', projectCost: 0, esRiskRating: null, parentProjectId: null },
+        {
+          id: 'P510604',
+          countryName: 'Eastern and Southern Africa',
+          borrower: 'Eastern Africa Power Pool',
+          implementingAgency: 'Eastern Africa Power Pool General Secretariat',
+          projectCost: null,
+        },
+      ],
+    });
+    const content = result.content
+      .flatMap((block) => (block.type === 'text' ? [block.text] : []))
+      .join('\n');
+    for (const field of [
+      '**projectCost:** 10,000,000,000 USD',
+      '**projectCost:** 0 USD',
+      '**projectCost:** null',
+      '**esRiskRating:** M',
+      '**esRiskRating:** null',
+      '**parentProjectId:** P180547',
+      '**parentProjectId:** null',
+      '**borrower:** Eastern Africa Power Pool',
+      '**borrower:** null',
+      '**implementingAgency:** Eastern Africa Power Pool General Secretariat',
+      '**implementingAgency:** null',
+    ]) {
+      expect(content).toContain(field);
+    }
+    const fields = new URL(String(fetchMock.mock.calls[0]?.[0])).searchParams.get('fl')?.split(',');
+    expect(fields).toEqual(
+      expect.arrayContaining([
+        'borrower',
+        'impagency',
+        'curr_project_cost',
+        'esrc_ovrl_risk_rate',
+        'parentprojid',
+      ]),
+    );
+  });
+
+  it('combines portfolio filters and excludes them from the country-only probe', async () => {
+    initProjectsService({} as never, createInMemoryStorage());
+    fetchMock
+      .mockResolvedValueOnce(Response.json({ total: '0', projects: {} }))
+      .mockResolvedValueOnce(Response.json({ total: '834', projects: {} }));
+    const result = await runToolContract(worldbankSearchProjects, {
+      countries: 'BR',
+      es_risk_rating: ['H', 'S'],
+      parent_project_id: 'P176758',
+    });
+
+    expect(result.structuredContent).toMatchObject({
+      projects: [],
+      totalCount: 0,
+      appliedFilters: { countries: 'BR', esRiskRating: 'H,S', parentProjectId: 'P176758' },
+      notice: expect.stringContaining('es_risk_rating, parent_project_id narrowed'),
+    });
+    const content = result.content
+      .flatMap((block) => (block.type === 'text' ? [block.text] : []))
+      .join('\n');
+    expect(content).toContain('es_risk_rating=H,S');
+    expect(content).toContain('parent_project_id=P176758');
+    expect(content).toContain('match 834 projects');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const search = new URL(String(fetchMock.mock.calls[0]?.[0])).searchParams;
+    expect(search.get('countrycode_exact')).toBe('BR');
+    expect(search.get('esrc_ovrl_risk_rate_exact')).toBe('H^S');
+    expect(search.get('parentprojid_exact')).toBe('P176758');
+    const probe = new URL(String(fetchMock.mock.calls[1]?.[0])).searchParams;
+    expect(probe.get('countrycode_exact')).toBe('BR');
+    expect(probe.get('rows')).toBe('0');
+    expect(probe.has('esrc_ovrl_risk_rate_exact')).toBe(false);
+    expect(probe.has('parentprojid_exact')).toBe(false);
+  });
+
+  it('caps a filtered search at 1,000 rows and echoes the filters on a page past the end', async () => {
+    initProjectsService({} as never, createInMemoryStorage());
+    fetchMock.mockResolvedValueOnce(Response.json({ total: '1', projects: {} }));
+    const result = await runToolContract(worldbankSearchProjects, {
+      es_risk_rating: ['S'],
+      parent_project_id: 'P176758',
+      page: 2,
+      per_page: 1_001,
+    });
+    expect(result.structuredContent).toMatchObject({
+      projects: [],
+      totalCount: 1,
+      currentPage: 2,
+      totalPages: 1,
+      appliedFilters: {
+        esRiskRating: 'S',
+        parentProjectId: 'P176758',
+        perPage: 1_000,
+        requestedPerPage: 1_001,
+      },
+      notice: expect.stringContaining('Page 2 is past the end'),
+    });
+    expect(result.content).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ text: expect.stringContaining('Page 2 is past the end') }),
+      ]),
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const search = new URL(String(fetchMock.mock.calls[0]?.[0])).searchParams;
+    expect(search.get('rows')).toBe('1000');
+    expect(search.get('os')).toBe('1000');
+    expect(search.get('esrc_ovrl_risk_rate_exact')).toBe('S');
+    expect(search.get('parentprojid_exact')).toBe('P176758');
+  });
+
+  it('reports an offset outside the upstream bound with its recovery hint', async () => {
+    initProjectsService({} as never, createInMemoryStorage());
+    const result = await runToolContract(worldbankSearchProjects, {
+      parent_project_id: 'P176758',
+      page: 102,
+      per_page: 1_000,
+    });
+    expect(result).toMatchObject({
+      isError: true,
+      structuredContent: {
+        error: {
+          code: JsonRpcErrorCode.ValidationError,
+          data: {
+            reason: 'page_out_of_range',
+            recovery: { hint: expect.stringContaining('Lower the page number') },
+          },
+        },
+      },
+      content: expect.arrayContaining([
+        expect.objectContaining({ text: expect.stringContaining('Lower the page number') }),
+      ]),
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [{ es_risk_rating: ['H', 'h'] }, ['es_risk_rating', 1], 'invalid_value'],
+    [{ es_risk_rating: [] }, ['es_risk_rating'], 'too_small'],
+    [{ parent_project_id: 'P176758^P180547' }, ['parent_project_id'], 'invalid_format'],
+  ])('rejects malformed portfolio filters before querying: %j', async (input, path, code) => {
+    initProjectsService({} as never, createInMemoryStorage());
+    const result = await runToolContract(worldbankSearchProjects, input as never);
+    expect(result).toMatchObject({
+      isError: true,
+      structuredContent: {
+        error: {
+          code: JsonRpcErrorCode.InvalidParams,
+          data: {
+            reason: 'invalid_arguments',
+            issues: [expect.objectContaining({ path, code })],
+          },
+        },
+      },
+      content: expect.arrayContaining([
+        expect.objectContaining({ text: expect.stringContaining(String(path[0])) }),
+      ]),
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it('reports an HTTP 400 on a search carrying query as invalid_query, attempted once', async () => {

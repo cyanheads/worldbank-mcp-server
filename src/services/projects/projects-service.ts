@@ -79,13 +79,18 @@ const PROJECT_FIELDS = [
   'status',
   'countryname',
   'countrycode',
+  'borrower',
+  'impagency',
   'regionname',
   'boardapprovaldate',
   'closingdate',
+  'curr_project_cost',
   'curr_total_commitment',
   'curr_ibrd_commitment',
   'curr_ida_commitment',
   'grantamt',
+  'esrc_ovrl_risk_rate',
+  'parentprojid',
   'projectfinancialtype',
   'major_sectors',
   'project_abstract',
@@ -251,14 +256,19 @@ function normalizeProject(
     countryCodes: (raw.countrycode ?? []).map(toWdiIso2),
     countryName: raw.countryname ?? '',
     regionName: raw.regionname ?? '',
+    borrower: raw.borrower ?? null,
+    implementingAgency: raw.impagency ?? null,
     boardApprovalDate: toCalendarDate(raw.boardapprovaldate),
     closingDate: toCalendarDate(raw.closingdate),
+    projectCost: toAmount(raw.curr_project_cost),
     totalCommitment: toAmount(raw.curr_total_commitment),
     ibrdCommitment: toAmount(raw.curr_ibrd_commitment),
     idaCommitment: toAmount(raw.curr_ida_commitment),
     grantAmount: toAmount(raw.grantamt),
     // Upstream repeats a financing window once per instrument drawn on it.
     financialTypes: [...new Set(raw.projectfinancialtype ?? [])],
+    esRiskRating: raw.esrc_ovrl_risk_rate ?? null,
+    parentProjectId: raw.parentprojid ?? null,
     majorSectors: majorSectorNames(raw),
     sectors: projectSectors(raw),
     themes: includeThemes ? projectThemes(raw) : null,
@@ -273,6 +283,8 @@ function normalizeProject(
 type ProjectsFilters = {
   countrycode_exact?: string;
   enddate?: string;
+  esrc_ovrl_risk_rate_exact?: string;
+  parentprojid_exact?: string;
   projectfinancialtype_exact?: string;
   qterm?: string;
   regionname_exact?: string;
@@ -295,12 +307,15 @@ export type ProjectSearchOptions = {
   approvedFrom?: string;
   approvedTo?: string;
   countryCodes: string[];
+  /** Overall environmental and social risk codes, combined as OR. */
+  esRiskRatings?: readonly string[];
   /** Financing windows (`IBRD`, `IDA`, `Grants`, `Other`), combined as OR. */
   financialTypes: string[];
   includeAbstract: boolean;
   /** Read each project's `theme_list` into `themes`; null on every row otherwise. */
   includeThemes: boolean;
   page: number;
+  parentProjectId?: string;
   perPage: number;
   query?: string;
   regions: string[];
@@ -515,6 +530,10 @@ export class ProjectsService {
       ...(opts.financialTypes.length > 0 && {
         projectfinancialtype_exact: opts.financialTypes.join(MULTI_VALUE_SEPARATOR),
       }),
+      ...(opts.esRiskRatings?.length && {
+        esrc_ovrl_risk_rate_exact: opts.esRiskRatings.join(MULTI_VALUE_SEPARATOR),
+      }),
+      ...(opts.parentProjectId !== undefined && { parentprojid_exact: opts.parentProjectId }),
       ...(opts.approvedFrom !== undefined && { strdate: opts.approvedFrom }),
       ...(opts.approvedTo !== undefined && { enddate: opts.approvedTo }),
     };

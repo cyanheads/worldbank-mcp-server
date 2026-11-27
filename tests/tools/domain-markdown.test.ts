@@ -71,13 +71,18 @@ const projects = {
       countryName: raw,
       countryCodes: [raw],
       regionName: raw,
+      borrower: raw,
+      implementingAgency: raw,
       boardApprovalDate: raw,
       closingDate: raw,
+      projectCost: 0,
       totalCommitment: 0,
       ibrdCommitment: null,
       idaCommitment: 0,
       grantAmount: null,
       financialTypes: [raw],
+      esRiskRating: raw,
+      parentProjectId: raw,
       majorSectors: [raw],
       sectors: [{ name: raw, code: raw, majorSector: raw, percent: null }],
       themes: [{ name: raw, code: raw, parent: raw, percent: null }],
@@ -91,7 +96,7 @@ it.each([
   ['data', () => worldbankGetData.format!(data), 7],
   ['countries', () => worldbankListCountries.format!(country), 3],
   ['poverty', () => worldbankGetPoverty.format!(poverty), 11],
-  ['projects', () => worldbankSearchProjects.format!(projects), 20],
+  ['projects', () => worldbankSearchProjects.format!(projects), 24],
 ] as const)('preserves each hostile %s field at its rendering boundary', (_name, render, count) => {
   const before = JSON.stringify([data, country, poverty, projects]);
   const text = render()
@@ -139,6 +144,8 @@ it('escapes caller text in each custom applied-filter trailer', () => {
       query: raw,
       sector: [raw],
       theme: [raw],
+      esRiskRating: raw,
+      parentProjectId: raw,
       includeAbstract: true,
       includeThemes: true,
       page: 1,
@@ -154,6 +161,7 @@ it('escapes caller text in each custom applied-filter trailer', () => {
     `countries=${escaped}, ppp_version=2021, release_version=${escaped}`,
   );
   expect(filters[3]).toContain(`query=${escaped}, sector=${escaped}, theme=${escaped}`);
+  expect(filters[3]).toContain(`es_risk_rating=${escaped}, parent_project_id=${escaped}`);
   for (const text of filters)
     expect(text).toMatch(/per_page=(?:1000 \(requested 2000\)|300 \(requested 500\))$/);
 });

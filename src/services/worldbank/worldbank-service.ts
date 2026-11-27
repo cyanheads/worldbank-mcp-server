@@ -17,6 +17,7 @@
 import type { Context } from '@cyanheads/mcp-ts-core';
 import type { AppConfig } from '@cyanheads/mcp-ts-core/config';
 import {
+  JsonRpcErrorCode,
   McpError,
   notFound,
   serviceUnavailable,
@@ -33,6 +34,7 @@ import {
 import { plainProse } from '@/services/plain-prose.js';
 import { MAX_COUNTRIES_PER_PAGE, MAX_OBSERVATIONS_PER_PAGE } from '@/services/response-budget.js';
 import { awaitSharedLoad, sharedLoadContext } from '@/services/shared-load.js';
+import { isAllSelector } from './identifiers.js';
 import {
   fullSpan,
   type LatestSelection,
@@ -43,11 +45,13 @@ import {
 } from './latest-values.js';
 import {
   isWithinWindow,
+  type MonthSpan,
   monthSpan,
   type PeriodForm,
   parseDateWindow,
   periodForm,
   periodFromToken,
+  widenSingletonWindow,
 } from './periods.js';
 import {
   defaultSelection,
@@ -240,6 +244,17 @@ function isTransientRequestError(error: unknown): boolean {
     typeof body === 'string' &&
     /<html\b/i.test(body) &&
     />\s*Request Error\s*</.test(body)
+  );
+}
+
+/** An optional Indicators read failed after the primary request already answered. */
+function optionalReadUnavailable(error: unknown, ctx: Context): boolean {
+  return (
+    !ctx.signal.aborted &&
+    error instanceof McpError &&
+    (error.code === JsonRpcErrorCode.ServiceUnavailable ||
+      error.code === JsonRpcErrorCode.Timeout ||
+      error.data?.errorSource === 'FetchHttpError')
   );
 }
 
@@ -777,10 +792,16 @@ export type DataResult = {
   perPage: number;
   nullCount: number;
   dateFilterDropped: boolean;
+  /** The original singleton was confirmed empty but its overlap check could not finish. */
+  overlapCheckUnavailable?: true;
   /** Present when the source-scoped data API served the result instead of the standard endpoint. */
   sourceScoped?: SourceScopedDisclosure;
   /** Valid codes the serving source publishes no data for, left out of the request. */
   uncoveredCountries?: string[];
+  /** Requested codes with no row in the complete latest-value selection. */
+  missingLatestCodes?: string[];
+  /** Unmatched requested codes that could alias a selected row when its index was unavailable. */
+  unresolvedLatestCodes?: string[];
   /** The serving source's last update date (`2026-07-13`); absent when its envelope carries none. */
   lastUpdated?: string;
   /**
@@ -1456,7 +1477,7 @@ export class WorldBankApiService {
     const codes = Array.isArray(countries) ? countries : countries.split(';');
     const isAll = codes.length === 1 && codes[0]?.toLowerCase() === 'all';
     const listed = new Map(sourceCountries.map((c) => [c.id.toUpperCase(), c.id]));
-    const countryIds: string[] = [];
+    const resolvedCodes = new Map<string, string>();
     const uncovered: string[] = [];
     const invalid: string[] = [];
     if (!isAll) {
@@ -1465,7 +1486,7 @@ export class WorldBankApiService {
         const entityId = listed.get(upper) ?? index.entities.get(upper)?.id;
         const canonical = entityId && listed.get(entityId.toUpperCase());
         if (canonical) {
-          if (!countryIds.includes(canonical)) countryIds.push(canonical);
+          resolvedCodes.set(code, canonical);
         } else if (entityId && opts.sourceId === undefined) uncovered.push(code);
         else invalid.push(code);
       }
@@ -1476,6 +1497,7 @@ export class WorldBankApiService {
         { reason: 'country_not_found', countryCodes: invalid.join(';'), indicatorId },
       );
     }
+    const countryIds = [...new Set(resolvedCodes.values())];
 
     // ── Dimension value ──
     const concept = layout.dimension;
@@ -1539,9 +1561,16 @@ export class WorldBankApiService {
       rows = rows.filter((r) => r.dimension?.id.toLowerCase() === pinned?.id.toLowerCase());
     }
     const latest = latestSelection(opts);
+    let missingLatestCodes: string[] | undefined;
     if (latest) {
       const form = frequency ?? selectionForm(rows.map((r) => r.period));
       rows = selectLatest(rows, latest, form, SCOPED_ROW_READER).rows;
+      if (latest.mode === 'mrnev' && !isAll) {
+        const selected = new Set(rows.map((r) => r.countryId.toUpperCase()));
+        missingLatestCodes = [...resolvedCodes]
+          .filter(([, canonical]) => !selected.has(canonical.toUpperCase()))
+          .map(([code]) => code);
+      }
     }
     rows = sortRows(rows, values);
 
@@ -1584,6 +1613,7 @@ export class WorldBankApiService {
               "source's own dataset through the source-scoped data API, and may be archived or superseded figures.",
       },
       uncoveredCountries: uncovered,
+      ...(missingLatestCodes?.length && { missingLatestCodes }),
       ...(lastUpdated && { lastUpdated }),
       periodForms: formsOf(timeTokens.map((token) => periodFromToken(token.id))),
       allNull: rows.length > 0 && rows.every((r) => r.value === null),
@@ -2001,6 +2031,97 @@ export class WorldBankApiService {
   }
 
   /**
+   * A singleton at a form the series lacks can be honestly empty upstream even
+   * when another form overlaps it. Request two adjacent periods at the same
+   * form. Use the recovered read only if a placeable row overlaps the original
+   * window, and preserve the requested form when the response mixes forms.
+   */
+  private async recoverSingleton(
+    path: string,
+    originalDate: string,
+    originalWindow: MonthSpan,
+    ctx: Context,
+  ): Promise<{ read: SeriesRead; rows: Observation[]; dateFilterDropped: boolean } | undefined> {
+    const date = widenSingletonWindow(originalDate);
+    if (!date) return;
+    const first = await this.readSeries(path, date, DATA_PAGE_SIZE, ctx);
+    if (isWbErrorEnvelope(first)) {
+      throw serviceUnavailable(
+        `The World Bank API accepted the original date window but rejected the recovery read for date=${date}.`,
+        { reason: 'upstream_inconsistent', date },
+      );
+    }
+    const read = await this.confirmRead(path, date, first, ctx);
+    const requestedForm = periodForm(originalDate.split(':')[0] ?? '');
+    const forms = formsOf(read.items.map(OBSERVATION_READER.period));
+    const rows = read.items.filter((raw) => {
+      const period = OBSERVATION_READER.period(raw);
+      const form = periodForm(period);
+      return (
+        form &&
+        (forms.length === 1 || form === requestedForm) &&
+        isWithinWindow(period, originalWindow)
+      );
+    });
+    if (rows.length === 0) return;
+
+    const widenedWindow = parseDateWindow(date);
+    const dateFilterDropped = widenedWindow
+      ? read.items.some((raw) => !isWithinWindow(OBSERVATION_READER.period(raw), widenedWindow))
+      : rows.length < read.items.length;
+    return { read, rows, dateFilterDropped };
+  }
+
+  /**
+   * Compare the caller's codes against every selected row before slicing. Most
+   * rows carry both identifiers. A page beyond the result needs the country
+   * index only when an unmatched code might be an alias of a selected row.
+   */
+  private async missingLatestCodes(
+    codes: string[],
+    rows: Observation[],
+    index: CountryIndex | undefined,
+    ctx: Context,
+  ): Promise<Pick<DataResult, 'missingLatestCodes' | 'unresolvedLatestCodes'>> {
+    if (codes.length === 1 && isAllSelector(codes[0] ?? '')) return {};
+
+    const selected = new Set<string>();
+    let maybeIso2 = false;
+    let maybeIso3 = false;
+    for (const row of rows) {
+      const iso3 = row.countryiso3code?.toUpperCase();
+      const code = row.country?.id?.toUpperCase();
+      if (iso3) selected.add(iso3);
+      if (code) selected.add(code);
+      maybeIso2 ||= code?.length !== 2;
+      maybeIso3 ||= !iso3 && code?.length !== 3;
+    }
+    const missing = [...new Set(codes.filter((code) => !selected.has(code.toUpperCase())))];
+    const mightBeAlias = (code: string) =>
+      (code.length === 2 && maybeIso2) || (code.length === 3 && maybeIso3);
+    if (!index && missing.some(mightBeAlias)) {
+      try {
+        index = await this.loadCountryIndex(ctx);
+      } catch (error) {
+        if (!optionalReadUnavailable(error, ctx)) throw error;
+        ctx.log.warning('Country index unavailable; omitting unresolved latest-value codes');
+        return {
+          missingLatestCodes: missing.filter((code) => !mightBeAlias(code)),
+          unresolvedLatestCodes: missing.filter(mightBeAlias),
+        };
+      }
+    }
+    const missingLatestCodes = missing.filter((code) => {
+      const entity = index?.entities.get(code.toUpperCase());
+      return (
+        !entity ||
+        (!selected.has(entity.id.toUpperCase()) && !selected.has(entity.iso2.toUpperCase()))
+      );
+    });
+    return missingLatestCodes.length > 0 ? { missingLatestCodes } : {};
+  }
+
+  /**
    * The rows `latest` selects at `frequency` (by default annual, or the series'
    * own form when it has no annual periods), the last update of the envelope
    * serving them, and the period forms the reads carried. The window read answers
@@ -2185,14 +2306,25 @@ export class WorldBankApiService {
 
     if (paged) return this.servePage(path, date, first, opts, ctx);
 
-    const read = await this.confirmRead(path, date, first, ctx);
+    const confirmed = await this.confirmRead(path, date, first, ctx);
+    const dateWindow = parseDateWindow(dateRange);
+    let recovery: Awaited<ReturnType<typeof this.recoverSingleton>>;
+    let overlapCheckUnavailable = false;
+    if (dateRange && dateWindow && confirmed.items.length === 0) {
+      try {
+        recovery = await this.recoverSingleton(path, dateRange, dateWindow, ctx);
+      } catch (error) {
+        if (!optionalReadUnavailable(error, ctx)) throw error;
+        overlapCheckUnavailable = true;
+      }
+    }
+    const read = recovery?.read ?? confirmed;
 
-    let rows = read.items;
+    let rows = recovery?.rows ?? read.items;
     let selectedIndicator: RawDataPoint['indicator'];
     let lastUpdated = read.paging.lastupdated;
     let periodForms = formsOf(read.items.map(OBSERVATION_READER.period));
-    let dateFilterDropped = false;
-    const dateWindow = parseDateWindow(dateRange);
+    let dateFilterDropped = recovery?.dateFilterDropped ?? false;
     if (latest) {
       ({
         rows,
@@ -2200,8 +2332,8 @@ export class WorldBankApiService {
         periodForms,
         indicator: selectedIndicator,
       } = await this.latestRows(path, indicatorId, read, latest, frequency, ctx));
-    } else if (dateWindow) {
-      rows = read.items.filter((raw) => isWithinWindow(raw.date ?? '', dateWindow));
+    } else if (dateWindow && !recovery) {
+      rows = read.items.filter((raw) => isWithinWindow(OBSERVATION_READER.period(raw), dateWindow));
       dateFilterDropped = rows.length < read.items.length;
     }
 
@@ -2209,6 +2341,8 @@ export class WorldBankApiService {
     const start = (page - 1) * perPage;
     const pageRows = rows.slice(start, start + perPage);
     const index = pageRows.length > 0 ? await this.loadCountryIndex(ctx) : undefined;
+    const coverage =
+      latest?.mode === 'mrnev' ? await this.missingLatestCodes(codes, rows, index, ctx) : {};
     const data = index
       ? pageRows.map((raw) => normalizeDataPoint(raw, index, read.paging.sourceid))
       : [];
@@ -2222,6 +2356,8 @@ export class WorldBankApiService {
       perPage,
       nullCount: data.filter((d) => d.value === null).length,
       dateFilterDropped,
+      ...(overlapCheckUnavailable && { overlapCheckUnavailable }),
+      ...coverage,
       ...(typeof read.paging.sourceid === 'string' &&
         read.paging.sourceid.trim() !== '' && { sourceId: read.paging.sourceid }),
       ...(lastUpdated && { lastUpdated }),

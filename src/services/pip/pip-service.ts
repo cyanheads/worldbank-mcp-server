@@ -186,7 +186,11 @@ type Routing = { economies: string[]; groups: Map<string, string[]> };
 function routeCodes(
   codes: readonly string[],
   regions: ReadonlyMap<string, string>,
-  filters: { welfareType: string | undefined; reportingLevel: string | undefined },
+  filters: {
+    populationShare: number | undefined;
+    welfareType: string | undefined;
+    reportingLevel: string | undefined;
+  },
 ): Routing {
   if (codes.includes('FCS')) {
     throw validationError(
@@ -238,13 +242,14 @@ function routeCodes(
   }
 
   const conflicting = [
+    ...(filters.populationShare === undefined ? [] : ['population_share']),
     ...(filters.welfareType === undefined ? [] : ['welfare_type']),
     ...(filters.reportingLevel === undefined ? [] : ['reporting_level']),
   ];
   if (routing.groups.size > 0 && conflicting.length > 0) {
     const aggregates = [...routing.groups.values()].flat().map(listedCode);
     throw validationError(
-      `${conflicting.join(' and ')} cannot be applied to the aggregate code(s) "${aggregates.join(',')}": PIP computes each aggregate across every economy's own welfare measure and reporting level.`,
+      `${conflicting.join(' and ')} cannot be applied to the aggregate code(s) "${aggregates.join(',')}": PIP only supports these filters on economy queries.`,
       {
         reason: 'aggregate_filter_conflict',
         parameters: conflicting,
@@ -689,13 +694,13 @@ class SharedLoads {
 // ─── Service ─────────────────────────────────────────────────────────────────
 
 /**
- * Filters `/pip` and `/pip-grp` share, pinned to one `version` — everything but
- * the codes and, on `/pip`, `fill_gaps`.
+ * Filters pinned to one PIP `version`. Aggregates use only the version, year, and fixed line.
  */
 type PipFilters = {
   version: string;
   year?: string;
   povline?: number;
+  popshare?: number;
   welfare_type?: string;
   reporting_level?: string;
 };
@@ -1209,6 +1214,7 @@ export class PipService {
       countries: string[];
       year?: string;
       povertyLine?: number;
+      populationShare?: number;
       welfareType?: string;
       reportingLevel?: string;
       pppVersion?: string;
@@ -1241,8 +1247,17 @@ export class PipService {
     releaseVersion: string;
   }> {
     ctx = withCallDeadline(ctx);
-    const { countries, year, povertyLine, welfareType, reportingLevel, fillGaps, page, perPage } =
-      opts;
+    const {
+      countries,
+      year,
+      povertyLine,
+      populationShare,
+      welfareType,
+      reportingLevel,
+      fillGaps,
+      page,
+      perPage,
+    } = opts;
 
     const requested = [
       ...new Set(
@@ -1258,12 +1273,17 @@ export class PipService {
         ? this.loadRegions(ctx)
         : Promise.resolve(new Map<string, string>()),
     ]);
-    const { economies, groups } = routeCodes(requested, regions, { welfareType, reportingLevel });
+    const { economies, groups } = routeCodes(requested, regions, {
+      populationShare,
+      welfareType,
+      reportingLevel,
+    });
 
     const filters: PipFilters = {
       version: resolved.version,
       ...(year !== undefined && { year }),
       ...(povertyLine !== undefined && { povline: povertyLine }),
+      ...(populationShare !== undefined && { popshare: populationShare }),
       ...(welfareType !== undefined && { welfare_type: welfareType }),
       ...(reportingLevel !== undefined && { reporting_level: reportingLevel }),
     };

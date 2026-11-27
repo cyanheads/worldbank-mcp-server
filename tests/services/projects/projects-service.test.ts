@@ -185,11 +185,13 @@ describe('ProjectsService', () => {
     expect(requestedUrl().searchParams.has('sector_exact')).toBe(false);
   });
 
-  it('sends a search without themes exactly as before: no theme filter and no theme_list', async () => {
+  it('omits optional portfolio filters and theme_list unless requested', async () => {
     mockBody(envelope([rawProject('P100')]));
     await service.searchProjects(baseOpts, createMockContext());
     const params = requestedUrl().searchParams;
     expect(params.has('theme_exact')).toBe(false);
+    expect(params.has('esrc_ovrl_risk_rate_exact')).toBe(false);
+    expect(params.has('parentprojid_exact')).toBe(false);
     expect(params.get('fl')?.split(',')).toEqual([
       'id',
       'project_name',
@@ -197,13 +199,18 @@ describe('ProjectsService', () => {
       'status',
       'countryname',
       'countrycode',
+      'borrower',
+      'impagency',
       'regionname',
       'boardapprovaldate',
       'closingdate',
+      'curr_project_cost',
       'curr_total_commitment',
       'curr_ibrd_commitment',
       'curr_ida_commitment',
       'grantamt',
+      'esrc_ovrl_risk_rate',
+      'parentprojid',
       'projectfinancialtype',
       'major_sectors',
       'project_abstract',
@@ -312,14 +319,19 @@ describe('ProjectsService', () => {
       countryCodes: ['BR'],
       countryName: 'Federative Republic of Brazil',
       regionName: 'Latin America and Caribbean',
+      borrower: null,
+      implementingAgency: null,
       // The timestamp is narrowed to the calendar day the tool's own filters use.
       boardApprovalDate: '2024-06-28',
       closingDate: '2029-12-31',
+      projectCost: null,
       totalCommitment: 41_800_000,
       ibrdCommitment: 41_800_000,
       idaCommitment: 0,
       grantAmount: 0,
       financialTypes: ['IBRD', 'Other'],
+      esRiskRating: null,
+      parentProjectId: null,
       majorSectors: ['Health', 'Education'],
       // Flattened in upstream order, each beside the major sector it sits under.
       sectors: [
@@ -341,13 +353,18 @@ describe('ProjectsService', () => {
       'countryCodes',
       'countryName',
       'regionName',
+      'borrower',
+      'implementingAgency',
       'boardApprovalDate',
       'closingDate',
+      'projectCost',
       'totalCommitment',
       'ibrdCommitment',
       'idaCommitment',
       'grantAmount',
       'financialTypes',
+      'esRiskRating',
+      'parentProjectId',
       'majorSectors',
       'sectors',
       'themes',

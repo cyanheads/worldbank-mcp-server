@@ -48,7 +48,7 @@ function listedValuesHint(parameters: readonly string[], listed: readonly string
 export const worldbankGetPoverty = tool('worldbank_get_poverty', {
   title: 'Get World Bank Poverty and Inequality Estimates',
   description:
-    "Query poverty and inequality estimates from the World Bank Poverty and Inequality Platform (PIP) for economies and PIP's own aggregates (World, regions, income, lending, and fragility groups): poverty headcount, gap, and severity at any poverty line, mean and median welfare, and population, plus the Gini, mean log deviation, polarization, and decile shares on survey rows. PIP is separate from the WDI series worldbank_get_data reads: welfare is in PPP dollars per person per day at the vintage ppp_version selects, and its aggregates are computed at any line, where worldbank_get_data carries only the published lines. estimationType tells survey rows from gap-filled estimates, whose inequality fields are null by design rather than missing in error.",
+    'Query Poverty and Inequality Platform (PIP) economies and aggregates: headcount, gap, and severity at any poverty line, or the welfare threshold for a population share in an economy. Welfare is in PPP dollars per person per day. Unlike WDI series in worldbank_get_data, PIP computes estimates at custom lines. Read estimationType to distinguish surveys from gap-filled estimates, whose inequality fields are null.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   inputAliases: { limit: 'per_page' },
   input: z.object({
@@ -76,7 +76,7 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
           .describe('Codes; an element holding several separated codes is split too.'),
       ])
       .describe(
-        "Economies by ISO3 (IND) or ISO2 (IN) code, model-estimate-only ones (AFG) included, or \"all\" for every economy. PIP's aggregates: WLD; regions AFE, AFW, EAS, ECS, LCN, MEA, NAC, SAS, SSF; income groups HIC, LIC, LMIC (or LMC), UMIC (or UMC); fragility groups FCVY (fragile) and FCVN (not fragile); lending groups IDX (IDA only), IDB or BLND (IDA blend), IBD or IBRD (IBRD only), REST. Income groups use the classification of PIP's data release for every year, so membership can differ from worldbank_get_country's. IDA is rejected (PIP computes no IDA total: ask for IDX and IDB), as are FCS (use FCVY, not asserted to match it), SSA, EAP, MIC, and LMY. welfare_type and reporting_level cannot combine with an aggregate.",
+        'Economies by ISO3 (IND) or ISO2 (IN) code, model-estimate-only ones (AFG) included, or "all" for every economy. PIP aggregates: WLD; regions AFE, AFW, EAS, ECS, LCN, MEA, NAC, SAS, SSF; income HIC, LIC, LMIC (LMC), UMIC (UMC); fragility FCVY (fragile), FCVN (not fragile); lending IDX (IDA only), IDB or BLND (IDA blend), IBD or IBRD (IBRD only), REST. Income membership follows PIP\'s release for every year and can differ from worldbank_get_country. For IDA use IDX and IDB. FCS, SSA, EAP, MIC, and LMY are unsupported. Aggregates cannot combine with population_share, welfare_type, or reporting_level.',
       ),
     year: z
       .string()
@@ -98,7 +98,17 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
       .max(2700)
       .optional()
       .describe(
-        "Poverty line in PPP dollars per person per day at the applied vintage, any threshold; omitted, the international poverty line for that vintage. PIP rounds it to two decimals (6.953 is computed at 6.95): each row's povertyLine is the line applied, appliedFilters.povertyLine the value sent. The inequality fields do not depend on it.",
+        "Fixed line in PPP dollars per person per day. PIP rounds it to two decimals (6.953 is computed at 6.95): each row's povertyLine is the line applied, appliedFilters.povertyLine the value sent. With neither threshold input, PIP uses the international line for the applied vintage.",
+      ),
+    population_share: z
+      .number()
+      .gt(0)
+      .lt(1)
+      // A pipe preserves the numeric schema while keeping framework repair from accepting strings.
+      .pipe(z.number())
+      .optional()
+      .describe(
+        'Target fraction of the population strictly between 0 and 1 (0.4 for the poorest 40%). Economy queries only. Omit poverty_line to use it.',
       ),
     welfare_type: z
       .union([
@@ -157,11 +167,13 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
             welfareType: z.string().nullable().describe('Welfare measure: income or consumption.'),
             povertyLine: z
               .number()
-              .describe('Poverty line applied, in PPP dollars per person per day.'),
+              .describe(
+                'Applied line, or threshold computed for population_share, in PPP dollars per person per day.',
+              ),
             headcount: z
               .number()
               .nullable()
-              .describe('Share of the population below the line, as a fraction (0.0814 = 8.14%).'),
+              .describe('Actual fraction below the line, which can differ from population_share.'),
             povertyGap: z
               .number()
               .nullable()
@@ -260,6 +272,7 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
           ),
         year: z.string().optional().describe('Year applied.'),
         povertyLine: z.number().optional().describe('Poverty line as sent.'),
+        populationShare: z.number().optional().describe('Target population share as sent.'),
         welfareType: z.string().optional().describe('Welfare type applied.'),
         reportingLevel: z.string().optional().describe('Reporting level applied.'),
         pppVersion: z.string().describe('PPP vintage of every dollar figure.'),
@@ -303,6 +316,9 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
           `countries=${escapeMarkdownInline(filters.countries)}`,
           ...(filters.year === undefined ? [] : [`year=${filters.year}`]),
           ...(filters.povertyLine === undefined ? [] : [`poverty_line=${filters.povertyLine}`]),
+          ...(filters.populationShare === undefined
+            ? []
+            : [`population_share=${filters.populationShare}`]),
           ...(filters.welfareType === undefined ? [] : [`welfare_type=${filters.welfareType}`]),
           ...(filters.reportingLevel === undefined
             ? []
@@ -345,9 +361,16 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
       reason: 'aggregate_filter_conflict',
       severity: 'notice',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'welfare_type or reporting_level is set with an aggregate code.',
+      when: 'population_share, welfare_type, or reporting_level is set with an aggregate code.',
       recovery:
-        'Drop welfare_type and reporting_level, or query the aggregates and the economies in separate calls.',
+        'Drop population_share, welfare_type, and reporting_level for aggregates, or query economies separately.',
+    },
+    {
+      reason: 'invalid_params',
+      severity: 'notice',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'Both poverty_line and population_share are set.',
+      recovery: 'Choose population_share for a threshold or poverty_line for a share.',
     },
     {
       reason: 'invalid_parameter',
@@ -384,6 +407,12 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
   ],
 
   async handler(input, ctx) {
+    if (input.poverty_line !== undefined && input.population_share !== undefined) {
+      throw ctx.fail('invalid_params', 'Set only one of poverty_line and population_share.', {
+        parameters: ['poverty_line', 'population_share'],
+        retryable: false,
+      });
+    }
     /**
      * One deadline for the whole call, started before anything waits: the ISO2
      * lookup through the Indicators API and every PIP request spend the same
@@ -400,6 +429,7 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
       countries: codes,
       year,
       povertyLine: input.poverty_line,
+      populationShare: input.population_share,
       fillGaps: input.fill_gaps,
       page: input.page,
     });
@@ -494,6 +524,7 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
           countries: queried,
           ...(year !== undefined && { year }),
           ...(input.poverty_line !== undefined && { povertyLine: input.poverty_line }),
+          ...(input.population_share !== undefined && { populationShare: input.population_share }),
           ...(welfareType !== undefined && { welfareType }),
           ...(reportingLevel !== undefined && { reportingLevel }),
           ...(pppVersion !== undefined && { pppVersion }),
@@ -571,6 +602,7 @@ export const worldbankGetPoverty = tool('worldbank_get_poverty', {
         countries: result.countries.map((code) => (code === 'ALL' ? 'all' : code)).join(','),
         ...(year !== undefined && { year }),
         ...(input.poverty_line !== undefined && { povertyLine: input.poverty_line }),
+        ...(input.population_share !== undefined && { populationShare: input.population_share }),
         ...(welfareType !== undefined && { welfareType }),
         ...(reportingLevel !== undefined && { reportingLevel }),
         pppVersion: result.pppVersion,

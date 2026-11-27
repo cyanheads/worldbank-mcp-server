@@ -1,7 +1,7 @@
 /**
  * @fileoverview Search the World Bank lending portfolio — active, closed,
  * dropped, and pipeline operations — by free text, country, region, status,
- * sector, theme, financing window, and board approval date.
+ * sector, theme, financing window, risk rating, parent project, and board approval date.
  * @module mcp-server/tools/definitions/worldbank-search-projects.tool
  */
 
@@ -65,6 +65,8 @@ const PROJECT_REGIONS = [
  */
 const FINANCING_WINDOWS = ['IBRD', 'IDA', 'Grants', 'Other'] as const;
 
+const ES_RISK_RATINGS = ['H', 'S', 'M', 'L'] as const;
+const PROJECT_ID = /^P[0-9]{6}$/;
 const CALENDAR_DATE = /^\d{4}-\d{2}-\d{2}$/;
 
 const DAYS_IN_MONTH = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31] as const;
@@ -86,7 +88,7 @@ function isCalendarDate(value: string): boolean {
 export const worldbankSearchProjects = tool('worldbank_search_projects', {
   title: 'Search World Bank Projects',
   description:
-    'Search the World Bank lending portfolio — the loans, credits, and grants the Bank finances — by free text, country, region, status, sector, theme, financing windows, and board approval date. Returns each operation\'s objective, borrower, status, dates, USD commitment with its IBRD, IDA, and grant parts, financing windows, sectors with their shares, optional themes and abstract, and project page. Use it for questions such as "what is the World Bank funding in Kenya" or "which climate adaptation projects are active" (theme: ["Adaptation"], status: ["Active"]); for development statistics, use worldbank_search_indicators and worldbank_get_data. Prefer the sector and theme filters to a free-text query, which also matches incidental prose: education commitments start from sector: ["Primary Education", "Secondary Education", "Tertiary Education"], three of the Education sub-sectors rows list in sectors[].name — read it on matching rows for the rest. Filters match exactly and combine by AND, so a narrow search can return nothing.',
+    'Search World Bank loans, credits, and grants by text, country, region, status, sector, theme, financing windows, board date, risk rating, or parent project. Returns borrower, implementing agency, cost and commitment in USD, and portfolio details. For active climate adaptation projects, pass theme: ["Adaptation"], status: ["Active"]. Prefer sector or theme over incidental text matches. For education commitments, start with sector: ["Primary Education", "Secondary Education", "Tertiary Education"]; see sectors[].name. Filters combine by AND. For development statistics, use worldbank_search_indicators and worldbank_get_data.',
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
   inputAliases: { limit: 'per_page' },
   input: z.object({
@@ -137,6 +139,18 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
       .describe(
         'Financing windows, combined as OR, matched against financialTypes; a project that publishes none never matches.',
       ),
+    es_risk_rating: z
+      .array(z.enum(ES_RISK_RATINGS))
+      .min(1)
+      .optional()
+      .describe(
+        'Overall environmental and social risk. H High, S Substantial, M Moderate, L Low. Values combine as OR.',
+      ),
+    parent_project_id: z
+      .string()
+      .regex(PROJECT_ID, 'Use an uppercase project ID such as P176758.')
+      .optional()
+      .describe('Find projects linked to this parent ID, such as additional financing.'),
     approved_from: z
       .union([
         z.literal(''),
@@ -189,10 +203,15 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
             countryCodes: z
               .array(z.string())
               .describe(
-                "The borrower's ISO2 code, which the other tools take (YE for Yemen, filed upstream as RY), or a World Bank regional code (3W) for a multi-country operation; one per project.",
+                'Portfolio economy code in ISO2 (YE for Yemen, filed upstream as RY), or World Bank regional code (3W) for a multi-country operation.',
               ),
-            countryName: z.string().describe('Borrower, as the portfolio names it.'),
+            countryName: z.string().describe('Country or region as named in the portfolio.'),
             regionName: z.string().describe('World Bank lending region.'),
+            borrower: z.string().nullable().describe('Loan borrower or grant recipient.'),
+            implementingAgency: z
+              .string()
+              .nullable()
+              .describe('Agency implementing the operation.'),
             boardApprovalDate: z
               .string()
               .nullable()
@@ -205,6 +224,10 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
               .describe(
                 'Scheduled or actual closing date, YYYY-MM-DD; null where none is published, as on most dropped operations.',
               ),
+            projectCost: z
+              .number()
+              .nullable()
+              .describe('Reported project cost in USD, including Bank and non-Bank funding.'),
             totalCommitment: z
               .number()
               .nullable()
@@ -234,6 +257,11 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
               .describe(
                 'Financing windows, the values financial_type takes; several on a blended operation, empty where none is published.',
               ),
+            esRiskRating: z
+              .string()
+              .nullable()
+              .describe('Published risk code used by es_risk_rating.'),
+            parentProjectId: z.string().nullable().describe('Parent project ID as published.'),
             majorSectors: z
               .array(z.string())
               .describe(
@@ -321,6 +349,8 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
           .optional()
           .describe('Theme names applied, deduplicated, FY17 - prefix removed, case kept.'),
         financialType: z.string().optional().describe('Financing windows applied, comma-joined.'),
+        esRiskRating: z.string().optional().describe('Risk codes applied, comma-joined.'),
+        parentProjectId: z.string().optional().describe('Parent project ID applied.'),
         approvedFrom: z.string().optional().describe('Earliest board approval date applied.'),
         approvedTo: z.string().optional().describe('Latest board approval date applied.'),
         includeAbstract: z.boolean().describe('Whether abstracts were requested.'),
@@ -379,6 +409,12 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
           ...(filters.financialType === undefined
             ? []
             : [`financial_type=${escapeMarkdownInline(filters.financialType)}`]),
+          ...(filters.esRiskRating === undefined
+            ? []
+            : [`es_risk_rating=${escapeMarkdownInline(filters.esRiskRating)}`]),
+          ...(filters.parentProjectId === undefined
+            ? []
+            : [`parent_project_id=${escapeMarkdownInline(filters.parentProjectId)}`]),
           ...(filters.approvedFrom === undefined
             ? []
             : [`approved_from=${escapeMarkdownInline(filters.approvedFrom)}`]),
@@ -482,6 +518,8 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
     const sectors = normalizeSectorNames(input.sector ?? []);
     const themes = normalizeThemeNames(input.theme ?? []);
     const financialTypes = input.financial_type ?? [];
+    const esRiskRatings = input.es_risk_rating;
+    const parentProjectId = input.parent_project_id;
     const query = input.query?.trim() ? input.query.trim() : undefined;
     const approvedFrom = input.approved_from || undefined;
     const approvedTo = input.approved_to || undefined;
@@ -641,6 +679,8 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
           ...(sectors.length > 0 && { sectors }),
           ...(themes.length > 0 && { themes }),
           financialTypes: [...financialTypes],
+          ...(esRiskRatings !== undefined && { esRiskRatings }),
+          ...(parentProjectId !== undefined && { parentProjectId }),
           ...(approvedFrom !== undefined && { approvedFrom }),
           ...(approvedTo !== undefined && { approvedTo }),
           includeAbstract: input.include_abstract,
@@ -681,6 +721,8 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
         ...(sectors.length > 0 && { sector: sectors }),
         ...(themes.length > 0 && { theme: themes }),
         ...(financialTypes.length > 0 && { financialType: financialTypes.join(',') }),
+        ...(esRiskRatings !== undefined && { esRiskRating: esRiskRatings.join(',') }),
+        ...(parentProjectId !== undefined && { parentProjectId }),
         ...(approvedFrom !== undefined && { approvedFrom }),
         ...(approvedTo !== undefined && { approvedTo }),
         includeAbstract: input.include_abstract,
@@ -722,6 +764,8 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
         ...(sectors.length > 0 ? ['sector'] : []),
         ...(themes.length > 0 ? ['theme'] : []),
         ...(financialTypes.length > 0 ? ['financial_type'] : []),
+        ...(esRiskRatings === undefined ? [] : ['es_risk_rating']),
+        ...(parentProjectId === undefined ? [] : ['parent_project_id']),
         ...(approvedFrom === undefined ? [] : ['approved_from']),
         ...(approvedTo === undefined ? [] : ['approved_to']),
       ];
@@ -816,8 +860,11 @@ export const worldbankSearchProjects = tool('worldbank_search_projects', {
         lines.push(`- **objective:** ${escapeMarkdownInline(project.objective)}`);
       lines.push(
         `- **status:** ${escapeMarkdownInline(project.status || 'unknown')} | **countryName:** ${escapeMarkdownInline(project.countryName)} | **countryCodes:** ${project.countryCodes.map(escapeMarkdownInline).join(', ') || 'none'} | **regionName:** ${escapeMarkdownInline(project.regionName)}`,
+        `- **borrower:** ${escapeMarkdownInline(project.borrower ?? 'null')} | **implementingAgency:** ${escapeMarkdownInline(project.implementingAgency ?? 'null')}`,
         `- **boardApprovalDate:** ${escapeMarkdownInline(String(project.boardApprovalDate))} | **closingDate:** ${escapeMarkdownInline(String(project.closingDate))}`,
+        `- **projectCost:** ${amount(project.projectCost)}${project.projectCost === null ? '' : ' USD'}`,
         `- **totalCommitment:** ${amount(project.totalCommitment)}${project.totalCommitment === null ? '' : ' USD'}${breakdown(project)} | **financialTypes:** ${project.financialTypes.map(escapeMarkdownInline).join(', ') || 'none'}`,
+        `- **esRiskRating:** ${escapeMarkdownInline(project.esRiskRating ?? 'null')} | **parentProjectId:** ${escapeMarkdownInline(project.parentProjectId ?? 'null')}`,
         // Major-sector names carry commas too (Agriculture, Fishing and Forestry).
         `- **majorSectors:** ${project.majorSectors.map(escapeMarkdownInline).join('; ') || 'none'}`,
         `- **sectors:** ${project.sectors.map(sector).join('; ') || 'none'}`,

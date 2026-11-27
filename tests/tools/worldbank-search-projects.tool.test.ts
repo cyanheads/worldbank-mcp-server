@@ -35,13 +35,18 @@ const project = {
   countryCodes: ['BR'],
   countryName: 'Federative Republic of Brazil',
   regionName: 'Latin America and Caribbean',
+  borrower: null,
+  implementingAgency: null,
   boardApprovalDate: '2026-03-30',
   closingDate: '2031-12-19',
+  projectCost: null,
   totalCommitment: 41_800_000,
   ibrdCommitment: 41_800_000,
   idaCommitment: 0,
   grantAmount: null as number | null,
   financialTypes: ['IBRD', 'Other'],
+  esRiskRating: null,
+  parentProjectId: null,
   majorSectors: ['Public Administration', 'Education'],
   sectors: [
     {

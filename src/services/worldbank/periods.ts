@@ -53,6 +53,28 @@ export function parseDateWindow(dateRange: string | undefined): MonthSpan | unde
   return { start: start.start, end: end.end };
 }
 
+/** Expand a singleton (including repeated endpoints) by one period at its own form. */
+export function widenSingletonWindow(dateRange: string): string | undefined {
+  const [first = '', last = first] = dateRange.toUpperCase().split(':');
+  if (first !== last) return;
+  const span = monthSpan(first);
+  if (!span) return;
+
+  const step = span.end - span.start + 1;
+  const next = span.start + step;
+  const useNext = next < 10_000 * 12;
+  const neighbor = useNext ? next : span.start - step;
+  const year = String(Math.floor(neighbor / 12)).padStart(4, '0');
+  const month = neighbor % 12;
+  const period =
+    step === 12
+      ? year
+      : step === 3
+        ? `${year}Q${month / 3 + 1}`
+        : `${year}M${String(month + 1).padStart(2, '0')}`;
+  return useNext ? `${first}:${period}` : `${period}:${first}`;
+}
+
 /** True when a period overlaps the requested window. A period that can't be placed is kept. */
 export function isWithinWindow(period: string, window: MonthSpan): boolean {
   const span = monthSpan(period);

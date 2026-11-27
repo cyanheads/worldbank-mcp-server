@@ -3885,15 +3885,21 @@ describe('WorldBankApiService', () => {
     expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(1);
   });
 
-  it('getData: re-reads a date window upstream matched nothing in, once, then reports it empty', async () => {
+  it('getData: confirms an empty singleton and keeps it empty if widening only finds a neighbor', async () => {
     mockResponse([pagingObj({ total: 0, pages: 0 }), null]);
     mockResponse([pagingObj({ total: 0, pages: 0 }), null]);
+    mockResponse([
+      pagingObj({ total: 1, pages: 1 }),
+      [rawDataPoint('US', 'USA', 'United States', '2021')],
+    ]);
     const result = await service.getData(
       { indicatorId: 'SP.POP.TOTL', countries: 'US', dateRange: '2020', page: 1, perPage: 50 },
       createMockContext(),
     );
-    expect(result).toMatchObject({ data: [], total: 0 });
-    expect(fetchWithTimeoutMock).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject({ data: [], total: 0, dateFilterDropped: false });
+    expect(
+      fetchWithTimeoutMock.mock.calls.map(([url]) => new URL(String(url)).searchParams.get('date')),
+    ).toEqual(['2020', '2020', '2020:2021']);
   });
 
   it('getData: keeps an honored window total on a page past the end', async () => {

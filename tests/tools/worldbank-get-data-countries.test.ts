@@ -8,11 +8,18 @@
  * @module tests/tools/worldbank-get-data-countries.test
  */
 
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createInMemoryStorage, runToolContract } from '@cyanheads/mcp-ts-core/testing';
+import { JsonRpcErrorCode, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
+import {
+  createInMemoryStorage,
+  createMockContext,
+  runToolContract,
+} from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { worldbankGetData } from '@/mcp-server/tools/definitions/worldbank-get-data.tool.js';
-import { initWorldBankApiService } from '@/services/worldbank/worldbank-service.js';
+import {
+  getWorldBankApiService,
+  initWorldBankApiService,
+} from '@/services/worldbank/worldbank-service.js';
 
 vi.mock('@/config/server-config.js', () => ({
   getServerConfig: vi.fn().mockReturnValue({
@@ -175,10 +182,16 @@ function failure(result: Awaited<ReturnType<typeof runToolContract>>) {
 }
 
 /** Call the tool through the contract runner, population series and `mrv: 1` unless overridden. */
-function call(args: { countries: unknown; indicator_id?: string }) {
+function call(args: {
+  countries: unknown;
+  indicator_id?: string;
+  mrnev?: number;
+  page?: number;
+  per_page?: number;
+}) {
   return runToolContract(
     worldbankGetData,
-    { indicator_id: 'SP.POP.TOTL', mrv: 1, ...args } as never,
+    { indicator_id: 'SP.POP.TOTL', ...(args.mrnev === undefined && { mrv: 1 }), ...args } as never,
     { context: { errors: worldbankGetData.errors } },
   );
 }
@@ -193,6 +206,162 @@ describe('worldbank_get_data country handling, end to end', () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
+  });
+
+  it.each([{ country: 'KE' }, { country_codes: ['KE'] }])(
+    'resolves the declared aliases %j before dispatch',
+    async (alias) => {
+      serve({ data: servesKnownCodes });
+      const result = await runToolContract(worldbankGetData, {
+        ...alias,
+        indicator: 'SP.POP.TOTL',
+        date: '2025',
+        limit: 1,
+      } as never);
+
+      expect(result.isError).toBeFalsy();
+      expect(result.structuredContent).toMatchObject({
+        data: [{ countryIso3: 'KEN' }],
+        appliedFilters: {
+          countries: 'KE',
+          indicatorId: 'SP.POP.TOTL',
+          dateRange: '2025',
+          perPage: 1,
+        },
+      });
+      expect(textOf(result)).toContain('Kenya (KE / KEN)');
+      expect(textOf(result)).toContain('date_range=2025');
+      expect(countrySegments()).toEqual(['KE']);
+    },
+  );
+
+  it.each([
+    { countries: 'KE', country: 'KE' },
+    { country_codes: 'KE', country: 'KE' },
+    { countries: 'KE', date: '2025/02' },
+  ])(
+    'rejects colliding aliases and invalid aliased values %j before sending requests',
+    async (args) => {
+      const result = await runToolContract(worldbankGetData, {
+        indicator_id: 'SP.POP.TOTL',
+        ...args,
+      } as never);
+      const { error, text } = failure(result);
+
+      expect(error.code).toBe(JsonRpcErrorCode.InvalidParams);
+      expect(error.data.reason).toBe('invalid_arguments');
+      if (Object.hasOwn(args, 'date')) {
+        expect(error.message).toContain('date_range');
+        expect(text).toContain('date_range');
+      } else {
+        expect(error.data.recovery).toMatchObject({
+          hint: expect.stringMatching(/alias(?:es)? of countries/),
+        });
+        expect(text).toMatch(/alias(?:es)? of countries/);
+      }
+      expect(urls()).toEqual([]);
+    },
+  );
+
+  it.each([1, 2, 3])(
+    'reports absent mrnev codes from the selection on page %i',
+    async (pageNumber) => {
+      serve({
+        data: () =>
+          page([
+            row('BR', 'BRA', 'Brazil'),
+            row('KE', 'KEN', 'Kenya'),
+            row('1W', 'WLD', 'World', null),
+          ]),
+      });
+      const result = await call({
+        countries: ['Bra|ke', 'WLD;ZA'],
+        mrnev: 2,
+        per_page: 1,
+        page: pageNumber,
+      });
+
+      expect(result.isError).toBeFalsy();
+      const structured = result.structuredContent as { notice?: string; data: unknown[] };
+      expect(structured).toMatchObject({ totalCount: 2, totalPages: 2 });
+      expect(structured.notice).toContain('No non-null value selected for WLD, ZA.');
+      expect(textOf(result)).toContain(structured.notice);
+      if (pageNumber === 3) {
+        expect(structured.data).toEqual([]);
+        expect(structured.notice).toContain('Page 3 is past the end');
+        expect(urls().some((url) => new URL(url).pathname === '/v2/country')).toBe(false);
+      }
+    },
+  );
+
+  it.each([false, true, 403, 404, 422])(
+    'resolves incomplete row IDs on a past-end page (index failure: %s)',
+    async (indexFails) => {
+      serve({
+        data: () => page([row('KEN', '', 'Kenya')]),
+        ...(indexFails && {
+          listing: () =>
+            typeof indexFails === 'number'
+              ? new Response(null, { status: indexFails })
+              : Response.json([{ message: [INVALID_VALUE] }]),
+        }),
+      });
+      const result = await call({ countries: 'ke;ZA;BRA', mrnev: 1, page: 2 });
+
+      expect(result.isError).toBeFalsy();
+      expect(result.structuredContent).toMatchObject({ data: [], totalCount: 1 });
+      const expected = indexFails ? 'BRA' : 'ZA, BRA';
+      expect(result.structuredContent).toMatchObject({
+        notice: expect.stringContaining(`No non-null value selected for ${expected}.`),
+      });
+      expect(textOf(result)).toContain(`No non-null value selected for ${expected}.`);
+      if (indexFails) {
+        expect(result.structuredContent).toMatchObject({
+          notice: expect.stringContaining('Could not check ke, ZA against the selected values'),
+        });
+        expect(textOf(result)).toContain('Could not check ke, ZA against the selected values');
+      }
+      expect(urls().filter((url) => new URL(url).pathname === '/v2/country')).toHaveLength(1);
+    },
+  );
+
+  it('resolves a requested ISO3 against a selected row carrying only ISO2 on a cold past-end page', async () => {
+    serve({ data: () => page([row('XD', '', 'High income')]) });
+    const result = await call({ countries: 'HIC;ZA', mrnev: 1, page: 2 });
+    const notice = (result.structuredContent as { notice: string }).notice;
+    expect(notice).toContain('No non-null value selected for ZA.');
+    expect(textOf(result)).toContain(notice);
+    expect(urls().filter((url) => new URL(url).pathname === '/v2/country')).toHaveLength(1);
+  });
+
+  it('propagates a caller abort whose reason resembles an optional index failure', async () => {
+    const controller = new AbortController();
+    const cause = serviceUnavailable('Client disconnected');
+    serve({
+      data: () => page([row('XD', '', 'High income')]),
+      listing: () => {
+        controller.abort(cause);
+        return Response.json(LISTING);
+      },
+    });
+    const pending = getWorldBankApiService().getData(
+      { countries: 'HIC;ZA', indicatorId: 'SP.POP.TOTL', mrnev: 1, page: 2, perPage: 50 },
+      createMockContext({ signal: controller.signal }),
+    );
+    await expect(pending).rejects.toBe(cause);
+  });
+
+  it('reports explicitly requested codes when the whole mrnev selection is empty', async () => {
+    serve({ data: () => page([row('KE', 'KEN', 'Kenya', null)]) });
+    const result = await call({ countries: 'ke;ZA', mrnev: 1 });
+
+    expect(result.structuredContent).toMatchObject({
+      data: [],
+      totalCount: 0,
+      notice: expect.stringContaining('No non-null value selected for ke, ZA.'),
+    });
+    expect(textOf(result)).toContain('No non-null value selected for ke, ZA.');
+    expect(urls().some((url) => new URL(url).pathname === '/v2/country')).toBe(false);
   });
 
   // ─── Separators ───────────────────────────────────────────────────────────
